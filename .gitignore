@@ -1,0 +1,6 @@
+target/
+*.parquet
+data/corpus/
+data/products/
+*.json
+!Cargo.lock

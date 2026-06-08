@@ -1,0 +1,20 @@
+[package]
+name = "genesis_core"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+flatbuffers = "25.12.19"
+hex = "0.4.3"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0.149"
+sha2 = "0.10.9"
+metal = "0.27"
+objc = "0.2.7"
+rayon = "1.10.0"
+rand = { version = "0.8", features = ["std_rng"] }
+arrow = "58.3.0"
+parquet = "58.3.0"
+
+[build-dependencies]
+flatc-rust = "0.2.0"
