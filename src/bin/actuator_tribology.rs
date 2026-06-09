@@ -16,7 +16,7 @@ const NUM_TRAJECTORIES: usize = 1_200_000;
 const HZ: f64 = 1000.0;
 const DT: f64 = 1.0 / HZ;
 
-// Optimus Actuator Baseline
+// Whole-Body Humanoid Actuator Baseline
 const ROLLER_SCREW_LIFE_CYCLES: usize = 10000;
 const SPALLING_THRESHOLD_MM: f64 = 0.5; // Half a millimeter of pitting causes catastrophic failure
 
@@ -47,7 +47,7 @@ fn main() {
         let mut screw_degradation_mm = 0.0;
         let mut catastrophic_lockup = false;
         
-        // Tesla relies entirely on End-to-End vision (cameras).
+        // The autonomous policy relies entirely on End-to-End vision (cameras).
         // Cameras cannot see inside a sealed planetary roller screw actuator.
         // Therefore, the policy cannot proactively adjust gait/torque to preserve a failing gear.
 

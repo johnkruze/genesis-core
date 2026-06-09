@@ -288,4 +288,4 @@ Non-commercial use permitted. Commercial use and custom simulation runs require 
 
 ---
 
-*John Kruze · [zerotrustphysics.com](https://zerotrustphysics.com)*
+*John Kruze · [zerotrustphysics.com](https://zerotrustphysics.com) · [LinkedIn](https://www.linkedin.com/in/john-kruze-34a6683a5/)*

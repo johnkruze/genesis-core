@@ -1,30 +1,27 @@
-// G^G BORING COMPANY LOOP THERMAL EVACUATION MONTE CARLO
-// Sovereign Verification: Lithium Backdraft vs FSD Evasion Paralysis
+// G^G SUBTERRANEAN TUBE THERMAL EVACUATION MONTE CARLO
+// Sovereign Verification: Lithium Backdraft vs Autonomous Evasion Paralysis
 //
-// THE EMBODIMENT: The Boring Company "Vegas Loop". A 12-foot diameter concrete tunnel 
-// running 1.5 miles. A platoon of 50 Tesla vehicles is operating inside the tunnel 
-// using FSD (Full Self-Driving).
+// THE EMBODIMENT: A subterranean transit tube. A 12-foot diameter concrete tunnel 
+// running 1.5 miles. A platoon of 50 autonomous electric vehicles (EVs) is operating 
+// inside the tunnel using vision-based autonomous driving software.
 // 
-// THE VULNERABILITY: Generative AI simulations (Tesla Dojo/NVIDIA) train FSD solely 
-// on open-road scenarios. When sensing a catastrophic obstacle, the neural network 
-// hallucinates a path geometry that includes shoulders, crosswalks, or adjacent lanes. 
-// Furthermore, the tunnel ventilation systems are modeled using continuous, steady-state 
-// Computational Fluid Dynamics (CFD).
+// THE VULNERABILITY: Vision-only autonomous systems are trained primarily 
+// on open-road scenarios. When sensing a catastrophic obstacle in a confined environment, 
+// the neural network can fail to find an evasion path when standard geometries (shoulders, 
+// adjacent lanes) are absent. Furthermore, standard tunnel safety modeling often relies 
+// on continuous, steady-state ventilation assumptions rather than transient thermal surges.
 //
-// THE MATHEMATICAL REALITY: The lead Tesla experiences a lithium-ion battery thermal 
-// runaway (1,000°C fire). The extreme heat instantly expands the air volume in the 
-// confined 12-foot cylinder (Charles's Law: V1/T1 = V2/T2). The resulting high-pressure 
-// thermal shockwave generates a lethal toxic backdraft moving at 15 m/s, completely 
-// overwhelming the fixed RPM of the tunnel ventilation fans.
+// THE MATHEMATICAL REALITY: The lead EV experiences a battery thermal runaway (1,000°C fire). 
+// The extreme heat instantly expands the air volume in the confined 12-foot cylinder 
+// (Charles's Law: V1/T1 = V2/T2). The resulting high-pressure thermal shockwave generates 
+// a toxic backdraft moving at 15 m/s, completely overwhelming the baseline ventilation flow.
 //
-// THE FATALITY: The 49 trailing FSD-enabled Teslas detect the anomaly and attempt to 
-// execute emergency evasion. Because they are in a 12-foot pipe, there is zero evasion 
-// vector. The FSD software lacks a hard-coded deterministic Hive-Mind "Synchronized 
-// High-Speed Reverse" protocol. 
-// The FSD neural net paralyzes the fleet. The vehicles freeze. In under 60 seconds, 
-// the 15 m/s thermal toxic backdraft overtakes the trapped platoon. Because the tunnel 
-// walls physically restrict the doors from opening fully, human evacuation is impossible. 
-// 100% simulated fleet fatality rate.
+// THE SAFETY BREAKDOWN: The 49 trailing autonomous vehicles detect the fire anomaly and 
+// attempt to execute emergency evasion. Because they are in a narrow 12-foot pipe, there is 
+// zero evasion vector. Lacking a hard-coded, deterministic, fleet-wide synchronized reverse 
+// protocol, the individual vehicle agents halt. The vehicles remain stationary. In under 60 
+// seconds, the 15 m/s toxic backdraft overtakes the trapped platoon. Because the tunnel walls 
+// restrict physical door clearance, manual egress is blocked.
 
 use std::time::Instant;
 use genesis_core::rng::Rng;
@@ -38,18 +35,18 @@ const FLEET_SIZE: usize = 50;
 
 // Lead car is at 1200m (middle of the tunnel)
 const LITHIUM_FIRE_LOCATION_M: f64 = 1200.0;
-const FLEET_SPACING_M: f64 = 15.0; // Teslas spaced 15 meters apart
+const FLEET_SPACING_M: f64 = 15.0; // EVs spaced 15 meters apart
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum FailureMode {
-    VirtualCleanSim,        // Ideal FSD Dojo Sim: Car pulls over, fans clear smoke
+    VirtualCleanSim,        // Ideal Autonomous Sim: Vehicle pulls over, fans clear smoke
     ThermalBackdraftSurge,  // Physical Thermodynamics: 1000C gas expansion
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum Phase {
-    NominalTransit,         // Teslas cruising at 35mph
-    LithiumThermalRunaway,  // Lead car erupts in 1,000°C fire
+    NominalTransit,         // EVs cruising at 35mph
+    LithiumThermalRunaway,  // Lead EV erupts in 1,000°C fire
     FSDEvasionParalysis,    // Trailing cars freeze, lacking reverse synchronization
     ToxicOverrun,           // The CO/Smoke backdraft overtakes the stationary fleet
     FatalFleetAsphyxiation, // 100% Loss of Crew
@@ -251,14 +248,14 @@ fn main() {
 
     if !json_output {
         println!("====================================================================");
-        println!("  G^G BORING CO THERMAL BACKDRAFT MONTE CARLO");
-        println!("  Verifying Tubular Thermodynamics vs FSD Neural Paralysis");
+        println!("  G^G SUBTERRANEAN TUBE THERMAL BACKDRAFT MONTE CARLO");
+        println!("  Verifying Tubular Thermodynamics vs Autonomous Evasion Paralysis");
         println!("====================================================================");
         println!();
         println!("  Trajectories:  {}", n_trajectories);
         println!("  Physics:       100Hz Enclosed Gas Expansion & Evasion Constraints");
-        println!("  Sensors:       Vegas Loop Fleet Logic");
-        println!("  Estimation:    Tesla Dojo/Sim assumes open-road AI logic");
+        println!("  Sensors:       Subterranean Transit Fleet Logic");
+        println!("  Estimation:    Vision-only simulation assumes open-road AI logic");
         println!("  Boundary:      50-Car Synchronized Retreat (100% Fatal Overrun)");
         println!("====================================================================");
         println!();
@@ -274,7 +271,7 @@ fn main() {
         let metadata = DatasetMetadata {
             generator: "G^G Sovereign Auditing v1.0".to_string(),
             domain: "subterranean_robotics".to_string(),
-            scenario: "boring_co_thermal_backdraft_evasion_failure".to_string(),
+            scenario: "subterranean_tube_thermal_backdraft_evasion_failure".to_string(),
             trajectories: n_trajectories as usize,
             physics_engine: "genesis_core::thermal_fluid_paralysis (100Hz)".to_string(),
             version: "1.0.0".to_string(),
@@ -288,9 +285,9 @@ fn main() {
             for r in rx {
                 let rec = TrajectoryRecord {
                     id: format!("tunnel_audit_{}", r.short_id),
-                    traj_type: "lithium_thermal_backdraft_fsd_freeze".to_string(),
+                    traj_type: "lithium_thermal_backdraft_evasion_freeze".to_string(),
                     scenario: match r.failure {
-                        FailureMode::VirtualCleanSim => "dojo_virtual_open_road_evasion".to_string(),
+                        FailureMode::VirtualCleanSim => "visual_virtual_open_road_evasion".to_string(),
                         FailureMode::ThermalBackdraftSurge => "narrow_tube_thermodynamic_surge".to_string(),
                     },
                     steps: r.steps,
@@ -381,7 +378,7 @@ fn main() {
     let timeout = results.iter().filter(|r| r.outcome == "TIMEOUT_STALL").count();
 
     println!("====================================================================");
-    println!("  BORING CO THERMAL BACKDRAFT RESULTS");
+    println!("  SUBTERRANEAN TUBE THERMAL BACKDRAFT RESULTS");
     println!("====================================================================");
     println!();
     println!("  Total Trajectories:    {}", total);
@@ -408,7 +405,7 @@ fn main() {
         if v.is_empty() { 0.0 } else { v.iter().filter(|r| r.outcome != "SAFE_VIRTUAL_SYNCHRONIZATION").count() as f64 / v.len() as f64 * 100.0 }
     };
 
-    println!("  | Dojo Virtual Sim (Clear):   {:>4.1}% ({:>6} runs) |", crash_rate(&clean), clean.len());
+    println!("  | Vision Virtual Sim (Clear):  {:>4.1}% ({:>6} runs) |", crash_rate(&clean), clean.len());
     println!("  | 1000C Thermal Surge & Jam:  {:>4.1}% ({:>6} runs) |", crash_rate(&fire), fire.len());
     println!("  +---------------------------------------------+");
     println!();

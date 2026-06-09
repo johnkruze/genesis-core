@@ -2,7 +2,7 @@
 //! TARGET: Generic Commercial/Industrial Autonomous Systems
 //! CLASS: Autonomous Flight Systems / Drones
 //! SUBSYSTEM: Vision-SLAM and Object Tracking
-//! VULNERABILITY: Skydio drones are aggressively marketed to Fire departments. However, VSLAM algorithms fundamentally rely on tracking high-contrast feature points (corners/edges) between frames. In dense structuring smoke, the particulate density scrambles spatial consistency. The point-tracker locks onto moving smoke tendrils instead of static walls, feeding mathematically correct but physically hallucinated velocity vectors into the EKF, causing the drone to abruptly dive into the flames.
+//! VULNERABILITY: Vision-SLAM (VSLAM) algorithms fundamentally rely on tracking high-contrast feature points (corners/edges) between frames. In dense structuring smoke, the particulate density scrambles spatial consistency. The point-tracker locks onto moving smoke tendrils instead of static walls, feeding mathematically correct but physically hallucinated velocity vectors into the EKF, causing the platform to abruptly dive into obstacles.
 
 use rayon::prelude::*;
 use serde_json::json;
@@ -108,7 +108,7 @@ fn main() {
             "hallucinated_drone_velocity_ms": f64::trunc(hallucinated_velocity_ms * 100.0) / 100.0,
             "survived": !tracking_lost_crash,
             "failure_mode": if !tracking_lost_crash { "NOMINAL" } else { "VSLAM_SMOKE_ADVECTION_HALLUCINATION_CRASH" },
-            "cryptographic_seal": format!("sha256:skydio_smoke_occlusion_{}", i)
+            "cryptographic_seal": format!("sha256:vslam_smoke_occlusion_{}", i)
         })
     }).collect();
 
