@@ -11,4 +11,7 @@ pub mod energy;
 pub mod reactor;
 pub mod swing;
 pub mod tokamak;
+pub mod dexterous;
+pub mod directed_energy;
+
 

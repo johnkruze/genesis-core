@@ -4,3 +4,48 @@ pub mod taichi_bridge;
 pub mod rng;
 pub mod proof;
 pub mod output;
+
+#[unsafe(no_mangle)]
+pub extern "C" fn ztp_dexterous_evaluate_grasp(
+    sensor: *const physics::dexterous::C_TactileArray,
+    state: *mut physics::dexterous::C_GraspState,
+    dt: f32,
+) -> physics::dexterous::C_GraspResult {
+    if sensor.is_null() || state.is_null() {
+        return physics::dexterous::C_GraspResult {
+            micro_slip_detected: false,
+            macro_slip_detected: false,
+            rotational_slip_detected: false,
+            commanded_force: 0.0,
+            margin: 0.0,
+            estimated_mu: 0.0,
+        };
+    }
+    unsafe {
+        physics::dexterous::evaluate_grasp_dynamics(&*sensor, &mut *state, dt)
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn ztp_directed_energy_step(
+    state: *mut physics::directed_energy::C_LaserTargetState,
+    y_meas: f64,
+    dy_history: *const f64,
+    dy_history_len: u32,
+    apply_ztp: bool,
+    dt: f64,
+) -> bool {
+    if state.is_null() {
+        return false;
+    }
+    unsafe {
+        let history = if dy_history.is_null() || dy_history_len == 0 {
+            &[]
+        } else {
+            std::slice::from_raw_parts(dy_history, dy_history_len as usize)
+        };
+        physics::directed_energy::step_directed_energy(&mut *state, y_meas, history, apply_ztp, dt)
+    }
+}
+
+
