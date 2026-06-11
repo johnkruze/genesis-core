@@ -13,5 +13,7 @@ pub mod swing;
 pub mod tokamak;
 pub mod dexterous;
 pub mod directed_energy;
+pub mod josephson;
+
 
 

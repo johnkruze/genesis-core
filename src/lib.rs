@@ -48,4 +48,21 @@ pub extern "C" fn ztp_directed_energy_step(
     }
 }
 
+#[unsafe(no_mangle)]
+pub extern "C" fn ztp_josephson_step(
+    state: *mut physics::josephson::JosephsonState,
+    dt: f64,
+    control_current: f64,
+    noise_seed: u64,
+) -> bool {
+    if state.is_null() {
+        return false;
+    }
+    unsafe {
+        (*state).step(dt, control_current, noise_seed);
+        (*state).quenched
+    }
+}
+
+
 

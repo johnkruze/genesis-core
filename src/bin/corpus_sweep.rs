@@ -17,7 +17,9 @@ const SUBSTRATES: &[(&str, &str, f64)] = &[
     ("asteroid_monte_carlo", "Asteroid (NEO)", 135.0),
     ("celestial_monte_carlo", "Celestial (Astro)", 150.0),
     ("energy_monte_carlo", "Energy (Grid)", 200.0),
+    ("josephson_monte_carlo", "Josephson (Qubit)", 2000.0),
 ];
+
 
 struct SubstrateResult {
     binary: String,
@@ -277,7 +279,9 @@ fn sequential_mode(args: &[String], export_dir: Option<&str>) {
         ("asteroid_monte_carlo", "Asteroid (NEO)", 10_000),
         ("celestial_monte_carlo", "Celestial (Astro)", 10_000),
         ("energy_monte_carlo", "Energy (Grid)", 10_000),
+        ("josephson_monte_carlo", "Josephson (Qubit)", 10_000),
     ];
+
 
     let icp_per = (12.0 * multiplier).ceil() as u32;
     let icp_total = icp_per * 8;
