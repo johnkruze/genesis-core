@@ -3,13 +3,13 @@
 **The G^G physics engine. 13 domains, 113 Monte Carlo simulations, pure CPU Rust. No external physics libraries.**
 
 [![Website](https://img.shields.io/badge/Web-zerotrustphysics.com-000000?style=flat-square)](https://zerotrustphysics.com)
-[![Dataset](https://img.shields.io/badge/HuggingFace-gg--physical--ground--truth-FF6B00?style=flat-square)](https://huggingface.co/datasets/johnkruze/gg-physical-ground-truth)
+[![Dataset](https://img.shields.io/badge/HuggingFace-gg--physical--ground--truth-FF6B00?style=flat-square)](https://huggingface.co/datasets/spiderpilot89/gg-physical-ground-truth)
 [![Paper](https://img.shields.io/badge/Paper-Zero_Trust_Physics-1a1a2e?style=flat-square)](https://zerotrustphysics.com/Zero-Trust-Physics.pdf)
 [![Kernel](https://img.shields.io/badge/FFI_Kernel-ztp--runtime-555555?style=flat-square)](https://github.com/johnkruze/ztp-runtime)
 
 ---
 
-Every equation in this codebase traces to a verified mechanical reference. Every integration step is sealed with a running SHA-256 hash chain. The corpus it generates is on [HuggingFace](https://huggingface.co/datasets/johnkruze/gg-physical-ground-truth) and anchored on the Internet Computer.
+Every equation in this codebase traces to a verified mechanical reference. Every integration step is sealed with a running SHA-256 hash chain. The corpus it generates is on [HuggingFace](https://huggingface.co/datasets/spiderpilot89/gg-physical-ground-truth) and anchored on the Internet Computer.
 
 ```bash
 cargo run --release --bin corpus_sweep -- 1000 --export data/corpus/
@@ -274,15 +274,15 @@ Integration rates are live-measured per domain. The `corpus_sweep` binary report
 Every trajectory carries a running SHA-256 proof chain anchored on the Internet Computer:
 
 - On-chain canister: `ad7wi-4aaaa-aaaad-aeijq-cai`
-- Open dataset: [huggingface.co/datasets/johnkruze/gg-physical-ground-truth](https://huggingface.co/datasets/johnkruze/gg-physical-ground-truth)
+- Open dataset: [huggingface.co/datasets/spiderpilot89/gg-physical-ground-truth](https://huggingface.co/datasets/spiderpilot89/gg-physical-ground-truth)
 
 ---
 
 ## License
 
-[John Kruze Commercial License v1](LICENSE)
+[MIT License](LICENSE)
 
-Non-commercial use permitted. Commercial use and custom simulation runs require direct engagement.
+
 
 → [zerotrustphysics.com](https://zerotrustphysics.com) · kruze@zerotrustphysics.com
 
