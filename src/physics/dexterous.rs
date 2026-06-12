@@ -172,3 +172,109 @@ pub fn evaluate_grasp_dynamics(
         estimated_mu,
     }
 }
+
+// ─── SURGICAL & MICRO-MANUFACTURING EXTENSIONS ───
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct C_SurgicalTissueAuditor {
+    pub tissue_type_id: u32,
+    pub max_tearing_force_n: f32,
+    pub measured_displacement_m: f32,
+    pub measured_force_n: f32,
+    pub relaxation_tau: f32,
+    pub last_displacement_m: f32,
+    pub last_force_n: f32,
+    pub accumulated_energy_j: f32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct C_SurgicalResult {
+    pub tissue_overstress_detected: bool,
+    pub viscoelastic_rupture_detected: bool,
+    pub cable_slip_fault: bool,
+    pub clamped_force: f32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct C_MicroReleaseAuditor {
+    pub part_mass_micrograms: f32,
+    pub pull_off_force_un: f32,
+    pub jaw_separation_um: f32,
+    pub dynamic_electrostatic_charge_v: f32,
+    pub last_jaw_separation_um: f32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct C_MicroResult {
+    pub release_stiction_active: bool,
+    pub electrostatic_charge_violation: bool,
+    pub piezo_shake_trigger: bool,
+    pub safe_to_retract: bool,
+}
+
+pub fn evaluate_surgical_grasp_dynamics(
+    auditor: &C_SurgicalTissueAuditor,
+    _dt: f32,
+) -> C_SurgicalResult {
+    // 1. Force Clamping based on tissue classification
+    let tissue_limit = match auditor.tissue_type_id {
+        0 => 1.2f32,  // Liver / Spleen
+        1 => 2.5f32,  // Bowel / Vessel
+        2 => 40.0f32, // Bone / Tendon
+        _ => 1.0f32,  // Safe default
+    };
+
+    let clamped_force = if auditor.max_tearing_force_n > 0.0f32 {
+        tissue_limit.min(auditor.max_tearing_force_n)
+    } else {
+        tissue_limit
+    };
+
+    let tissue_overstress_detected = auditor.measured_force_n > clamped_force;
+
+    // 2. Viscoelastic Rupture Detection (Stiffness drop during active displacement)
+    let dx = auditor.measured_displacement_m - auditor.last_displacement_m;
+    let df = auditor.measured_force_n - auditor.last_force_n;
+
+    // If active displacement is positive (compressing) and force drops significantly, it's a rupture
+    let viscoelastic_rupture_detected = dx > 0.0001f32 && df < -0.02f32;
+
+    // 3. Cable Slip / Tension Fault
+    // Jaws are open/stretched but force is extremely low (cable broke or slipped off pulley)
+    let cable_slip_fault = auditor.measured_displacement_m > 0.012f32 && auditor.measured_force_n < 0.05f32;
+
+    C_SurgicalResult {
+        tissue_overstress_detected,
+        viscoelastic_rupture_detected,
+        cable_slip_fault,
+        clamped_force,
+    }
+}
+
+pub fn evaluate_micro_release_dynamics(
+    auditor: &C_MicroReleaseAuditor,
+    _dt: f32,
+) -> C_MicroResult {
+    // 1. Release Stiction detection (capillary forces keeping the part attached to gripper jaw)
+    let release_stiction_active = auditor.jaw_separation_um > 10.0f32 && auditor.pull_off_force_un > 5.0f32;
+
+    // 2. Electrostatic charge violation (danger of ESD or static attraction)
+    let electrostatic_charge_violation = auditor.dynamic_electrostatic_charge_v > 150.0f32;
+
+    // 3. Piezo shake trigger (active high-frequency vibrate to break stiction bridge)
+    let piezo_shake_trigger = release_stiction_active;
+
+    // 4. Safe to Retract
+    let safe_to_retract = !release_stiction_active && !electrostatic_charge_violation;
+
+    C_MicroResult {
+        release_stiction_active,
+        electrostatic_charge_violation,
+        piezo_shake_trigger,
+        safe_to_retract,
+    }
+}

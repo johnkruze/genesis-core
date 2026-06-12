@@ -64,5 +64,41 @@ pub extern "C" fn ztp_josephson_step(
     }
 }
 
+#[unsafe(no_mangle)]
+pub extern "C" fn ztp_surgical_evaluate_grasp(
+    auditor: *const physics::dexterous::C_SurgicalTissueAuditor,
+    dt: f32,
+) -> physics::dexterous::C_SurgicalResult {
+    if auditor.is_null() {
+        return physics::dexterous::C_SurgicalResult {
+            tissue_overstress_detected: false,
+            viscoelastic_rupture_detected: false,
+            cable_slip_fault: false,
+            clamped_force: 0.0,
+        };
+    }
+    unsafe {
+        physics::dexterous::evaluate_surgical_grasp_dynamics(&*auditor, dt)
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn ztp_micro_evaluate_release(
+    auditor: *const physics::dexterous::C_MicroReleaseAuditor,
+    dt: f32,
+) -> physics::dexterous::C_MicroResult {
+    if auditor.is_null() {
+        return physics::dexterous::C_MicroResult {
+            release_stiction_active: false,
+            electrostatic_charge_violation: false,
+            piezo_shake_trigger: false,
+            safe_to_retract: false,
+        };
+    }
+    unsafe {
+        physics::dexterous::evaluate_micro_release_dynamics(&*auditor, dt)
+    }
+}
+
 
 
