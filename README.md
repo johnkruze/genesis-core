@@ -19,7 +19,7 @@ cargo run --release --bin corpus_sweep -- 1000 --export data/corpus/
 
 ## Physics Modules
 
-Thirteen physical domains, each implemented from first principles in `src/physics/`:
+Fourteen physical domains, each implemented from first principles in `src/physics/`:
 
 | Module | Physics |
 |--------|---------|
@@ -36,6 +36,7 @@ Thirteen physical domains, each implemented from first principles in `src/physic
 | `tokamak.rs` | MHD plasma stability, Z-axis shear, beta-limit disruption, coil quench |
 | `swing.rs` | Rotor angle swing, PLL tracking error, governor droop, IBR penetration |
 | `reactor.rs` | Fission core neutron kinetics, 6-group delayed precursors, Xenon-135 poisoning |
+| `josephson.rs` | RCSJ transmon qubit — pendulum phase dynamics, thermal decoherence, 500 GHz solver |
 
 ---
 
@@ -158,6 +159,14 @@ Thirteen physical domains, each implemented from first principles in `src/physic
 | `reactor_monte_carlo` | Neutron kinetics, Xenon-135 poisoning, prompt criticality boundary |
 | `reactor_demo` | Reactor kinetics demonstrator with control rod extraction scenarios |
 | `tokamak_monte_carlo` | Plasma confinement, Z-axis shear, coil quench, wall breach |
+| `josephson_monte_carlo` | Transmon qubit phase coherence sweep — 5D parameter space, decoherence boundary |
+
+### Surgical & Micro-Manufacturing
+
+| Binary | What it models |
+|--------|---------------|
+| `ztp_surgical_evaluate_grasp` (FFI) | Tissue-type force clamping, viscoelastic rupture detection, cable slip fault |
+| `ztp_micro_evaluate_release` (FFI) | Capillary stiction detection, piezo shake trigger, electrostatic charge gate |
 
 ### Thermal Physics
 
