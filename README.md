@@ -11,7 +11,7 @@
 
 This engine generates the proprioceptive ground truth that lets autonomous systems feel forces instead of just measuring them — the substrate for physically-grounded decision making across 14 environments from Terran soil to transmon qubits.
 
-Every equation in this codebase traces to a verified mechanical reference. Every integration step is sealed with a running SHA-256 hash chain. The corpus it generates is on [HuggingFace](https://huggingface.co/datasets/spiderpilot89/gg-physical-ground-truth) and anchored on the Internet Computer.
+Every equation in this codebase traces to a verified mechanical reference. Every integration step is signed into a running SHA-256 attestation chain. The corpus it generates is on [HuggingFace](https://huggingface.co/datasets/spiderpilot89/gg-physical-ground-truth) and anchored on the Internet Computer.
 
 ```bash
 cargo run --release --bin corpus_sweep -- 1000 --export data/corpus/
@@ -282,7 +282,7 @@ Integration rates are live-measured per domain. The `corpus_sweep` binary report
 
 ## Verification
 
-Every trajectory carries a running SHA-256 proof chain anchored on the Internet Computer:
+Every trajectory carries a running SHA-256 attestation chain anchored on the Internet Computer:
 
 - On-chain canister: `ad7wi-4aaaa-aaaad-aeijq-cai`
 - Open dataset: [huggingface.co/datasets/spiderpilot89/gg-physical-ground-truth](https://huggingface.co/datasets/spiderpilot89/gg-physical-ground-truth)
