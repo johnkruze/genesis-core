@@ -1,6 +1,6 @@
 # genesis-core
 
-**The G^G physics engine. 13 domains, 113 Monte Carlo simulations, pure CPU Rust. No external physics libraries.**
+**The G^G physics engine. 14 domains, 113 Monte Carlo simulations, pure CPU Rust. No external physics libraries.**
 
 [![Website](https://img.shields.io/badge/Web-zerotrustphysics.com-000000?style=flat-square)](https://zerotrustphysics.com)
 [![Dataset](https://img.shields.io/badge/HuggingFace-gg--physical--ground--truth-FF6B00?style=flat-square)](https://huggingface.co/datasets/spiderpilot89/gg-physical-ground-truth)
@@ -8,6 +8,8 @@
 [![Kernel](https://img.shields.io/badge/FFI_Kernel-ztp--runtime-555555?style=flat-square)](https://github.com/johnkruze/ztp-runtime)
 
 ---
+
+This engine generates the proprioceptive ground truth that lets autonomous systems feel forces instead of just measuring them — the substrate for physically-grounded decision making across 14 environments from Terran soil to transmon qubits.
 
 Every equation in this codebase traces to a verified mechanical reference. Every integration step is sealed with a running SHA-256 hash chain. The corpus it generates is on [HuggingFace](https://huggingface.co/datasets/spiderpilot89/gg-physical-ground-truth) and anchored on the Internet Computer.
 
