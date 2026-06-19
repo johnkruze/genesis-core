@@ -4,3 +4,7 @@ data/corpus/
 data/products/
 *.json
 !Cargo.lock
+.DS_Store
+.wrangler/
+__pycache__/
+*.log
