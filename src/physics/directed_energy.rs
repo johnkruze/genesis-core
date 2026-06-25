@@ -1,4 +1,4 @@
-//! Directed Energy Laser Targeting Firewall & Gimbal Jitter Auditor
+//! Directed Energy Laser Targeting Coherence Auditor & Gimbal Jitter Projector
 //! Core physics and state estimation (Kalman filter) solver.
 
 #[repr(C)]
