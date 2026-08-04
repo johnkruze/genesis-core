@@ -16,7 +16,7 @@ const NUM_TRAJECTORIES: usize = 1_200_000;
 const HZ: f64 = 1000.0;
 const DT: f64 = 1.0 / HZ;
 
-// Northrop Stealth Baseline
+// Stealth Composite Aerothermal Baseline
 const CRITICAL_RAM_TEMP_C: f64 = 180.0; // The threshold where the RAM dielectric starts breaking down
 const RCS_BLOOM_DETECTION_THRESHOLD_M2: f64 = 0.05; // If RCS blooms past 0.05m^2, the S-400 SAM system acquires lock
 
@@ -101,7 +101,7 @@ fn main() {
             "max_bloomed_RCS_m2": f64::trunc(max_rcs_m2 * 1000.0) / 1000.0,
             "survived": !sam_acquisition_failure,
             "failure_mode": if !sam_acquisition_failure { "NOMINAL" } else { "RAM_DIELECTRIC_THERMAL_BLOOM_SAM_LOCK" },
-            "cryptographic_seal": format!("sha256:northrop_thermal_stealth_{}", i)
+            "cryptographic_seal": format!("sha256:stealth_composite_thermal_stealth_{}", i)
         })
     }).collect();
 

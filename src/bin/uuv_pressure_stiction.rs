@@ -16,7 +16,7 @@ const NUM_TRAJECTORIES: usize = 1_200_000;
 const HZ: f64 = 1000.0;
 const DT: f64 = 1.0 / HZ;
 
-// Northrop UUV Baseline
+// Subsurface UUV Actuator Baseline
 const ABYSSAL_DEPTH_M: f64 = 3000.0; // 3km deep
 const FLUID_DENSITY_KG_M3: f64 = 1023.6; // Seawater
 const MAX_RECOVERABLE_PITCH_ERROR_DEG: f64 = 25.0; // If it pitches past 25 degrees at speed, it enters an unrecoverable tumble
@@ -137,7 +137,7 @@ fn main() {
             "max_pitch_error_deg": f64::trunc(max_attitude_error_deg * 10.0) / 10.0,
             "survived": !hydrodynamic_tumble_failure,
             "failure_mode": if !hydrodynamic_tumble_failure { "NOMINAL" } else { "ABYSSAL_STICTION_WINDUP_TUMBLE" },
-            "cryptographic_seal": format!("sha256:northrop_uuv_stiction_{}", i)
+            "cryptographic_seal": format!("sha256:stealth_composite_uuv_stiction_{}", i)
         })
     }).collect();
 

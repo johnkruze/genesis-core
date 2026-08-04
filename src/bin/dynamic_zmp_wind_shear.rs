@@ -16,7 +16,7 @@ const NUM_TRAJECTORIES: usize = 1_200_000;
 const HZ: f64 = 1000.0;
 const DT: f64 = 1.0 / HZ;
 
-// Apptronik Apollo Baseline
+// Centroidal Biped Baseline
 const APOLLO_MASS_KG: f64 = 72.6; // 160 lbs
 const APOLLO_FRONTAL_AREA_M2: f64 = 0.65; // Approx surface area exposed to wind 
 const FOOT_WIDTH_HALF_M: f64 = 0.045; // 90mm wide feet
@@ -104,7 +104,7 @@ fn main() {
             "max_zmp_deflection_m": f64::trunc(max_zmp_deflection_m * 1000.0) / 1000.0,
             "survived": !catastrophic_fall,
             "failure_mode": if !catastrophic_fall { "NOMINAL" } else { "AERODYNAMIC_UNMODELED_ZMP_BLOWOVER" },
-            "cryptographic_seal": format!("sha256:apptronik_zmp_wind_shear_{}", i)
+            "cryptographic_seal": format!("sha256:humanoid_zmp_wind_shear_{}", i)
         })
     }).collect();
 

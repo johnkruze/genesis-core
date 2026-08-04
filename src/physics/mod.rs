@@ -14,6 +14,8 @@ pub mod tokamak;
 pub mod dexterous;
 pub mod directed_energy;
 pub mod josephson;
+pub mod compounding;
+
 
 
 

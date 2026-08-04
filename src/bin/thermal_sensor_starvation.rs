@@ -16,7 +16,7 @@ const NUM_TRAJECTORIES: usize = 1_200_000;
 const HZ: f64 = 1000.0;
 const DT: f64 = 1.0 / HZ;
 
-// Apptronik Compute Baseline
+// High-Density Compute Node Baseline
 const CRITICAL_CPU_TEMP_C: f64 = 105.0; // Silicon thermal limit before hard throttle
 const NOMINAL_FRAME_TIME_MS: f64 = 33.3; // 30 FPS expected by the locomotion loop
 const CRITICAL_FRAME_TIME_MS: f64 = 150.0; // If frame time exceeds 150ms during dynamic walking, the robot trips over its own feet
@@ -98,7 +98,7 @@ fn main() {
             "max_frame_processing_delay_ms": f64::trunc(max_frame_time_experienced_ms * 10.0) / 10.0,
             "survived": !locomotion_desync_collapse,
             "failure_mode": if !locomotion_desync_collapse { "NOMINAL" } else { "LLM_THERMAL_THROTTLE_KINEMATIC_STARVATION" },
-            "cryptographic_seal": format!("sha256:apptronik_thermal_starvation_{}", i)
+            "cryptographic_seal": format!("sha256:humanoid_thermal_starvation_{}", i)
         })
     }).collect();
 

@@ -1,7 +1,7 @@
 // G^G AMAZON FAR BIPEDAL RESMIMIC COLLAPSE MONTE CARLO
 // Sovereign Verification: Inverted Pendulum Slip vs Fluctuating Warehouse Friction
 //
-// THE EMBODIMENT: An Amazon FAR (Frontier AI Research) 50kg Humanoid (e.g. Unitree 
+// THE EMBODIMENT: An Autonomous 50kg Humanoid
 // G1 or Fauna Robotics "Sprout") attempting to lift a 20kg Amazon fulfillment package.
 // 
 // THE VULNERABILITY: Amazon's "ResMimic" AI system teaches robots to lift objects 

@@ -16,7 +16,7 @@ const NUM_TRAJECTORIES: usize = 1_200_000;
 const HZ: f64 = 1000.0;
 const DT: f64 = 1.0 / HZ;
 
-// BAE OMFV/Bradley Baseline
+// Heavy Armored Barrel Baseline
 const TARGET_ENGAGEMENT_DISTANCE_M: f64 = 800.0; // Typical engagement range
 const FRIENDLY_INFANTRY_OFFSET_M: f64 = 5.0; // Friendlies 5 meters away from the target line
 
@@ -113,7 +113,7 @@ fn main() {
             "max_boresight_error_mm": f64::trunc(max_projectile_drift_m * 1000.0) / 1000.0,
             "survived": !friendly_fire_incident,
             "failure_mode": if !friendly_fire_incident { "NOMINAL" } else { "THERMAL_WARP_BORESIGHT_DIVERGENCE" },
-            "cryptographic_seal": format!("sha256:bae_bradley_warp_{}", i)
+            "cryptographic_seal": format!("sha256:armored_barrel_warp_{}", i)
         })
     }).collect();
 

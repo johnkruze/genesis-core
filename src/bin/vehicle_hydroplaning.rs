@@ -16,7 +16,7 @@ const NUM_TRAJECTORIES: usize = 1_200_000;
 const HZ: f64 = 1000.0;
 const DT: f64 = 1.0 / HZ;
 
-// Tesla Model Y Baseline
+// Passenger Chassis Baseline
 const MODEL_Y_MASS_KG: f64 = 2000.0; 
 const TIRE_FOOTPRINT_WIDTH_M: f64 = 0.255; // 255mm tires
 const CRITICAL_HYDROPLANE_SPEED_MS: f64 = 25.0; // ~55mph where standing water overcomes generic tread evacuation

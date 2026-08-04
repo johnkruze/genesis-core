@@ -117,7 +117,7 @@ fn main() {
             "max_strut_compression_m": f64::trunc(max_strut_compression_m * 100.0) / 100.0,
             "survived": !gear_collapse_failure,
             "failure_mode": if !gear_collapse_failure { "NOMINAL" } else { "THERMAL_HYSTERESIS_GEAR_COLLAPSE" },
-            "cryptographic_seal": format!("sha256:boeing_gear_hysteresis_{}", i)
+            "cryptographic_seal": format!("sha256:aerospace_gear_hysteresis_{}", i)
         })
     }).collect();
 

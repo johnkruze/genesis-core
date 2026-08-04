@@ -93,7 +93,7 @@ fn main() {
             "max_precision_error_mm": f64::trunc(grip_precision_error_mm * 100.0) / 100.0,
             "survived": !task_failed,
             "failure_mode": if !task_failed { "NOMINAL" } else { "Unmodeled_TENDON_HYSTERESIS_GRIP_LOSS" },
-            "cryptographic_seal": format!("sha256:1x_neo_cable_stretch_{}", i)
+            "cryptographic_seal": format!("sha256:humanoid_cable_stretch_{}", i)
         })
     }).collect();
 

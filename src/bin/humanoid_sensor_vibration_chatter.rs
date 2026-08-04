@@ -16,7 +16,7 @@ const NUM_TRAJECTORIES: usize = 1_200_000;
 const HZ: f64 = 1000.0;
 const DT: f64 = 1.0 / HZ;
 
-// Unitree H1 Sensor Baseline
+// Humanoid Sensor Suite Baseline
 const LIDAR_RESOLUTION_RAD: f64 = 0.002; // Angular resolution of point cloud (~0.1 degrees)
 const SPINE_RESONANT_FREQ_HZ: f64 = 45.0; // Typical structural resonance of a 1.8m aluminum/carbon biped
 
@@ -101,7 +101,7 @@ fn main() {
             "max_head_angular_chatter_rad": f64::trunc(max_angular_chatter_rad * 10000.0) / 10000.0,
             "survived": !lidar_smearing_freeze,
             "failure_mode": if !lidar_smearing_freeze { "NOMINAL" } else { "LIDAR_POINT_CLOUD_SMEAR_FREEZE" },
-            "cryptographic_seal": format!("sha256:unitree_h1_sensor_chatter_{}", i)
+            "cryptographic_seal": format!("sha256:humanoid_sensor_chatter_{}", i)
         })
     }).collect();
 

@@ -101,7 +101,7 @@ fn main() {
             "max_zmp_deflection_m": f64::trunc(max_zmp_deflection_m * 1000.0) / 1000.0,
             "survived": !catastrophic_trip,
             "failure_mode": if !catastrophic_trip { "NOMINAL" } else { "E2E_UNMODELED_ANKLE_INVERSION_FALL" },
-            "cryptographic_seal": format!("sha256:1x_neo_ankle_inversion_{}", i)
+            "cryptographic_seal": format!("sha256:humanoid_ankle_inversion_{}", i)
         })
     }).collect();
 

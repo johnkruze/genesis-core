@@ -16,7 +16,7 @@ const NUM_TRAJECTORIES: usize = 1_200_000;
 const HZ: f64 = 1000.0;
 const DT: f64 = 1.0 / HZ;
 
-// BAE AMPV Infrastructure Baseline
+// Heavy Vehicle Armor Baseline
 const FIBER_SHOCK_CATASTROPHE_THRESHOLD_G: f64 = 550.0; // Rigid glass fiber cladding shatters under extreme high-frequency acoustic shock > 550Gs
 
 fn main() {
@@ -109,7 +109,7 @@ fn main() {
             "peak_loom_shock_g": f64::trunc(peak_shock_felt_g * 10.0) / 10.0,
             "survived": !central_ai_bricked,
             "failure_mode": if !central_ai_bricked { "NOMINAL" } else { "HYDROSTATIC_FIBER_SHATTER_ISOLATION" },
-            "cryptographic_seal": format!("sha256:bae_armor_spall_{}", i)
+            "cryptographic_seal": format!("sha256:armored_hull_spall_{}", i)
         })
     }).collect();
 

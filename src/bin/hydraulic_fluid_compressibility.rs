@@ -16,7 +16,7 @@ const NUM_TRAJECTORIES: usize = 1_200_000;
 const HZ: f64 = 1000.0;
 const DT: f64 = 1.0 / HZ;
 
-// Sanctuary Hydraulic Baseline
+// Hydraulic Actuator Baseline
 const NOMINAL_BULK_MODULUS_PSI: f64 = 250000.0; // Typical hydraulic oil stiffness
 const CRITICAL_OVERSHOOT_ERROR_MM: f64 = 3.0; // 3mm overshoot when trying to insert a tight-tolerance part (e.g. spark plug) destroys the thread.
 
@@ -99,7 +99,7 @@ fn main() {
             "max_precision_overshoot_mm": f64::trunc(max_overshoot_experienced * 100.0) / 100.0,
             "survived": !task_failed,
             "failure_mode": if !task_failed { "NOMINAL" } else { "CARBON_AI_UNMODELED_HYDRAULIC_SPONGINESS" },
-            "cryptographic_seal": format!("sha256:sanctuary_fluid_compressibility_{}", i)
+            "cryptographic_seal": format!("sha256:dexterous_hand_fluid_compressibility_{}", i)
         })
     }).collect();
 

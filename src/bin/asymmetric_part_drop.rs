@@ -16,7 +16,7 @@ const NUM_TRAJECTORIES: usize = 1_200_000;
 const HZ: f64 = 1000.0;
 const DT: f64 = 1.0 / HZ;
 
-// Sanctuary Grasping Baseline
+// Dexterous Hand Grasping Baseline
 const MAX_WRIST_HOLDING_TORQUE_NM: f64 = 45.0; // The max resistive torque the wrist actuators can hold statically
 const NOMINAL_GRIP_WIDTH_M: f64 = 0.08; 
 
@@ -90,7 +90,7 @@ fn main() {
             "max_wrist_torque_Nm": f64::trunc(max_wrist_torque_experienced * 10.0) / 10.0,
             "survived": !part_dropped,
             "failure_mode": if !part_dropped { "NOMINAL" } else { "CARBON_AI_ASYMMETRIC_COM_BUCKLE_DROP" },
-            "cryptographic_seal": format!("sha256:sanctuary_asymmetric_drop_{}", i)
+            "cryptographic_seal": format!("sha256:dexterous_hand_asymmetric_drop_{}", i)
         })
     }).collect();
 

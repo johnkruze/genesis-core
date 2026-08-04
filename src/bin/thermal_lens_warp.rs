@@ -16,7 +16,7 @@ const NUM_TRAJECTORIES: usize = 1_200_000;
 const HZ: f64 = 1000.0;
 const DT: f64 = 1.0 / HZ;
 
-// Skydio Optics Baseline
+// Tactical Electro-Optical Baseline
 const LENS_THERMAL_EXPANSION_COEFFICIENT: f64 = 0.00007; // Typical for injection molded optic plastics 
 const CRITICAL_FOCAL_SHIFT_PERCENT: f64 = 2.5; // If focal length shifts by 2.5%, the projection matrix is irreversibly broken and objects appear closer/farther dynamically
 

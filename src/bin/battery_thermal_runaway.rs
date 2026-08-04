@@ -95,7 +95,7 @@ fn main() {
             "max_cell_temp_C": f64::trunc(max_cell_temp_c * 100.0) / 100.0,
             "survived": !bms_shutdown,
             "failure_mode": if !bms_shutdown { "NOMINAL" } else { "E2E_UNMODELED_BMS_THERMAL_SHUTDOWN" },
-            "cryptographic_seal": format!("sha256:1x_neo_battery_thermal_{}", i)
+            "cryptographic_seal": format!("sha256:humanoid_battery_thermal_{}", i)
         })
     }).collect();
 

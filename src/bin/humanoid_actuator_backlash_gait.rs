@@ -92,7 +92,7 @@ fn main() {
             "accumulated_phase_lag_s": f64::trunc(accumulated_phase_lag_s * 1000.0) / 1000.0,
             "survived": !catastrophic_fall,
             "failure_mode": if !catastrophic_fall { "NOMINAL" } else { "ISAAC_SIM_UNMODELED_BACKLASH_RESONANCE_FALL" },
-            "cryptographic_seal": format!("sha256:unitree_h1_gait_backlash_{}", i)
+            "cryptographic_seal": format!("sha256:humanoid_gait_backlash_{}", i)
         })
     }).collect();
 

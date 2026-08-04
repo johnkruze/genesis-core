@@ -90,7 +90,7 @@ fn main() {
             "rl_commanded_torque_Nm": f64::trunc(rl_commanded_torque_nm * 100.0) / 100.0,
             "survived": !step_execution_failed,
             "failure_mode": if !step_execution_failed { "NOMINAL" } else { "ISAAC_SIM_UNMODELED_THERMAL_STICTION_TRIP" },
-            "cryptographic_seal": format!("sha256:unitree_go2_thermal_stiction_{}", i)
+            "cryptographic_seal": format!("sha256:quadruped_thermal_stiction_{}", i)
         })
     }).collect();
 

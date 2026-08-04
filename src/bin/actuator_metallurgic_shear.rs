@@ -16,7 +16,7 @@ const NUM_TRAJECTORIES: usize = 1_200_000;
 const HZ: f64 = 1000.0;
 const DT: f64 = 1.0 / HZ;
 
-// Unitree Actuator Baseline (Mass-produced tolerances)
+// Commercial Actuator Baseline (Mass-produced tolerances)
 const GEAR_TOOTH_SHEAR_YIELD_NM: f64 = 120.0; // The physical torque limit before the mass-produced metallurgy yields and shears.
 
 fn main() {
@@ -45,7 +45,7 @@ fn main() {
         
         // In Isaac Sim / MuJoCo, gears are treated as perfectly elastic geometric primitives.
         // They can mathematically transmit infinite instantaneous torque.
-        // Unitree ports these RL policies directly onto cheap, non-hardened steel/aluminum hybrid gearboxes.
+        // Commercial platforms port these RL policies directly onto cheap, non-hardened steel/aluminum hybrid gearboxes.
 
         let mut max_torque_demanded = 0.0;
         let mut gear_teeth_sheared = false;

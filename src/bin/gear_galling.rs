@@ -16,7 +16,7 @@ const NUM_TRAJECTORIES: usize = 1_200_000;
 const HZ: f64 = 1000.0;
 const DT: f64 = 1.0 / HZ;
 
-// Apptronik Actuator Baseline
+// Dynamic Actuator Gearbox Baseline
 const LUBRICATION_FILM_STRENGTH_MPA: f64 = 250.0; // The pressure the grease can withstand before tearing
 const CRITICAL_GALLING_FRICTION_NM: f64 = 8.5; // If internal friction hits 8.5Nm, the motor is effectively seized under standard loads
 

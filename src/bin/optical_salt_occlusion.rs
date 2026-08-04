@@ -16,7 +16,7 @@ const NUM_TRAJECTORIES: usize = 1_200_000;
 const HZ: f64 = 1000.0;
 const DT: f64 = 1.0 / HZ;
 
-// Northrop Maritime Baseline
+// Maritime Electro-Optical Baseline
 const FLIGHT_DURATION_HOURS: f64 = 24.0; 
 const CRITICAL_OPTICAL_TRANSMISSION_PERCENT: f64 = 0.35; // If light transmission drops below 35%, the EKF tracking state diverges.
 
@@ -105,7 +105,7 @@ fn main() {
             "min_optical_transmission": f64::trunc(min_transmission_reached * 1000.0) / 1000.0,
             "survived": !horizon_tracking_failure,
             "failure_mode": if !horizon_tracking_failure { "NOMINAL" } else { "VSLAM_SALT_OCCLUSION_HORIZON_DRIFT" },
-            "cryptographic_seal": format!("sha256:northrop_salt_occlusion_{}", i)
+            "cryptographic_seal": format!("sha256:stealth_composite_salt_occlusion_{}", i)
         })
     }).collect();
 

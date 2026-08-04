@@ -16,7 +16,7 @@ const NUM_TRAJECTORIES: usize = 1_200_000;
 const HZ: f64 = 1000.0;
 const DT: f64 = 1.0 / HZ;
 
-// Northrop Composite Wing Baseline
+// Transonic Composite Wing Baseline
 const WING_STRUCTURAL_YIELD_AMPLITUDE_M: f64 = 0.45; // 45cm of vertical wing flex before the carbon fiber matrix shatters
 const TRANSONIC_FLUTTER_FREQ_HZ: f64 = 28.5; // Natural frequency of the long composite wing
 
@@ -115,7 +115,7 @@ fn main() {
             "max_wing_deflection_m": f64::trunc(max_wing_deflection_m * 100.0) / 100.0,
             "survived": !structural_delamination_failure,
             "failure_mode": if !structural_delamination_failure { "NOMINAL" } else { "TRANSONIC_AEROELASTIC_DELAMINATION" },
-            "cryptographic_seal": format!("sha256:northrop_flutter_{}", i)
+            "cryptographic_seal": format!("sha256:stealth_composite_flutter_{}", i)
         })
     }).collect();
 

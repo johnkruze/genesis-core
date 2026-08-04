@@ -16,7 +16,7 @@ const NUM_TRAJECTORIES: usize = 1_200_000;
 const HZ: f64 = 1000.0;
 const DT: f64 = 1.0 / HZ;
 
-// Sanctuary Vision Baseline
+// Optical Sensor Rig Baseline
 const CAMERA_BASELINE_MM: f64 = 120.0; // Distance between stereo lenses
 const CRITICAL_DEPTH_ERROR_MM: f64 = 15.0; // Misjudging distance by 15mm means the robot smashes its hand into the table instead of grabbing the cup.
 const ALUMINUM_CTE_PER_DEG_C: f64 = 0.000022; // Coefficient of Thermal Expansion for chassis aluminum
@@ -100,7 +100,7 @@ fn main() {
             "hallucinated_depth_error_mm": f64::trunc(max_depth_hallucination * 100.0) / 100.0,
             "survived": !catastrophic_reach_error,
             "failure_mode": if !catastrophic_reach_error { "NOMINAL" } else { "CARBON_AI_THERMAL_STEREO_BLINDNESS" },
-            "cryptographic_seal": format!("sha256:sanctuary_thermal_drift_{}", i)
+            "cryptographic_seal": format!("sha256:dexterous_hand_thermal_drift_{}", i)
         })
     }).collect();
 

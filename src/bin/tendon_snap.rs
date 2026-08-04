@@ -29,7 +29,7 @@ fn main() {
         .write(true)
         .create(true)
         .truncate(true)
-        .open(format!("{}/1x_neo_tendon_snap.json", export_dir))
+        .open(format!("{}/humanoid_tendon_snap.json", export_dir))
         .unwrap();
     let mut writer = BufWriter::new(file);
 
@@ -90,7 +90,7 @@ fn main() {
             "tendon_structural_limit_N": CABLE_TENSILE_LIMIT_N,
             "survived": !tendon_snapped,
             "failure_mode": if !tendon_snapped { "NOMINAL" } else { "E2E_GENERATIVE_TENDON_SHEAR" },
-            "cryptographic_seal": format!("sha256:1x_neo_tendon_snap_{}", i)
+            "cryptographic_seal": format!("sha256:humanoid_tendon_snap_{}", i)
         })
     }).collect();
 
@@ -105,5 +105,5 @@ fn main() {
     println!("TOTAL TRAJECTORIES: {:?}", NUM_TRAJECTORIES);
     println!("CATASTROPHIC TENDON SHEAR RATE: {} ({:.2}%)", fc, failure_rate);
     println!("EXECUTION TIME: {:?}", start_time.elapsed());
-    println!("SEALED TO: {}/1x_neo_tendon_snap.json\n", export_dir);
+    println!("SEALED TO: {}/humanoid_tendon_snap.json\n", export_dir);
 }

@@ -118,7 +118,7 @@ fn main() {
             "max_probe_shear_force_n": f64::trunc(max_shear_n * 10.0) / 10.0,
             "survived": !probe_snap_failure,
             "failure_mode": if !probe_snap_failure { "NOMINAL" } else { "WAKE_RESONANT_PROBE_SHEAR" },
-            "cryptographic_seal": format!("sha256:boeing_mq25_wake_{}", i)
+            "cryptographic_seal": format!("sha256:refueling_drone_wake_{}", i)
         })
     }).collect();
 

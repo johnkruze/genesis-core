@@ -91,7 +91,7 @@ mod targets {
             LiquidationTarget {
                 name: "Sovereign Optimus Pilot",
                 domain: "Orbital", // Using orbital logic for proprioceptive balance
-                entity: "Tesla / NVIDIA",
+                entity: "Commercial Vehicle / Compute Platform",
                 batch_size: 400_000,
                 parameters: TargetParams::Orbital { mu: 0.0, j2: 0.0 }, // Localized gravity
             },

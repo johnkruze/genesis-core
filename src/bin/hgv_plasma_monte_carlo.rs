@@ -212,7 +212,7 @@ fn run_single_trajectory(index: usize, seed: u64, scenario: &str) -> HypersonicT
     let mut true_vel = if scenario == "transonic_flutter" {
         MACH_1 * 2.5f32
     } else {
-        rng.range((MACH_1 * 18.0f32) as f64, (MACH_1 * 22.0f32) as f64) as f32
+        rng.range((MACH_1 * 8.0f32) as f64, (MACH_1 * 18.0f32) as f64) as f32
     };
     let initial_mass = 1500.0f32;
     let mut true_mass = initial_mass;
@@ -235,7 +235,11 @@ fn run_single_trajectory(index: usize, seed: u64, scenario: &str) -> HypersonicT
     let mut true_pitch = 0.0f32;
     let mut true_pitch_rate = 0.0f32;
     let mut true_cog_offset = 1.2f32; // Initial stable CoG lever arm
-    let material_density = rng.range(1.7, 2.1) as f32;
+    let material_density = if let Ok(d_str) = std::env::var("DENSITY_FIXED") {
+        d_str.parse::<f32>().unwrap_or(1.8f32)
+    } else {
+        rng.range(1.7, 2.1) as f32
+    };
     
     let failure = match scenario {
         "asymmetric_ablation" | "asymmetric" => FailureMode::AsymmetricAblation,
@@ -380,7 +384,7 @@ fn run_single_trajectory(index: usize, seed: u64, scenario: &str) -> HypersonicT
             thermal_tax += (surface_temp * dt) / 1000.0f32;
             
             // Continuous Porosity model
-            let max_density = 2.10f32;
+            let max_density = 2.26f32; // Updated to theoretical graphite density
             let porosity = 1.0f32 - (material_density / max_density);
             let open_porosity_fraction = 1.0f32 / (1.0f32 + (150.0f32 * (material_density - 1.98f32)).exp());
             
@@ -598,6 +602,8 @@ fn main() {
     let n_trajectories: usize = args.get(1)
         .and_then(|s| s.parse().ok())
         .unwrap_or(10000);
+    
+    let mut total_survived = 0;
         
     let out_path = args.iter().position(|a| a == "--out")
         .and_then(|i| args.get(i + 1))
@@ -759,6 +765,9 @@ fn main() {
         let mut trajectory_id = Vec::new();
 
         for traj in trajectories {
+            if traj.survived {
+                total_survived += 1;
+            }
             let t_id = traj.trajectory_id;
             for step in traj.data {
                 timestamp.push(step.timestamp);

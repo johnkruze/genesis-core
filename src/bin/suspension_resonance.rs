@@ -16,7 +16,7 @@ const NUM_TRAJECTORIES: usize = 1_200_000;
 const HZ: f64 = 1000.0;
 const DT: f64 = 1.0 / HZ;
 
-// BAE AMPV Baseline
+// Heavy Tracked Vehicle Suspension Baseline
 const TORSION_BAR_YIELD_STRESS_MPA: f64 = 1200.0; // High-strength steel yield point
 
 fn main() {
@@ -137,7 +137,7 @@ fn main() {
             "max_shear_stress_mpa": f64::trunc(max_stress_mpa * 10.0) / 10.0,
             "survived": !torsion_bar_snapped,
             "failure_mode": if !torsion_bar_snapped { "NOMINAL" } else { "AI_INDUCED_RESONANT_FRACTURE" },
-            "cryptographic_seal": format!("sha256:bae_ampv_suspension_{}", i)
+            "cryptographic_seal": format!("sha256:tracked_vehicle_suspension_{}", i)
         })
     }).collect();
 
