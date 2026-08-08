@@ -21,7 +21,7 @@ const FIBER_SHOCK_CATASTROPHE_THRESHOLD_G: f64 = 550.0; // Rigid glass fiber cla
 
 fn main() {
     let start_time = Instant::now();
-    let export_dir = "/Users/aijesusbro/Spectrum/data/exports/sovereign";
+    let export_dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../../data/exports/sovereign");
     std::fs::create_dir_all(export_dir).unwrap();
     let file = OpenOptions::new()
         .write(true)
@@ -85,7 +85,7 @@ fn main() {
                     spall_density_shrapnel_m2 = peak_shock_felt_g * rng.gen_range(0.5..2.0);
                 }
 
-                // Generative AI stacks assume their internal network is an invincible abstraction.
+                // Idealized stacks assume their internal network is an invincible abstraction.
                 // In reality, fiber optic glass shatters under massive acoustic shock (tensile reflection wave),
                 // and gets physically severed by the spray of hot steel spall filling the interior cavity.
                 

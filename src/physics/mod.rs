@@ -15,6 +15,14 @@ pub mod dexterous;
 pub mod directed_energy;
 pub mod josephson;
 pub mod compounding;
+pub mod molecular;
+pub mod microbiome;
+pub mod bioreactor;
+pub mod genome;
+pub mod materials;
+pub mod tribology;
+pub mod plasma_facing;
+pub mod inverse_properties;
 
 
 

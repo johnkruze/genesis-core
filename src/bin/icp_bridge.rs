@@ -52,7 +52,7 @@ fn main() {
     println!("═══════════════════════════════════════════════════════════");
     println!();
 
-    let corpus_dir = "/Users/aijesusbro/Spectrum/data/corpus";
+    let corpus_dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../../data/corpus");
     let mut all_calls: Vec<IcpCall> = Vec::new();
     let start = Instant::now();
 

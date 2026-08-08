@@ -16,12 +16,12 @@ const NUM_TRAJECTORIES: usize = 1_200_000;
 const HZ: f64 = 1000.0;
 const DT: f64 = 1.0 / HZ;
 
-// HII UUV Baseline
+// Subsurface Sonar Baseline
 const CRITICAL_MISS_DISTANCE_M: f64 = 120.0; // Inertia & turning radius means if it approaches within 120m unseen, collision is mathematically unavoidable
 
 fn main() {
     let start_time = Instant::now();
-    let export_dir = "/Users/aijesusbro/Spectrum/data/exports/sovereign";
+    let export_dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../../data/exports/sovereign");
     std::fs::create_dir_all(export_dir).unwrap();
     let file = OpenOptions::new()
         .write(true)

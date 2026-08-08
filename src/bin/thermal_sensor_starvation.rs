@@ -23,7 +23,7 @@ const CRITICAL_FRAME_TIME_MS: f64 = 150.0; // If frame time exceeds 150ms during
 
 fn main() {
     let start_time = Instant::now();
-    let export_dir = "/Users/aijesusbro/Spectrum/data/exports/sovereign";
+    let export_dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../../data/exports/sovereign");
     std::fs::create_dir_all(export_dir).unwrap();
     let file = OpenOptions::new()
         .write(true)

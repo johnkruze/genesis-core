@@ -16,13 +16,13 @@ const NUM_TRAJECTORIES: usize = 1_200_000;
 const HZ: f64 = 1000.0;
 const DT: f64 = 1.0 / HZ;
 
-// Midnight Control Baseline
+// Multirotor Control Baseline
 const FBW_CORRECTIVE_GAIN_P: f64 = 8.5; // Aggressive proportional gain to keep 7000lbs level
 const HOVER_ALTITUDE_M: f64 = 15.0; // Starting altitude
 
 fn main() {
     let start_time = Instant::now();
-    let export_dir = "/Users/aijesusbro/Spectrum/data/exports/sovereign";
+    let export_dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../../data/exports/sovereign");
     std::fs::create_dir_all(export_dir).unwrap();
     let file = OpenOptions::new()
         .write(true)

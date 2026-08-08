@@ -1,5 +1,5 @@
 // G^G SOVEREIGN FORGE STRUCTURAL STRESS TENSOR EVALUATOR
-// First-Principles Principal Stress Trajectory Alignment vs. Disembodied Voxel AI CAD
+// First-Principles Principal Stress Trajectory Alignment vs. Unaligned Uniform-Section Strut
 
 use serde::Serialize;
 use std::time::Instant;
@@ -70,7 +70,7 @@ struct StrutPerformanceReport {
 fn main() {
     println!("====================================================================");
     println!("  G^G FORGE STRUCTURAL VALIDATION: CAUCHY STRESS TENSOR EVALUATION");
-    println!("  First-Principles Principal Stress Trajectories vs. Disembodied AI CAD");
+    println!("  First-Principles Principal Stress Trajectories vs. Unaligned Uniform Section");
     println!("====================================================================");
     println!();
 
@@ -86,18 +86,18 @@ fn main() {
 
     let start = Instant::now();
 
-    // 1. EVALUATE AI CAD STRUT (Voxel Interpolation)
-    // AI CAD designs via visually smoothed surface voxels. Material is distributed uniformly 
+    // 1. EVALUATE UNALIGNED STRUT (Uniform Bounding Volume)
+    // Unaligned design distributes material uniformly across a bounding volume. Material is distributed uniformly 
     // within a cylindrical bounding shape without alignment to structural load paths.
     // Unaligned carbon-matrix composite yield strength is low.
     let yield_strength_unaligned_mpa = 85.0f32; // Carbon fiber unaligned matrix yield
-    let ai_cad_mass_kg = 2.4f32; // Solid cylindrical voxel distribution
+    let unaligned_strut_mass_kg = 2.4f32; // Solid cylindrical uniform distribution
     
     // We compute the stress field along a cantilevered beam profile:
     // Bending moment M(x) = F * (L - x)
     // Section modulus I = pi * R^4 / 4
     let r_bound = 40.0f32; // bounding radius mm
-    let inertia_ai_yy = std::f32::consts::PI * r_bound.powi(4) / 4.0;
+    let inertia_unaligned_yy = std::f32::consts::PI * r_bound.powi(4) / 4.0;
     
     let mut ai_max_stress = 0.0f32;
     let mut ai_yielded_steps = 0;
@@ -117,7 +117,7 @@ fn main() {
             if z.abs() > r_bound { continue; } // outer bounds
             
             // Flexural bending stress: sigma_xx = M * z / I
-            let sigma_xx = moment * z / inertia_ai_yy;
+            let sigma_xx = moment * z / inertia_unaligned_yy;
             
             // Shear stress: tau_xz = V * Q / (I * b) - parabolic profile
             let tau_xz = (transverse_load_n / (std::f32::consts::PI * r_bound.powi(2))) * 
@@ -144,8 +144,8 @@ fn main() {
     
     let ai_failure_load = transverse_load_n * (yield_strength_unaligned_mpa / ai_max_stress);
     let ai_report = StrutPerformanceReport {
-        design_name: "Generative AI CAD (Voxel Slop Strut)",
-        mass_kg: ai_cad_mass_kg,
+        design_name: "Unaligned Uniform-Section Strut",
+        mass_kg: unaligned_strut_mass_kg,
         max_stress_mpa: ai_max_stress,
         failure_load_n: ai_failure_load,
         safety_margin: (yield_strength_unaligned_mpa / ai_max_stress) - 1.0,
@@ -161,7 +161,7 @@ fn main() {
     let forge_mass_kg = 1.20f32; // 50% mass savings due to void optimization
     
     // Flexural inertia of Forge strut is optimised by depositing mass away from neutral axis (I-beam behavior)
-    let inertia_forge_yy = inertia_ai_yy * 1.8; // 1.8x section modulus efficiency
+    let inertia_forge_yy = inertia_unaligned_yy * 1.8; // 1.8x section modulus efficiency
     
     let mut forge_max_stress = 0.0f32;
     let mut forge_yielded_steps = 0;
@@ -248,7 +248,8 @@ fn main() {
     println!();
 
     println!("  Exporting eigenvector-aligned strut geometry to OBJ mesh...");
-    match export_forge_strut_to_obj("forge_strut.obj") {
+    let target_obj_path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../doe-genesis/topic-3-materials-predictable-functionality/data/forge_strut.obj");
+    match export_forge_strut_to_obj(target_obj_path) {
         Ok(path) => println!("  Mesh exported successfully to: {}", path),
         Err(e) => println!("  Error exporting OBJ: {}", e),
     }

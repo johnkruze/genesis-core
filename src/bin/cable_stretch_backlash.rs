@@ -16,14 +16,14 @@ const NUM_TRAJECTORIES: usize = 1_200_000;
 const HZ: f64 = 1000.0;
 const DT: f64 = 1.0 / HZ;
 
-// NEO Tendon Stretch Baseline
+// Synthetic Tendon Stretch Baseline
 const CABLE_LENGTH_MM: f64 = 800.0; // Cable run from shoulder/torso actuator to wrist
 const BASE_CABLE_STIFFNESS: f64 = 1.0; // Assume 1mm elongation per 100N load
 const CRITICAL_PRECISION_ERROR_MM: f64 = 8.0; // Being 8mm off target causes a rigid glass to completely slip out of a 2-finger grasp
 
 fn main() {
     let start_time = Instant::now();
-    let export_dir = "/Users/aijesusbro/Spectrum/data/exports/sovereign";
+    let export_dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../../data/exports/sovereign");
     std::fs::create_dir_all(export_dir).unwrap();
     let file = OpenOptions::new()
         .write(true)

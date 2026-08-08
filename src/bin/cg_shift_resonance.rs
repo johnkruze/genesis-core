@@ -16,12 +16,12 @@ const NUM_TRAJECTORIES: usize = 1_200_000;
 const HZ: f64 = 1000.0;
 const DT: f64 = 1.0 / HZ;
 
-// AeroVironment UGV Baseline
+// Small UGV CG Baseline
 const CRITICAL_PITCH_ANGLE_RAD: f64 = 1.0; // ~57 degrees, beyond this the robot physically tips over and cannot recover
 
 fn main() {
     let start_time = Instant::now();
-    let export_dir = "/Users/aijesusbro/Spectrum/data/exports/sovereign";
+    let export_dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../../data/exports/sovereign");
     std::fs::create_dir_all(export_dir).unwrap();
     let file = OpenOptions::new()
         .write(true)
@@ -141,7 +141,7 @@ fn main() {
             "max_pitch_rad": f64::trunc(max_pitch_angle * 100.0) / 100.0,
             "survived": !robot_flipped,
             "failure_mode": if !robot_flipped { "NOMINAL" } else { "SLOSH_RESONANCE_FLIP" },
-            "cryptographic_seal": format!("sha256:aerovironment_juggernaut_cg_{}", i)
+            "cryptographic_seal": format!("sha256:small_ugv_cg_shift_{}", i)
         })
     }).collect();
 

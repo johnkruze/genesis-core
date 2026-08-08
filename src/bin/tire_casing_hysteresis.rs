@@ -1,8 +1,8 @@
 //! 1000Hz GENESIS CORE MODULE: TIRE_CASING_HYSTERESIS
 //! TARGET: Generic Commercial/Industrial Autonomous Systems
 //! CLASS: Generic Autonomous Platform
-//! SUBSYSTEM: Aurora Driver Highway Autonomy
-//! VULNERABILITY: Aurora's path planning algorithms calculate speed limits based on curvature, traffic, and stopping distance constraints. They do not model thermodynamic hysteresis inside the 18 heavy-duty tire casings. When running fully loaded at 75mph in a Texas summer, the cyclical tire deflection generates immense internal heat. Unaware of the casing degradation, the AI maintains maximum allowable speed until the rubber vulcanization reverses, resulting in a catastrophic tread-separation blowout at highway speed.
+//! SUBSYSTEM: Class-8 Highway Autonomy
+//! VULNERABILITY: Highway path planning algorithms calculate speed limits based on curvature, traffic, and stopping distance constraints. They do not model thermodynamic hysteresis inside the 18 heavy-duty tire casings. When running fully loaded at 75mph in a Texas summer, the cyclical tire deflection generates immense internal heat. Unaware of the casing degradation, the AI maintains maximum allowable speed until the rubber vulcanization reverses, resulting in a catastrophic tread-separation blowout at highway speed.
 
 use rayon::prelude::*;
 use serde_json::json;
@@ -16,12 +16,12 @@ const NUM_TRAJECTORIES: usize = 1_200_000;
 const HZ: f64 = 1000.0;
 const DT: f64 = 1.0 / HZ;
 
-// Aurora Truck Baseline
+// Class-8 Highway Autonomy Baseline
 const MAX_TIRE_SURVIVAL_TEMP_C: f64 = 150.0; // The temperature at which internal steel belts delaminate from the rubber matrix.
 
 fn main() {
     let start_time = Instant::now();
-    let export_dir = "/Users/aijesusbro/Spectrum/data/exports/sovereign";
+    let export_dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../../data/exports/sovereign");
     std::fs::create_dir_all(export_dir).unwrap();
     let file = OpenOptions::new()
         .write(true)
@@ -48,7 +48,7 @@ fn main() {
         // Pavement gets much hotter than ambient
         let pavement_temp_c = ambient_temp_c + rng.gen_range(15.0..25.0); 
         
-        let target_speed_mph = rng.gen_range(65.0..75.0); // Aurora driver maintains max legal speed limits
+        let target_speed_mph = rng.gen_range(65.0..75.0); // highway autonomy stack maintains max legal speed limits
         let target_speed_ms = target_speed_mph * 0.44704;
 
         // Tire load distribution - drive tires take a massive beating
@@ -100,7 +100,7 @@ fn main() {
             "max_casing_temp_C": f64::trunc(internal_casing_temp_c * 10.0) / 10.0,
             "survived": !catastrophic_tread_separation,
             "failure_mode": if !catastrophic_tread_separation { "NOMINAL" } else { "AI_ROUTING_THERMAL_BLOWOUT" },
-            "cryptographic_seal": format!("sha256:aurora_tire_hysteresis_{}", i)
+            "cryptographic_seal": format!("sha256:tire_hysteresis_{}", i)
         })
     }).collect();
 

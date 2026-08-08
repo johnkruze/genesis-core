@@ -1,12 +1,12 @@
-// G^G BLUE ORIGIN LUNAR REGOLITH MONTE CARLO
+// G^G LUNAR REGOLITH MONTE CARLO
 // Sovereign Verification: Vacuum Thruster Ejecta vs LiDAR Sensor Hallucinations
 //
-// THE EMBODIMENT: A Blue Origin "Blue Moon" lander (16,000kg) executing its terminal 
-// descent to the Lunar South Pole. The main BE-7 engine is firing at 40,000 N of thrust 
+// THE EMBODIMENT: A heavy lunar lander (16,000kg) executing its terminal 
+// descent to the Lunar South Pole. The main rocket engine is firing at 40,000 N of thrust 
 // to decelerate the lander from 20 m/s at 100 meters altitude down to a safe 1.5 m/s 
 // touchdown velocity.
 // 
-// THE VULNERABILITY: Generative rendering environments (Omniverse/Isaac Sim) model 
+// THE VULNERABILITY: Generative rendering environments (idealized mesh trainers) model 
 // laser altimeters (LiDAR) and Radar bouncing off a rigidly defined geometric mesh 
 // (the solid ground). They train the lander's Extended Kalman Filter (EKF) to trust 
 // altimeter bounces implicitly as distance-to-surface. 
@@ -44,7 +44,7 @@ const PLUME_EJECTA_CLOUD_HEIGHT_M: f64 = 25.0; // The dust cloud kicks 25m high
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum FailureMode {
-    VirtualCleanSim,        // Ideal Isaac Sim: Solid ground reflection, clear vacuum
+    VirtualCleanSim,        // Idealized trainer: Solid ground reflection, clear vacuum
     RegolithEjectaBlind,    // The dust reflects the LiDAR (False MECO)
 }
 
@@ -244,14 +244,14 @@ fn main() {
 
     if !json_output {
         println!("====================================================================");
-        println!("  G^G BLUE ORIGIN LUNAR REGOLITH EJECTA MONTE CARLO");
-        println!("  Verifying Vacuum Dynamics vs Generative AI Radar Hallucinations");
+        println!("  G^G LUNAR REGOLITH EJECTA LANDING MONTE CARLO");
+        println!("  Verifying Vacuum Dynamics vs Idealized Radar Mesh Priors");
         println!("====================================================================");
         println!();
         println!("  Trajectories:  {}", n_trajectories);
         println!("  Physics:       100Hz EKF Sensor Fusion & Supersonic Regolith Expansion");
         println!("  Sensors:       Landing Radar / LiDAR Altimeter");
-        println!("  Estimation:    Isaac Sim meshes render transparent vacuum with rigid floors");
+        println!("  Estimation:    Idealized meshes render transparent vacuum with rigid floors");
         println!("  Boundary:      > 1.5 m/s Touchdown Structural Leg Limit");
         println!("====================================================================");
         println!();
@@ -267,7 +267,7 @@ fn main() {
         let metadata = DatasetMetadata {
             generator: "G^G Sovereign Auditing v1.0".to_string(),
             domain: "spaceflight_robotics".to_string(),
-            scenario: "blue_origin_lunar_regolith_ejecta".to_string(),
+            scenario: "lunar_regolith_ejecta".to_string(),
             trajectories: n_trajectories as usize,
             physics_engine: "genesis_core::vacuum_radar_hallucination (100Hz)".to_string(),
             version: "1.0.0".to_string(),
@@ -283,7 +283,7 @@ fn main() {
                     id: format!("space_audit_{}", r.short_id),
                     traj_type: "vacuum_regolith_radar_blind".to_string(),
                     scenario: match r.failure {
-                        FailureMode::VirtualCleanSim => "isaac_sim_perfect_mesh_hallucination".to_string(),
+                        FailureMode::VirtualCleanSim => "idealized_perfect_mesh_prior".to_string(),
                         FailureMode::RegolithEjectaBlind => "lunar_south_pole_dense_plasma_ejecta".to_string(),
                     },
                     steps: r.steps,
@@ -375,7 +375,7 @@ fn main() {
     let timeout = results.iter().filter(|r| r.outcome == "TIMEOUT_STALL").count();
 
     println!("====================================================================");
-    println!("  BLUE ORIGIN LUNAR DESCENT RESULTS");
+    println!("  LUNAR REGOLITH DESCENT RESULTS");
     println!("====================================================================");
     println!();
     println!("  Total Trajectories:    {}", total);
@@ -402,7 +402,7 @@ fn main() {
         if v.is_empty() { 0.0 } else { v.iter().filter(|r| r.outcome != "SAFE_LUNAR_TOUCHDOWN").count() as f64 / v.len() as f64 * 100.0 }
     };
 
-    println!("  | Isaac Sim Mesh Reflection:   {:>4.1}% ({:>6} runs) |", crash_rate(&clean), clean.len());
+    println!("  | Idealized Mesh Reflection:   {:>4.1}% ({:>6} runs) |", crash_rate(&clean), clean.len());
     println!("  | Lunar Regolith Dense Plume:  {:>4.1}% ({:>6} runs) |", crash_rate(&ejecta), ejecta.len());
     println!("  +---------------------------------------------+");
     println!();

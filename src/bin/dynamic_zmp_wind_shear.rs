@@ -17,13 +17,13 @@ const HZ: f64 = 1000.0;
 const DT: f64 = 1.0 / HZ;
 
 // Centroidal Biped Baseline
-const APOLLO_MASS_KG: f64 = 72.6; // 160 lbs
+const BIPED_MASS_KG: f64 = 72.6; // 160 lbs
 const APOLLO_FRONTAL_AREA_M2: f64 = 0.65; // Approx surface area exposed to wind 
 const FOOT_WIDTH_HALF_M: f64 = 0.045; // 90mm wide feet
 
 fn main() {
     let start_time = Instant::now();
-    let export_dir = "/Users/aijesusbro/Spectrum/data/exports/sovereign";
+    let export_dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../../data/exports/sovereign");
     std::fs::create_dir_all(export_dir).unwrap();
     let file = OpenOptions::new()
         .write(true)

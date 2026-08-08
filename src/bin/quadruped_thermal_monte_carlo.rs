@@ -1,11 +1,11 @@
-// G^G QUADRUPED THERMAL RUNAWAY MONTE CARLO (GHOST ROBOTICS STRIKE II)
+// G^G QUADRUPED THERMAL RUNAWAY MONTE CARLO (quadruped platform STRIKE II)
 // Sovereign Verification: Thermodynamic Winding Saturation vs AI Control
 //
-// THE EMBODIMENT: A Ghost Robotics V60 Quadruped (50kg) carrying a 15kg external
+// THE EMBODIMENT: A quadruped platform V60 Quadruped (50kg) carrying a 15kg external
 // sensor payload (65kg total mass) navigating a continuous 15-degree incline.
 // The ambient temperature is 45°C (113°F, e.g., Middle Eastern desert deployment).
 // 
-// THE VULNERABILITY: Generative RL models (Isaac Sim) do not calculate thermodynamic
+// THE VULNERABILITY: Idealized RL trainers do not calculate thermodynamic
 // limits. They assume the actuator motors have an infinite heatsink. They command
 // whatever torque is required to optimize the kinematic path, completely blind to 
 // the physical Heat (I^2 * R) accumulating in the copper motor windings.
@@ -36,7 +36,7 @@ const TORQUE_CONSTANT_KT: f64 = 0.5; // Nm per Ampere
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum FailureMode {
     NominalAmbient,      // 20°C (Standard Lab Conditions)
-    IsaacSimHallucination, // Desert heat, AI ignores temperature
+    IdealizedFrictionPrior, // Desert heat, AI ignores temperature
     FailedThermistor,    // Sensor fails, motor catches fire at 180°C
 }
 
@@ -89,7 +89,7 @@ fn run_single_trajectory(
     // Failure injection
     let failure = if rng.chance(0.05) { FailureMode::FailedThermistor }
     else if rng.chance(0.20) { FailureMode::NominalAmbient }
-    else { FailureMode::IsaacSimHallucination };
+    else { FailureMode::IdealizedFrictionPrior };
 
     let true_ambient_temp = if failure == FailureMode::NominalAmbient {
         20.0 // Lab conditions
@@ -130,7 +130,7 @@ fn run_single_trajectory(
     while step < max_steps {
         let t = step as f64 * dt;
 
-        // 1. THE RL KINEMATICS HALLUCINATION (Isaac Sim)
+        // 1. THE RL KINEMATICS PRIOR (idealized trainer)
         // The AI attempts to maintain a 1.0 m/s ascent rate.
         // It commands the torque required to overcome gravity and accelerate. 
         // It has NO thermal cost function in its reward policy.
@@ -231,14 +231,14 @@ fn main() {
 
     if !json_output {
         println!("====================================================================");
-        println!("  G^G THERMAL RUNAWAY MONTE CARLO (GHOST ROBOTICS)");
+        println!("  G^G THERMAL RUNAWAY MONTE CARLO (quadruped platform)");
         println!("  Verifying AI Liability against Copper Winding Thermodynamics");
         println!("====================================================================");
         println!();
         println!("  Trajectories:  {}", n_trajectories);
         println!("  Physics:       1000Hz Actuator Thermal Load (I^2 * R)");
         println!("  Sensors:       Internal Thermistor Limit Check");
-        println!("  Estimation:    Isaac Sim RL assumes infinite thermal heatsink capacity");
+        println!("  Estimation:    Idealized RL assumes infinite thermal heatsink capacity");
         println!("  Boundary:      Protective Hardware Cutoff & Winding Ignition");
         println!("====================================================================");
         println!();
@@ -271,7 +271,7 @@ fn main() {
                     traj_type: "desert_incline_thermal_load".to_string(),
                     scenario: match r.failure {
                         FailureMode::NominalAmbient => "lab_ambient_20c".to_string(),
-                        FailureMode::IsaacSimHallucination => "isaac_sim_infinite_heatsink".to_string(),
+                        FailureMode::IdealizedFrictionPrior => "idealized_infinite_heatsink_prior".to_string(),
                         FailureMode::FailedThermistor => "safeguard_failure_ignition".to_string(),
                     },
                     steps: r.steps,
@@ -385,7 +385,7 @@ fn main() {
     println!("  | VULNERABILITY IMPACT (Mechanical Loss Rate)  |");
     println!("  +---------------------------------------------+");
     let nominal: Vec<&TrajectoryResult> = results.iter().filter(|r| matches!(r.failure, FailureMode::NominalAmbient)).collect();
-    let sim_fail: Vec<&TrajectoryResult> = results.iter().filter(|r| matches!(r.failure, FailureMode::IsaacSimHallucination)).collect();
+    let sim_fail: Vec<&TrajectoryResult> = results.iter().filter(|r| matches!(r.failure, FailureMode::IdealizedFrictionPrior)).collect();
     let fire_fail: Vec<&TrajectoryResult> = results.iter().filter(|r| matches!(r.failure, FailureMode::FailedThermistor)).collect();
 
     let shatter_rate = |v: &[&TrajectoryResult]| -> f64 {
@@ -393,7 +393,7 @@ fn main() {
     };
 
     println!("  | Lab Ambient Control (20C): {:>4.1}% ({:>6} runs)  |", shatter_rate(&nominal), nominal.len());
-    println!("  | Omniverse Blank Check/45C : {:>4.1}% ({:>6} runs)  |", shatter_rate(&sim_fail), sim_fail.len());
+    println!("  | Idealized Thermal Blank Check/45C : {:>4.1}% ({:>6} runs)  |", shatter_rate(&sim_fail), sim_fail.len());
     println!("  | Thermistor Override / Fire: {:>4.1}% ({:>6} runs)  |", shatter_rate(&fire_fail), fire_fail.len());
     println!("  +---------------------------------------------+");
     println!();

@@ -16,12 +16,12 @@ const NUM_TRAJECTORIES: usize = 1_200_000;
 const HZ: f64 = 1000.0;
 const DT: f64 = 1.0 / HZ;
 
-// GDLS Track Baseline
+// Tracked Vehicle Pin Baseline
 const PIN_SEIZURE_TEMPERATURE_C: f64 = 350.0; // Point where cold welding / severe galling seizes the steel track pin
 
 fn main() {
     let start_time = Instant::now();
-    let export_dir = "/Users/aijesusbro/Spectrum/data/exports/sovereign";
+    let export_dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../../data/exports/sovereign");
     std::fs::create_dir_all(export_dir).unwrap();
     let file = OpenOptions::new()
         .write(true)
@@ -118,7 +118,7 @@ fn main() {
             "max_pin_temperature_c": f64::trunc(pin_temperature_c * 10.0) / 10.0,
             "survived": !track_seized,
             "failure_mode": if !track_seized { "NOMINAL" } else { "AI_STUTTER_INDUCED_GALLING" },
-            "cryptographic_seal": format!("sha256:gdls_track_galling_{}", i)
+            "cryptographic_seal": format!("sha256:track_pin_galling_{}", i)
         })
     }).collect();
 

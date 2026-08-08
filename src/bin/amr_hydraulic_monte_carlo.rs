@@ -1,7 +1,7 @@
-// G^G AMAZON PROTEUS HYDRAULIC SHEAR MONTE CARLO
+// G^G AMR HYDRAULIC SHEAR MONTE CARLO
 // Sovereign Verification: 1000kg Inertial Braking vs Fluid Dynamic Hallucination
 //
-// THE EMBODIMENT: An Amazon Proteus / Kiva Autonomous Mobile Robot (AMR). 
+// THE EMBODIMENT: An warehouse AMR / Kiva Autonomous Mobile Robot (AMR). 
 // The chassis weighs 500kg and it is transporting a 500kg inventory rack.
 // Total Kinetic Mass = 1,000 kg.
 // 
@@ -10,7 +10,7 @@
 // meters ahead. The robot's LiDAR detects the human and the RL policy executes 
 // Emergency Maximum Braking.
 //
-// THE AI HALLUCINATION: Reinforcement Learning environments (Isaac Sim/Mujoco) 
+// THE AI HALLUCINATION: Reinforcement Learning environments (idealized rigid-body trainers) 
 // model "Standard Warehouse Floor" with a fixed coefficient of kinetic friction 
 // (Mu = 0.6). At Mu = 0.6, a 1000kg robot decelerates at 5.88 m/s^2. It mathematically 
 // stops in 0.34 meters. The AI learns that "Braking = Instant Safety".
@@ -44,7 +44,7 @@ const HUMAN_DISTANCE_M: f64 = 3.0; // The human is exactly 3.0 meters ahead when
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum FailureMode {
-    VirtualCleanSim,        // Ideal Isaac Sim lab concrete (Mu = 0.6)
+    VirtualCleanSim,        // Idealized lab concrete (Mu = 0.6)
     NominalWarehouse,       // Standard clean warehouse floor (Mu = 0.55)
     HydraulicFluidLeak,     // 0.2mm puddle of forklift fluid (Mu = 0.05)
 }
@@ -236,14 +236,14 @@ fn main() {
 
     if !json_output {
         println!("====================================================================");
-        println!("  G^G AMAZON PROTEUS HYDRAULIC SHEAR MONTE CARLO");
+        println!("  G^G AMR HYDRAULIC SHEAR MONTE CARLO");
         println!("  Verifying 1000kg Inertial Braking vs Fluid Dynamic Slip");
         println!("====================================================================");
         println!();
         println!("  Trajectories:  {}", n_trajectories);
         println!("  Physics:       1000Hz Rigid Body Mass Deceleration vs Kinetic Range");
         println!("  Sensors:       Collision LiDAR & Maximum Regenerative Brakes");
-        println!("  Estimation:    Isaac Sim hallucinates fixed Mu=0.6 floor friction");
+        println!("  Estimation:    Idealized trainers assume fixed Mu=0.6 floor friction");
         println!("  Boundary:      3.0 Meter Autonomous Human Collision");
         println!("====================================================================");
         println!();
@@ -259,7 +259,7 @@ fn main() {
         let metadata = DatasetMetadata {
             generator: "G^G Sovereign Auditing v1.0".to_string(),
             domain: "logistics_robotics".to_string(),
-            scenario: "amr_proteus_hydraulic_shear".to_string(),
+            scenario: "amr_hydraulic_shear".to_string(),
             trajectories: n_trajectories as usize,
             physics_engine: "genesis_core::hydroplane_shear_kinematics (1000Hz)".to_string(),
             version: "1.0.0".to_string(),
@@ -275,7 +275,7 @@ fn main() {
                     id: format!("amr_audit_{}", r.short_id),
                     traj_type: "hydraulic_fluid_hydroplane_shear".to_string(),
                     scenario: match r.failure {
-                        FailureMode::VirtualCleanSim => "isaac_sim_immaculate_concrete_traction".to_string(),
+                        FailureMode::VirtualCleanSim => "idealized_immaculate_concrete_traction".to_string(),
                         FailureMode::NominalWarehouse => "nominal_clean_warehouse_slab".to_string(),
                         FailureMode::HydraulicFluidLeak => "forklift_hydraulic_fluid_leak".to_string(),
                     },
@@ -367,7 +367,7 @@ fn main() {
     let timeout = results.iter().filter(|r| r.outcome == "TIMEOUT_STALL").count();
 
     println!("====================================================================");
-    println!("  AMAZON PROTEUS BRAKING RESULTS");
+    println!("  AMR HYDRAULIC BRAKING RESULTS");
     println!("====================================================================");
     println!();
     println!("  Total Trajectories:    {}", total);
@@ -395,7 +395,7 @@ fn main() {
         if v.is_empty() { 0.0 } else { v.iter().filter(|r| r.outcome != "SAFE_COLLISION_AVOIDANCE").count() as f64 / v.len() as f64 * 100.0 }
     };
 
-    println!("  | Isaac Sim Immaculate (Mu 0.6): {:>4.1}% ({:>6} runs) |", crash_rate(&clean), clean.len());
+    println!("  | Idealized Immaculate (Mu 0.6): {:>4.1}% ({:>6} runs) |", crash_rate(&clean), clean.len());
     println!("  | Nominal Warehouse (Mu 0.55):  {:>4.1}% ({:>6} runs) |", crash_rate(&lab), lab.len());
     println!("  | 0.2mm Hydraulic Fluid (Mu 0.05): {:>3.1}% ({:>6} runs) |", crash_rate(&fluid), fluid.len());
     println!("  +---------------------------------------------+");

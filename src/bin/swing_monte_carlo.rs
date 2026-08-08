@@ -77,7 +77,7 @@ fn main() {
     let out_path = args.iter().position(|a| a == "--out")
         .and_then(|i| args.get(i + 1))
         .cloned()
-        .unwrap_or_else(|| "/Users/aijesusbro/Spectrum/data/products/swing_intermittency_failure_envelope.parquet".to_string());
+        .unwrap_or_else(|| concat!(env!("CARGO_MANIFEST_DIR"), "/../../data/products/swing_intermittency_failure_envelope.parquet").to_string());
 
     let start = Instant::now();
 

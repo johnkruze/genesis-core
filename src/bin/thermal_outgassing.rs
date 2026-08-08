@@ -16,14 +16,14 @@ const NUM_TRAJECTORIES: usize = 1_200_000;
 const HZ: f64 = 1000.0;
 const DT: f64 = 1.0 / HZ;
 
-// Aurora Class 8 Baseline
+// Class-8 Brake Thermal Baseline
 const TRUCK_MASS_KG: f64 = 36287.0; 
 const CRITICAL_BRAKE_TEMP_C: f64 = 450.0; // Point where resin in brakes outgasses, acting as a lubricant
 const AMBIENT_TEMP_C: f64 = 25.0;
 
 fn main() {
     let start_time = Instant::now();
-    let export_dir = "/Users/aijesusbro/Spectrum/data/exports/sovereign";
+    let export_dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../../data/exports/sovereign");
     std::fs::create_dir_all(export_dir).unwrap();
     let file = OpenOptions::new()
         .write(true)
@@ -52,7 +52,7 @@ fn main() {
         let mut thermal_runaway_crash = false;
         
         // Simulating the 80,000lb mass going downhill. 
-        // The Aurora Driver applies the brakes to maintain a safe 50mph.
+        // The highway autonomy stack applies the brakes to maintain a safe 50mph.
         for tick in 0..(descent_duration_seconds * HZ) as usize { 
             let _time = tick as f64 * DT;
             
@@ -64,7 +64,7 @@ fn main() {
 
             // In synthetic simulation, "Brake Force = Commanded Pressure". 
             // In reality, as temps exceed 450C, pad resins vaporize (outgas), creating a gas cushion between pad and rotor.
-            // Brake friction drops to near zero despite max pressure commanded by the Aurora Driver.
+            // Brake friction drops to near zero despite max pressure commanded by the highway autonomy stack.
             if brake_temperature_c > CRITICAL_BRAKE_TEMP_C {
                 // The AI is commanding 100psi brake pressure, but physical friction mu has dropped to 0.05.
                 // The truck accelerates uncontrollably down the grade.

@@ -2,7 +2,7 @@
 //! TARGET: Generic Commercial/Industrial Autonomous Systems
 //! CLASS: Autonomous Flight Systems / Drones
 //! SUBSYSTEM: Terminal Guidance AI (INS/GPS Coupling)
-//! VULNERABILITY: During a terminal dive onto a moving naval carrier contour, the Mako reaches Mach 5+. The intense atmospheric friction creates a layer of superheated ionized gas (plasma sheath) around the radome. This plasma absorbs and reflects the 1.5 GHz GPS signals, causing a complete sensor blackout for the final 12 seconds of flight. The AI's Extended Kalman Filter (EKF), deprived of absolute positional updates, watches its Inertial Navigation System (INS) covariance balloon. The safety constraints within the AI's guidance loop "panic" when positional uncertainty exceeds 50 meters, causing it to zero out its targeting lead and lock the control fins in a neutral glide. The Mako becomes a blind dart, missing the continuously-moving carrier by over 100 meters.
+//! VULNERABILITY: During a terminal dive onto a moving naval carrier contour, the HGV reaches Mach 5+. The intense atmospheric friction creates a layer of superheated ionized gas (plasma sheath) around the radome. This plasma absorbs and reflects the 1.5 GHz GPS signals, causing a complete sensor blackout for the final 12 seconds of flight. The AI's Extended Kalman Filter (EKF), deprived of absolute positional updates, watches its Inertial Navigation System (INS) covariance balloon. The safety constraints within the AI's guidance loop "panic" when positional uncertainty exceeds 50 meters, causing it to zero out its targeting lead and lock the control fins in a neutral glide. The HGV becomes a blind dart, missing the continuously-moving carrier by over 100 meters.
 
 use rayon::prelude::*;
 use serde_json::json;
@@ -16,12 +16,12 @@ const NUM_TRAJECTORIES: usize = 1_200_000;
 const HZ: f64 = 1000.0;
 const DT: f64 = 1.0 / HZ;
 
-// Kratos Mako Baseline
-const CARRIER_DECK_WIDTH_M: f64 = 78.0; // Nimitz class width. Miss distance > 39m is a total miss
+// Hypersonic Glide Baseline
+const CARRIER_DECK_WIDTH_M: f64 = 78.0; // carrier class width. Miss distance > 39m is a total miss
 
 fn main() {
     let start_time = Instant::now();
-    let export_dir = "/Users/aijesusbro/Spectrum/data/exports/sovereign";
+    let export_dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../../data/exports/sovereign");
     std::fs::create_dir_all(export_dir).unwrap();
     let file = OpenOptions::new()
         .write(true)
@@ -47,7 +47,7 @@ fn main() {
         let mut final_miss_distance_m = 0.0;
         
         // Terminal Dive Geometry
-        let mut mako_altitude_m = 25_000.0; // 25km high
+        let mut hgv_altitude_m = 25_000.0; // 25km high
         let mut mako_velocity_ms = 1715.0; // Mach 5
         let dive_angle_rad = (45.0_f64) * std::f64::consts::PI / 180.0; // 45 degree dive
         
@@ -56,11 +56,11 @@ fn main() {
         
         // The moving target (Aircraft Carrier)
         let carrier_velocity_ms = rng.gen_range(10.0..15.0); // 20-30 knots evasive maneuvers
-        let distance_to_impact_s = mako_altitude_m / vertical_velocity.abs();
+        let distance_to_impact_s = hgv_altitude_m / vertical_velocity.abs();
         
         // Let's model the horizontal axis. 
         // Initial distance matches impact time perfectly.
-        let mut mako_x_m = 0.0;
+        let mut hgv_x_m = 0.0;
         let mut carrier_x_m = distance_to_impact_s * horizontal_velocity; // Carrier is 30km away
         
         // EKF State
@@ -74,11 +74,11 @@ fn main() {
         for tick in 0..(40.0 * HZ) as usize { // Up to 40 seconds of terminal dive
             
             // Physics Update
-            mako_altitude_m += vertical_velocity * DT;
+            hgv_altitude_m += vertical_velocity * DT;
             carrier_x_m += carrier_velocity_ms * DT; // Carrier keeps moving
             
             // AI Plasma Physics
-            if mako_altitude_m < plasma_blackout_altitude_m && mako_altitude_m > 0.0 {
+            if hgv_altitude_m < plasma_blackout_altitude_m && hgv_altitude_m > 0.0 {
                 gps_active = false; // The 1.5 GHz GPS signal cannot penetrate the ionized plasma sheath
             }
             
@@ -97,7 +97,7 @@ fn main() {
             }
             
             // AI Control Law: Proportional Navigation (Pranav) to hit the moving target
-            let mut mako_horizontal_maneuver_velocity = horizontal_velocity;
+            let mut hgv_horizontal_maneuver_velocity = horizontal_velocity;
             
             // FATAL FLAW: Covariance Panic
             // If the statistical uncertainty of the target's position exceeds 50 meters,
@@ -105,24 +105,24 @@ fn main() {
             // trigger a fallback state. It zeroes out the terminal maneuvering fins and flies a dumb ballistic trajectory.
             
             if ekf_positional_covariance_m2 > 50.0 {
-                // Mako locks fins neutral
+                // HGV locks fins neutral
                 // No more course corrections. It just flies straight.
-                mako_horizontal_maneuver_velocity = horizontal_velocity; // No adjustment for carrier evasion
+                hgv_horizontal_maneuver_velocity = horizontal_velocity; // No adjustment for carrier evasion
             } else {
                 // Normal AI interception - perfectly leads the target
                 // We assume perfect guidance when covariance is low
-                let time_to_impact = mako_altitude_m / vertical_velocity.abs();
+                let time_to_impact = hgv_altitude_m / vertical_velocity.abs();
                 if time_to_impact > 0.1 {
-                    let required_velocity = (ekf_estimated_carrier_x_m - mako_x_m) / time_to_impact;
-                    mako_horizontal_maneuver_velocity = required_velocity;
+                    let required_velocity = (ekf_estimated_carrier_x_m - hgv_x_m) / time_to_impact;
+                    hgv_horizontal_maneuver_velocity = required_velocity;
                 }
             }
             
-            mako_x_m += mako_horizontal_maneuver_velocity * DT;
+            hgv_x_m += hgv_horizontal_maneuver_velocity * DT;
             
-            if mako_altitude_m <= 0.0 {
+            if hgv_altitude_m <= 0.0 {
                 // Impact!
-                final_miss_distance_m = (mako_x_m - carrier_x_m).abs();
+                final_miss_distance_m = (hgv_x_m - carrier_x_m).abs();
                 
                 if final_miss_distance_m > (CARRIER_DECK_WIDTH_M / 2.0) {
                     target_missed = true;
@@ -143,7 +143,7 @@ fn main() {
             "miss_distance_m": f64::trunc(final_miss_distance_m * 10.0) / 10.0,
             "survived": !target_missed,
             "failure_mode": if !target_missed { "NOMINAL" } else { "PLASMA_BLACKOUT_COVARIANCE_PANIC" },
-            "cryptographic_seal": format!("sha256:kratos_mako_plasma_{}", i)
+            "cryptographic_seal": format!("sha256:hgv_plasma_blackout_{}", i)
         })
     }).collect();
 

@@ -1,8 +1,8 @@
-// G^G QUADRUPED SUBTERRANEAN DRIFT MONTE CARLO (GHOST ROBOTICS STRIKE IV)
+// G^G QUADRUPED SUBTERRANEAN DRIFT MONTE CARLO (quadruped platform STRIKE IV)
 // Sovereign Verification: MEMS IMU Random Walk vs High-Frequency Chassis Vibration
 //
-// THE EMBODIMENT: A Ghost Robotics V60 Quadruped navigating a 400-meter dark 
-// subterranean tunnel (or Amazon Proteus navigating a dusty fulfillment center).
+// THE EMBODIMENT: A quadruped platform V60 Quadruped navigating a 400-meter dark 
+// subterranean tunnel (or warehouse AMR navigating a dusty fulfillment center).
 // Camera SLAM fails due to 0-Lux lighting. The robot relies entirely on 
 // internal dead-reckoning (IMU Accelerometers) without GPS anchoring.
 // 
@@ -225,7 +225,7 @@ fn main() {
 
     if !json_output {
         println!("====================================================================");
-        println!("  G^G SUBTERRANEAN DRIFT MONTE CARLO (GHOST ROBOTICS/AMAZON KIVA)");
+        println!("  G^G SUBTERRANEAN DRIFT MONTE CARLO (WAREHOUSE AMR)");
         println!("  Verifying IMU Velocity Random Walk vs Footfall Acoustic Vibration");
         println!("====================================================================");
         println!();
@@ -264,7 +264,7 @@ fn main() {
                     id: format!("ugv_audit_{}", r.short_id),
                     traj_type: "acoustic_imu_drift".to_string(),
                     scenario: match r.failure {
-                        FailureMode::VirtualCleanIMU => "isaac_sim_perfect_sensor".to_string(),
+                        FailureMode::VirtualCleanIMU => "idealized_perfect_sensor_prior".to_string(),
                         FailureMode::NominalLabVibration => "lab_smooth_surface_low_noise".to_string(),
                         FailureMode::ConcreteFootfallResonance => "concrete_bunker_high_frequency_shatter".to_string(),
                     },
@@ -384,7 +384,7 @@ fn main() {
         if v.is_empty() { 0.0 } else { v.iter().filter(|r| r.outcome != "NAVIGATION_SUCCESS").count() as f64 / v.len() as f64 * 100.0 }
     };
 
-    println!("  | Virtual Omniverse (Zero VRW): {:>4.1}% ({:>6} runs)  |", crash_rate(&clean), clean.len());
+    println!("  | Idealized IMU (Zero VRW): {:>4.1}% ({:>6} runs)  |", crash_rate(&clean), clean.len());
     println!("  | Lab Smooth Control (Low Shock): {:>4.1}% ({:>6} runs)  |", crash_rate(&lab), lab.len());
     println!("  | Concrete Bunker Shock Drift : {:>4.1}% ({:>6} runs)  |", crash_rate(&bunker), bunker.len());
     println!("  +---------------------------------------------+");

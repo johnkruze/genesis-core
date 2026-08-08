@@ -16,12 +16,12 @@ const NUM_TRAJECTORIES: usize = 1_200_000;
 const HZ: f64 = 1000.0;
 const DT: f64 = 1.0 / HZ;
 
-// HII XLUUV Baseline
+// Large UUV Propulsion Baseline
 const HYDROPHONE_SATURATION_THRESHOLD_DB: f64 = 110.0; // Broadband noise > 110dB completely masks distant stealth submarine signatures (which are ~90dB)
 
 fn main() {
     let start_time = Instant::now();
-    let export_dir = "/Users/aijesusbro/Spectrum/data/exports/sovereign";
+    let export_dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../../data/exports/sovereign");
     std::fs::create_dir_all(export_dir).unwrap();
     let file = OpenOptions::new()
         .write(true)

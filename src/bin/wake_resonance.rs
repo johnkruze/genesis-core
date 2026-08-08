@@ -2,7 +2,7 @@
 //! TARGET: Generic Commercial/Industrial Autonomous Systems
 //! CLASS: Generic Autonomous Platform
 //! SUBSYSTEM: Collaborative Flight Control AI
-//! VULNERABILITY: Autonomous aerial refueling AI relies heavily on computer vision and localized CFD modeling to maintain perfectly static formation behind the tanker. However, operating behind a Nimitz-class carrier group at low altitudes introduces massive, chaotic harmonic vortex shedding from the ship's superstructure. The AI attempts to filter this as standard turbulence but the wake frequencies physically entrain the drone's V-tail resonance, saturating the pitch command authority and snapping the refueling probe off inside the receiver aircraft.
+//! VULNERABILITY: Autonomous aerial refueling AI relies heavily on computer vision and localized CFD modeling to maintain perfectly static formation behind the tanker. However, operating behind a carrier battle group at low altitudes introduces massive, chaotic harmonic vortex shedding from the ship's superstructure. The AI attempts to filter this as standard turbulence but the wake frequencies physically entrain the drone's V-tail resonance, saturating the pitch command authority and snapping the refueling probe off inside the receiver aircraft.
 
 use rayon::prelude::*;
 use serde_json::json;
@@ -22,7 +22,7 @@ const CARRIER_WAKE_VORTEX_FREQ_HZ: f64 = 3.5; // High-energy shed vortices from 
 
 fn main() {
     let start_time = Instant::now();
-    let export_dir = "/Users/aijesusbro/Spectrum/data/exports/sovereign";
+    let export_dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../../data/exports/sovereign");
     std::fs::create_dir_all(export_dir).unwrap();
     let file = OpenOptions::new()
         .write(true)
@@ -47,7 +47,7 @@ fn main() {
         let mut max_shear_n = 0.0;
         let mut probe_snap_failure = false;
         
-        // Simulating the MQ-25 attempting a basket connection 500ft behind the carrier in rough seas
+        // Simulating the autonomous tanker attempting a basket connection 500ft behind the carrier in rough seas
         let wind_speed_kts = rng.gen_range(25.0..45.0); // Minimum wind over deck + natural wind
         let wake_base: f64 = wind_speed_kts / 30.0;
         let wake_energy = wake_base.powi(2) * 5000.0; 
@@ -57,13 +57,13 @@ fn main() {
         
         let mut pid_integral = 0.0;
         
-        // The MQ-25 is physically coupled to the receiver aircraft via the refueling hose (spring-damper)
+        // The autonomous tanker is physically coupled to the receiver aircraft via the refueling hose (spring-damper)
         let hose_stiffness_k = 3000.0; 
         
         for tick in 0..(10.0 * HZ) as usize { // 10 seconds of connected refueling
             
             // The carrier island sheds massive Von Karman vortices. 
-            // The generative AI interprets this as random white-noise turbulence, but it's actually highly harmonic.
+            // The idealized planner interprets this as random white-noise turbulence, but it's actually highly harmonic.
             let vortex_forcing = (tick as f64 * DT * CARRIER_WAKE_VORTEX_FREQ_HZ * std::f64::consts::PI * 2.0).sin() * wake_energy;
             
             let target_displacement = 0.0; // AI wants perfectly level flight

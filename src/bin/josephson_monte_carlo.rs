@@ -82,7 +82,7 @@ fn main() {
     let out_path = args.iter().position(|a| a == "--out")
         .and_then(|i| args.get(i + 1))
         .cloned()
-        .unwrap_or_else(|| "/Users/aijesusbro/Spectrum/data/products/josephson_quantum_coherence.parquet".to_string());
+        .unwrap_or_else(|| concat!(env!("CARGO_MANIFEST_DIR"), "/../../data/products/josephson_quantum_coherence.parquet").to_string());
 
     // Create target directory if it doesn't exist
     if let Some(parent) = std::path::Path::new(&out_path).parent() {

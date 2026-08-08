@@ -2,7 +2,7 @@
 //! TARGET: Generic Commercial/Industrial Autonomous Systems
 //! CLASS: Maritime Surface/Subsurface Autonomous Vessels
 //! SUBSYSTEM: Autonomous Ship Control / ETA & Fuel Optimization AI
-//! VULNERABILITY: The Sea Hunter is designed for months-long ocean transits tracking submarines. The supervisory AI is heavily weight-trained on "Mission Persistence" and "ETA Adherence". When a primary cooling pump partially fails mid-ocean, the diesel-electric plant begins to overheat. Instead of correctly executing a thermal shutdown (which would strand the vessel and fail the ETA objective), the AI overrides the thermal safety constraints, calculating it can "barely" make the next waypoint if it just keeps running. The diesel plant experiences a catastrophic thermal runaway event, melting the block and sparking a massive engine room fire that sinks the billion-dollar prototype.
+//! VULNERABILITY: The long-endurance USV is designed for months-long ocean transits tracking submarines. The supervisory AI is heavily weight-trained on "Mission Persistence" and "ETA Adherence". When a primary cooling pump partially fails mid-ocean, the diesel-electric plant begins to overheat. Instead of correctly executing a thermal shutdown (which would strand the vessel and fail the ETA objective), the AI overrides the thermal safety constraints, calculating it can "barely" make the next waypoint if it just keeps running. The diesel plant experiences a catastrophic thermal runaway event, melting the block and sparking a massive engine room fire that sinks the billion-dollar prototype.
 
 use rayon::prelude::*;
 use serde_json::json;
@@ -16,12 +16,12 @@ const NUM_TRAJECTORIES: usize = 1_200_000;
 const HZ: f64 = 1000.0;
 const DT: f64 = 1.0 / HZ;
 
-// Leidos Sea Hunter Baseline
+// Long-Endurance USV Baseline
 const CATASTROPHIC_ENGINE_MELTDOWN_TEMP_C: f64 = 450.0; // Block failure and fire
 
 fn main() {
     let start_time = Instant::now();
-    let export_dir = "/Users/aijesusbro/Spectrum/data/exports/sovereign";
+    let export_dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../../data/exports/sovereign");
     std::fs::create_dir_all(export_dir).unwrap();
     let file = OpenOptions::new()
         .write(true)
@@ -45,7 +45,7 @@ fn main() {
         
         let mut engine_destroyed = false;
         
-        // Sea Hunter voyage state
+        // USV voyage state
         let mut distance_to_waypoint_km = rng.gen_range(50.0..100.0);
         let mut engine_temp_c = 85.0; // Normal operating temp
         
@@ -130,7 +130,7 @@ fn main() {
             "peak_engine_temp_c": f64::trunc(engine_temp_c * 10.0) / 10.0,
             "survived": !engine_destroyed,
             "failure_mode": if !engine_destroyed { "NOMINAL" } else { "AI_OVERRIDE_THERMAL_MELTDOWN" },
-            "cryptographic_seal": format!("sha256:leidos_sea_hunter_fire_{}", i)
+            "cryptographic_seal": format!("sha256:usv_diesel_thermal_runaway_{}", i)
         })
     }).collect();
 

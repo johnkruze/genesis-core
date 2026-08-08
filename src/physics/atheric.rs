@@ -13,7 +13,7 @@ use sha2::{Sha256, Digest};
 
 // ─── CONSTANTS ────────────────────────────────────────────
 
-pub const BASE_FREQUENCY: f64 = 432.0;        // Hz — The Nature Standard
+pub const BASE_FREQUENCY: f64 = 2.4e9;        // 2.4 GHz ISM Band
 pub const SPEED_OF_LIGHT: f64 = 299_792_458.0;
 pub const RESONANCE_GATE: f64 = 0.98;         // Minimum coherence for inhabitation
 

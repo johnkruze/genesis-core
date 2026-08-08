@@ -1,10 +1,10 @@
-// G^G QUADRUPED KINETIC RECOIL MONTE CARLO (GHOST ROBOTICS STRIKE III)
+// G^G QUADRUPED KINETIC RECOIL MONTE CARLO (quadruped platform STRIKE III)
 // Sovereign Verification: Instantaneous Ballistic Impulse vs PID Gyro Recovery
 //
-// THE EMBODIMENT: A Ghost Robotics V60 Quadruped (50kg) carrying a 10kg SPUR 
+// THE EMBODIMENT: A quadruped platform V60 Quadruped (50kg) carrying a 10kg SPUR 
 // (Special Purpose Unmanned Rifle) mounted on its dorsal hardpoints. 
 // 
-// THE VULNERABILITY: Isaac Sim RL policies are trained to withstand "continuous" 
+// THE VULNERABILITY: Idealized RL policies are trained to withstand "continuous" 
 // disturbances (wind) or low-frequency kinetic shoves (a human kicking the dog).
 // They rely on PID loops and IMU gyroscopes to swing the legs and catch the fall.
 //
@@ -43,7 +43,7 @@ const ROLL_RECOVERY_LIMIT_RAD: f64 = 0.785; // 45 degrees. Beyond this, it turtl
 enum FailureMode {
     FourPointStance,      // Firing while perfectly still (4 feet planted)
     DiagonalGaitImpulse,  // Firing while walking (2 feet planted)
-    IsaacSimPerfectCoG,   // Hallucinating that the rifle kicks perfectly through the CoG
+    IdealizedCenteredCoG,   // Hallucinating that the rifle kicks perfectly through the CoG
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -93,7 +93,7 @@ fn run_single_trajectory(
     let total_mass = 60.0; // 50kg dog + 10kg rifle
     
     // Failure injection
-    let failure = if rng.chance(0.15) { FailureMode::IsaacSimPerfectCoG }
+    let failure = if rng.chance(0.15) { FailureMode::IdealizedCenteredCoG }
     else if rng.chance(0.25) { FailureMode::FourPointStance }
     else { FailureMode::DiagonalGaitImpulse };
 
@@ -104,8 +104,8 @@ fn run_single_trajectory(
     // We simulate the shot at exactly t = 1.0s
     let trigger_pull_time = 1.0; 
 
-    // True physical offsets. Isaac Sim sometimes centers mass perfectly in training.
-    let (h_offset, l_offset) = if failure == FailureMode::IsaacSimPerfectCoG {
+    // True physical offsets. Idealized trainers sometimes center mass perfectly in training.
+    let (h_offset, l_offset) = if failure == FailureMode::IdealizedCenteredCoG {
         (0.0, 0.0) // Perfect center of mass hallucination
     } else {
         (MOUNT_HEIGHT_OFFSET_M, MOUNT_LATERAL_OFFSET_M)
@@ -279,14 +279,14 @@ fn main() {
 
     if !json_output {
         println!("====================================================================");
-        println!("  G^G KINETIC RECOIL MONTE CARLO (GHOST ROBOTICS SPUR)");
+        println!("  G^G KINETIC RECOIL MONTE CARLO (quadruped platform SPUR)");
         println!("  Verifying Ballistic Roll Collapse vs High-Frequency PID Recovery");
         println!("====================================================================");
         println!();
         println!("  Trajectories:  {}", n_trajectories);
         println!("  Physics:       1000Hz Off-Axis Torque Injection (6.5mm Creedmoor)");
         println!("  Sensors:       UGV IMU Gyroscopic P-Controller");
-        println!("  Estimation:    Isaac Sim RL assumes perfectly centered CoG vectors");
+        println!("  Estimation:    Idealized RL assumes perfectly centered CoG vectors");
         println!("  Boundary:      >45 Deg Chassis Turtle Mode Rollover Cutoff");
         println!("====================================================================");
         println!();
@@ -320,7 +320,7 @@ fn main() {
                     scenario: match r.failure {
                         FailureMode::FourPointStance => "four_point_anchored_stance".to_string(),
                         FailureMode::DiagonalGaitImpulse => "two_point_diagonal_walking_gait".to_string(),
-                        FailureMode::IsaacSimPerfectCoG => "isaac_sim_centered_hallucination".to_string(),
+                        FailureMode::IdealizedCenteredCoG => "idealized_centered_cog_prior".to_string(),
                     },
                     steps: r.steps,
                     score: serde_json::json!({
@@ -432,14 +432,14 @@ fn main() {
     println!("  +---------------------------------------------+");
     let four_point: Vec<&TrajectoryResult> = results.iter().filter(|r| matches!(r.failure, FailureMode::FourPointStance)).collect();
     let gait: Vec<&TrajectoryResult> = results.iter().filter(|r| matches!(r.failure, FailureMode::DiagonalGaitImpulse)).collect();
-    let sim_fail: Vec<&TrajectoryResult> = results.iter().filter(|r| matches!(r.failure, FailureMode::IsaacSimPerfectCoG)).collect();
+    let sim_fail: Vec<&TrajectoryResult> = results.iter().filter(|r| matches!(r.failure, FailureMode::IdealizedCenteredCoG)).collect();
 
     let shatter_rate = |v: &[&TrajectoryResult]| -> f64 {
         if v.is_empty() { 0.0 } else { v.iter().filter(|r| r.outcome != "STABLE_RECOVERY").count() as f64 / v.len() as f64 * 100.0 }
     };
 
     println!("  | Four-Point Anchored Defense:{:>5.1}% ({:>6} runs)  |", shatter_rate(&four_point), four_point.len());
-    println!("  | Omniverse Perfect CoG/Mass :{:>5.1}% ({:>6} runs)  |", shatter_rate(&sim_fail), sim_fail.len());
+    println!("  | Idealized Perfect CoG/Mass :{:>5.1}% ({:>6} runs)  |", shatter_rate(&sim_fail), sim_fail.len());
     println!("  | Two-Point Diagonal Walking :{:>5.1}% ({:>6} runs)  |", shatter_rate(&gait), gait.len());
     println!("  +---------------------------------------------+");
     println!();

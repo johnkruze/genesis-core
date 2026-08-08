@@ -133,7 +133,7 @@ fn run_single_trajectory(
             // 1. FSD REACTION LOGIC
             match failure {
                 FailureMode::VirtualCleanSim => {
-                    // Generative AI hallucinates that all 50 cars instantly coordinate 
+                    // Idealized planner assumes all 50 cars instantly coordinate 
                     // a perfect high-speed reverse formation (0.0s latency).
                     fsd_reverse_velocity_mps = -15.0; // Reversing at 33 mph
                     phase = Phase::SafeSynchronousReverse;

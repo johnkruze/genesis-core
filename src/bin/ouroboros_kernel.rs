@@ -3,7 +3,7 @@
 //
 // "The Serpent Eating Its Own Tail."
 // 
-// This kernel replaces generative AI decision-making during a total sensor blackout
+// This kernel replaces ungrounded planner decision-making during a total sensor blackout
 // (The Dark Window). It pilots the vehicle via absolute mathematical dead-reckoning,
 // calculating 1000Hz Euler physics on its last known parameters, refusing to hallucinate,
 // and cryptographically sealing every internal movement to the SOMA ledger.

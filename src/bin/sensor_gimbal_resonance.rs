@@ -16,12 +16,12 @@ const NUM_TRAJECTORIES: usize = 1_200_000;
 const HZ: f64 = 1000.0;
 const DT: f64 = 1.0 / HZ;
 
-// L3Harris Gimbal Baseline
+// EO Gimbal Baseline
 const MAX_ALLOWABLE_JITTER_MRAD: f64 = 0.5; // If jitter exceeds 0.5 milliradians, the laser designator is useless
 
 fn main() {
     let start_time = Instant::now();
-    let export_dir = "/Users/aijesusbro/Spectrum/data/exports/sovereign";
+    let export_dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../../data/exports/sovereign");
     std::fs::create_dir_all(export_dir).unwrap();
     let file = OpenOptions::new()
         .write(true)
@@ -134,7 +134,7 @@ fn main() {
             "max_jitter_mrad": f64::trunc(max_observed_jitter_mrad * 1000.0) / 1000.0,
             "survived": !targeting_failure,
             "failure_mode": if !targeting_failure { "NOMINAL" } else { "BRINELLING_INDUCED_PID_SLOP" },
-            "cryptographic_seal": format!("sha256:l3harris_gimbal_brinell_{}", i)
+            "cryptographic_seal": format!("sha256:eo_gimbal_brinell_{}", i)
         })
     }).collect();
 

@@ -1,11 +1,11 @@
-// G^G QUADRUPED SHALE MONTE CARLO (GHOST ROBOTICS STRIKE)
+// G^G QUADRUPED SHALE MONTE CARLO (quadruped platform STRIKE)
 // Sovereign Verification: Inverse Kinematics Hallucination vs Kinetic Friction
 //
 // THE EMBODIMENT: A 50kg (110lb) Quadruped Unmanned Ground Vehicle (UGV) ascending
 // a 25-degree incline. The terrain is loose shale/scree (fracturing rock) or black ice.
 // 
 // THE VULNERABILITY: UGVs are trained using Reinforcement Learning (RL) in software
-// like NVIDIA Isaac Sim. The physics engines rely on generic "Mujoco" style friction
+// like idealized rigid-body trainers. The physics engines rely on generic "isotropic Coulomb" style friction
 // models, which assume rigid ground (Static Friction Coefficient ~0.8). 
 //
 // THE MATHEMATICAL REALITY: When a 50kg dog shifts its weight to ONE planted hind 
@@ -35,7 +35,7 @@ const ACTUATOR_MAX_TORQUE_NM: f64 = 110.0;
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum FailureMode {
     Nominal,
-    IsaacSimHallucination, // Assumes concrete friction (mu=0.9)
+    IdealizedFrictionPrior, // Assumes concrete friction (mu=0.9)
     FracturingShale,       // Surface shear causes immediate kinetic slip
     IcePatch,              // mu drops to 0.05 instantly mid-step
 }
@@ -86,7 +86,7 @@ fn run_single_trajectory(
     
     // Failure injection
     let failure = if rng.chance(0.08) { FailureMode::IcePatch }
-    else if rng.chance(0.06) { FailureMode::IsaacSimHallucination }
+    else if rng.chance(0.06) { FailureMode::IdealizedFrictionPrior }
     else if rng.chance(0.06) { FailureMode::FracturingShale }
     else { FailureMode::Nominal };
 
@@ -103,8 +103,8 @@ fn run_single_trajectory(
     }
 
     // AI Hallucination parameters (What the Inverse Kinematics solver *thinks* is happening)
-    let ai_assumed_mu = if failure == FailureMode::IsaacSimHallucination {
-        0.9 // NVIDIA omniverse concrete
+    let ai_assumed_mu = if failure == FailureMode::IdealizedFrictionPrior {
+        0.9 // idealized concrete friction prior
     } else {
         0.5 // Standard tactical estimate
     };
@@ -154,7 +154,7 @@ fn run_single_trajectory(
             phase = Phase::TorqueExecution;
         }
 
-        // 2. THE RL INVERSE KINEMATICS HALLUCINATION (Isaac Sim)
+        // 2. THE RL INVERSE KINEMATICS PRIOR (idealized trainer)
         // The dog attempts to exert torque against the ground to pull its body up the hill.
         // It calculates required torque assuming the foot won't slip (T = F * r).
         let required_hill_force = active_downhill_force + 25.0; // Overcome gravity + ascend
@@ -273,7 +273,7 @@ fn main() {
 
     if !json_output {
         println!("====================================================================");
-        println!("  G^G QUADRUPED SHALE MONTE CARLO (GHOST ROBOTICS)");
+        println!("  G^G QUADRUPED SHALE MONTE CARLO (quadruped platform)");
         println!("  Verifying Terrain Kinematics Hallucination against Live Actuators");
         println!("====================================================================");
         println!();
@@ -313,7 +313,7 @@ fn main() {
                     traj_type: "scree_incline_25deg".to_string(),
                     scenario: match r.failure {
                         FailureMode::Nominal => "nominal_soil".to_string(),
-                        FailureMode::IsaacSimHallucination => "isaac_sim_concrete_hallucination".to_string(),
+                        FailureMode::IdealizedFrictionPrior => "idealized_concrete_friction_prior".to_string(),
                         FailureMode::FracturingShale => "fracturing_shale_scree".to_string(),
                         FailureMode::IcePatch => "black_ice_lateral_slip".to_string(),
                     },
@@ -424,7 +424,7 @@ fn main() {
     println!("  | VULNERABILITY IMPACT (Mechanical Loss Rate)  |");
     println!("  +---------------------------------------------+");
     let nominal: Vec<&TrajectoryResult> = results.iter().filter(|r| matches!(r.failure, FailureMode::Nominal)).collect();
-    let sim_fail: Vec<&TrajectoryResult> = results.iter().filter(|r| matches!(r.failure, FailureMode::IsaacSimHallucination)).collect();
+    let sim_fail: Vec<&TrajectoryResult> = results.iter().filter(|r| matches!(r.failure, FailureMode::IdealizedFrictionPrior)).collect();
     let shale_fail: Vec<&TrajectoryResult> = results.iter().filter(|r| matches!(r.failure, FailureMode::FracturingShale)).collect();
     let ice_fail: Vec<&TrajectoryResult> = results.iter().filter(|r| matches!(r.failure, FailureMode::IcePatch)).collect();
 
@@ -433,7 +433,7 @@ fn main() {
     };
 
     println!("  | Nominal Terrain (Dirt): {:>5.1}% ({:>6} runs)   |", shatter_rate(&nominal), nominal.len());
-    println!("  | Omniverse Hallucination : {:>5.1}% ({:>6} runs)   |", shatter_rate(&sim_fail), sim_fail.len());
+    println!("  | Idealized Friction Prior : {:>5.1}% ({:>6} runs)   |", shatter_rate(&sim_fail), sim_fail.len());
     println!("  | Loose Shale Fracture:  {:>5.1}% ({:>6} runs)   |", shatter_rate(&shale_fail), shale_fail.len());
     println!("  | Structural Black Ice:   {:>5.1}% ({:>6} runs)   |", shatter_rate(&ice_fail), ice_fail.len());
     println!("  +---------------------------------------------+");

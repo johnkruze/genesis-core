@@ -16,14 +16,14 @@ const NUM_TRAJECTORIES: usize = 1_200_000;
 const HZ: f64 = 1000.0;
 const DT: f64 = 1.0 / HZ;
 
-// NEO Tendon Physics Baseline
+// Synthetic Tendon Physics Baseline
 const CABLE_TENSILE_LIMIT_N: f64 = 2500.0; // Assume 2500 Newtons break force for synthetic tendon
 const PAYLOAD_MASS_KG: f64 = 15.0; // Box lift scenario
 const GRAVITY: f64 = 9.81;
 
 fn main() {
     let start_time = Instant::now();
-    let export_dir = "/Users/aijesusbro/Spectrum/data/exports/sovereign";
+    let export_dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../../data/exports/sovereign");
     std::fs::create_dir_all(export_dir).unwrap();
     let file = OpenOptions::new()
         .write(true)

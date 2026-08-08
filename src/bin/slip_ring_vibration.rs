@@ -2,7 +2,7 @@
 //! TARGET: Generic Commercial/Industrial Autonomous Systems
 //! CLASS: Quadrupedal Robotics
 //! SUBSYSTEM: Infinite Rotation Actuators
-//! VULNERABILITY: Anybotics uses infinite rotation joints (slip rings) to pass high-speed data buses across moving boundaries. In heavy industrial environments (e.g. vibrating steel catwalks on an oil rig), exogenous structural vibration couples with the slip ring brushes. At specific harmonics, the physical brushes bounce off the gold contact rings, literally dropping Ethernet packets on the floor and severing the E2E matrix communication spine for milliseconds at a time.
+//! VULNERABILITY: Some quadrupeds use infinite rotation joints (slip rings) to pass high-speed data buses across moving boundaries. In heavy industrial environments (e.g. vibrating steel catwalks on an oil rig), exogenous structural vibration couples with the slip ring brushes. At specific harmonics, the physical brushes bounce off the gold contact rings, literally dropping Ethernet packets on the floor and severing the E2E matrix communication spine for milliseconds at a time.
 
 use rayon::prelude::*;
 use serde_json::json;
@@ -16,13 +16,13 @@ const NUM_TRAJECTORIES: usize = 1_200_000;
 const HZ: f64 = 1000.0;
 const DT: f64 = 1.0 / HZ;
 
-// Anybotics Slip Ring Baseline
+// Quadruped Slip Ring Baseline
 const BRUSH_SPRING_FORCE_N: f64 = 1.2; // The delicate preload on the gold/silver slip ring brush
 const E2E_CRITICAL_PACKET_LOSS_MS: f64 = 30.0; // If the central policy loses connection to the leg for 30ms, the quadruped trips.
 
 fn main() {
     let start_time = Instant::now();
-    let export_dir = "/Users/aijesusbro/Spectrum/data/exports/sovereign";
+    let export_dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../../data/exports/sovereign");
     std::fs::create_dir_all(export_dir).unwrap();
     let file = OpenOptions::new()
         .write(true)

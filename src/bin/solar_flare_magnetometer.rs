@@ -2,7 +2,7 @@
 //! TARGET: Generic Commercial/Industrial Autonomous Systems
 //! CLASS: Autonomous Flight Systems / Drones
 //! SUBSYSTEM: Sensor Fusion / Heading AI (Magnetometer & GPS)
-//! VULNERABILITY: The Puma uses a low-cost MEMS magnetometer for rapid heading stabilization, fused with slower GPS updates via an Extended Kalman Filter (EKF). During a G3-class solar flare (or a localized directed magnetic anomaly weapon), the Earth's local magnetic field skews significantly. The fast-response magnetometer reports a sudden 45-degree heading shift. Because the AI is hardcoded to trust the magnetometer for high-frequency updates, it aggressively banks to "correct" this hallucinated deviation. The drone establishes a steady-state crabbing angle, permanently wandering off its programmed waypoint track and deep into hostile airspace before the slower GPS loop can accumulate enough error covariance to reject the magnetic data.
+//! VULNERABILITY: The UAV uses a low-cost MEMS magnetometer for rapid heading stabilization, fused with slower GPS updates via an Extended Kalman Filter (EKF). During a G3-class solar flare (or a localized directed magnetic anomaly weapon), the Earth's local magnetic field skews significantly. The fast-response magnetometer reports a sudden 45-degree heading shift. Because the AI is hardcoded to trust the magnetometer for high-frequency updates, it aggressively banks to "correct" this hallucinated deviation. The drone establishes a steady-state crabbing angle, permanently wandering off its programmed waypoint track and deep into hostile airspace before the slower GPS loop can accumulate enough error covariance to reject the magnetic data.
 
 use rayon::prelude::*;
 use serde_json::json;
@@ -16,12 +16,12 @@ const NUM_TRAJECTORIES: usize = 1_200_000;
 const HZ: f64 = 1000.0;
 const DT: f64 = 1.0 / HZ;
 
-// Solar UAV Baseline
+// Solar UAV Magnetometer Baseline
 const WAYPOINT_DEVIATION_FAILURE_M: f64 = 1000.0; // If it wanders >1km off the corridor, it enters denied airspace and is lost.
 
 fn main() {
     let start_time = Instant::now();
-    let export_dir = "/Users/aijesusbro/Spectrum/data/exports/sovereign";
+    let export_dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../../data/exports/sovereign");
     std::fs::create_dir_all(export_dir).unwrap();
     let file = OpenOptions::new()
         .write(true)
@@ -46,7 +46,7 @@ fn main() {
         let mut drone_lost = false;
         
         // Flight condition
-        let flight_velocity_ms = 15.0; // Typical Puma cruise (~30 knots)
+        let flight_velocity_ms = 15.0; // Typical UAV cruise (~30 knots)
         // Waypoint is 10km away on heading 0.0 (Due North)
         let target_heading_rad = 0.0;
         
@@ -129,7 +129,7 @@ fn main() {
             "max_lateral_deviation_m": f64::trunc(max_deviation_m * 10.0) / 10.0,
             "survived": !drone_lost,
             "failure_mode": if !drone_lost { "NOMINAL" } else { "MAGNETOMETER_HALLUCINATION_OFF_COURSE" },
-            "cryptographic_seal": format!("sha256:aerovironment_puma_mag_{}", i)
+            "cryptographic_seal": format!("sha256:solar_uav_magnetometer_{}", i)
         })
     }).collect();
 

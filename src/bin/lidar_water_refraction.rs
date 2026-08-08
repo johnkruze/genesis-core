@@ -2,7 +2,7 @@
 //! TARGET: Generic Commercial/Industrial Autonomous Systems
 //! CLASS: Quadrupedal Robotics
 //! SUBSYSTEM: Ouster LiDAR Navigation
-//! VULNERABILITY: Anybotics markets its quadruped for outdoor rainy environments (IP67). However, when rainwater aggregates into macroscopic droplets on the transparent spinning LiDAR dome, each droplet acts as a convex or concave lens. The emitted 850nm laser pulse refracts through the droplet, changing its exit angle. The returned time-of-flight photon is mapped to the *expected* angle, not the refracted one, causing the SLAM map to dynamically warp and curve around the robot until it hallucinates a wall and freezes.
+//! VULNERABILITY: When a quadruped operates in outdoor rainy environments (IP67), if rainwater aggregates into macroscopic droplets on the transparent spinning LiDAR dome, each droplet acts as a convex or concave lens. The emitted 850nm laser pulse refracts through the droplet, changing its exit angle. The returned time-of-flight photon is mapped to the *expected* angle, not the refracted one, causing the SLAM map to dynamically warp and curve around the robot until it hallucinates a wall and freezes.
 
 use rayon::prelude::*;
 use serde_json::json;
@@ -16,13 +16,13 @@ const NUM_TRAJECTORIES: usize = 1_200_000;
 const HZ: f64 = 1000.0;
 const DT: f64 = 1.0 / HZ;
 
-// Anybotics Optical Baseline
+// Quadruped Optical Baseline
 const LIDAR_BEAM_DIVERGENCE_RAD: f64 = 0.003; // ~0.17 degrees beam width
 const CRITICAL_MAPPING_ERROR_M: f64 = 1.5; // If a wall is mapped 1.5m closer than reality, the robot refuses to move forward.
 
 fn main() {
     let start_time = Instant::now();
-    let export_dir = "/Users/aijesusbro/Spectrum/data/exports/sovereign";
+    let export_dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../../data/exports/sovereign");
     std::fs::create_dir_all(export_dir).unwrap();
     let file = OpenOptions::new()
         .write(true)
@@ -98,7 +98,7 @@ fn main() {
             "max_depth_hallucination_m": f64::trunc(max_depth_hallucination_m * 10.0) / 10.0,
             "survived": !vslam_virtual_cage_freeze,
             "failure_mode": if !vslam_virtual_cage_freeze { "NOMINAL" } else { "VSLAM_WATER_REFRACTION_PHANTOM_OBSTACLE" },
-            "cryptographic_seal": format!("sha256:anybotics_water_refraction_{}", i)
+            "cryptographic_seal": format!("sha256:quadruped_water_refraction_{}", i)
         })
     }).collect();
 

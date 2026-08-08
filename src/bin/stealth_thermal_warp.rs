@@ -22,7 +22,7 @@ const RCS_BLOOM_DETECTION_THRESHOLD_M2: f64 = 0.05; // If RCS blooms past 0.05m^
 
 fn main() {
     let start_time = Instant::now();
-    let export_dir = "/Users/aijesusbro/Spectrum/data/exports/sovereign";
+    let export_dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../../data/exports/sovereign");
     std::fs::create_dir_all(export_dir).unwrap();
     let file = OpenOptions::new()
         .write(true)

@@ -608,7 +608,7 @@ fn main() {
     let out_path = args.iter().position(|a| a == "--out")
         .and_then(|i| args.get(i + 1))
         .cloned()
-        .unwrap_or_else(|| "/Users/aijesusbro/Spectrum/data/products/hypersonic_aerothermal_ablation.parquet".to_string());
+        .unwrap_or_else(|| concat!(env!("CARGO_MANIFEST_DIR"), "/../../data/products/hypersonic_aerothermal_ablation.parquet").to_string());
 
     let scenario = args.iter().position(|a| a == "--scenario")
         .and_then(|i| args.get(i + 1))

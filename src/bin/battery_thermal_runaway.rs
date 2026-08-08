@@ -16,13 +16,13 @@ const NUM_TRAJECTORIES: usize = 1_200_000;
 const HZ: f64 = 1000.0;
 const DT: f64 = 1.0 / HZ;
 
-// NEO Battery Baseline
+// Compact Battery Thermal Baseline
 const SAFE_DISCHARGE_CURRENT_AMPS: f64 = 40.0; // The continuous safe discharge limit
 const CRITICAL_CELL_TEMP_C: f64 = 65.0; // BMS forced shutdown or cell venting
 
 fn main() {
     let start_time = Instant::now();
-    let export_dir = "/Users/aijesusbro/Spectrum/data/exports/sovereign";
+    let export_dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../../data/exports/sovereign");
     std::fs::create_dir_all(export_dir).unwrap();
     let file = OpenOptions::new()
         .write(true)

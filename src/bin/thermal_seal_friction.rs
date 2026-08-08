@@ -16,13 +16,13 @@ const NUM_TRAJECTORIES: usize = 1_200_000;
 const HZ: f64 = 1000.0;
 const DT: f64 = 1.0 / HZ;
 
-// Anybotics Actuator Baseline
+// Quadruped Actuator Baseline
 const NOMINAL_SEAL_FRICTION: f64 = 0.05; // Base friction coefficient inside the actuator at 20C
 const FATAL_PHASE_LAG_MS: f64 = 15.0; // The RL policy expects movement. If the leg is stuck for >15ms holding a dynamic pose, the robot tips over.
 
 fn main() {
     let start_time = Instant::now();
-    let export_dir = "/Users/aijesusbro/Spectrum/data/exports/sovereign";
+    let export_dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../../data/exports/sovereign");
     std::fs::create_dir_all(export_dir).unwrap();
     let file = OpenOptions::new()
         .write(true)
@@ -45,7 +45,7 @@ fn main() {
         let mut rng = rand::thread_rng();
         
         // Simulating deployment on a North Sea Rig in Winter
-        // Nominal Isaac Sim training temp: 20C. Physical deployment temp: -15C to 5C.
+        // Nominal idealized training temp: 20C. Physical deployment temp: -15C to 5C.
         let ambient_temp_c = rng.gen_range(-15.0..5.0);
         
         // Polymer seals (PTFE / Rubber) contract exponentially as they approach freezing.
@@ -65,7 +65,7 @@ fn main() {
             let commanded_torque = rng.gen_range(10.0..50.0); 
             
             // To overcome the thermal stiction, a larger threshold of torque is required.
-            // In Isaac Sim, this threshold is static.
+            // In idealized trainers, this threshold is static.
             let physical_breakaway_force = actual_seal_stiction * 500.0; // Arbitrary torque map
             
             // The time it takes for the motor to ramp up enough current to overcome this unmodeled stiction

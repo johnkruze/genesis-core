@@ -16,12 +16,12 @@ const NUM_TRAJECTORIES: usize = 1_200_000;
 const HZ: f64 = 1000.0;
 const DT: f64 = 1.0 / HZ;
 
-// Textron Aerosonde Baseline
+// Fixed-Wing UAV Icing Baseline
 const CRITICAL_STALL_ANGLE_RAD: f64 = 0.26; // ~15 degrees AoA is the absolute limit before flow separation
 
 fn main() {
     let start_time = Instant::now();
-    let export_dir = "/Users/aijesusbro/Spectrum/data/exports/sovereign";
+    let export_dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../../data/exports/sovereign");
     std::fs::create_dir_all(export_dir).unwrap();
     let file = OpenOptions::new()
         .write(true)
@@ -141,7 +141,7 @@ fn main() {
             "max_forced_aoa_rad": f64::trunc(max_aoa_rad * 100.0) / 100.0,
             "survived": !uas_stalled,
             "failure_mode": if !uas_stalled { "NOMINAL" } else { "AI_INDUCED_AERODYNAMIC_STALL" },
-            "cryptographic_seal": format!("sha256:textron_aerosonde_stall_{}", i)
+            "cryptographic_seal": format!("sha256:fixed_wing_icing_stall_{}", i)
         })
     }).collect();
 

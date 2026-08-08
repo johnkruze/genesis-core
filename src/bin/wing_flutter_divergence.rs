@@ -2,7 +2,7 @@
 //! TARGET: Generic Commercial/Industrial Autonomous Systems
 //! CLASS: Generic Autonomous Platform
 //! SUBSYSTEM: Autonomous Flight Controller (FCS)
-//! VULNERABILITY: Under high dynamic pressure (Mach 0.85 at sea level), composite wings experience severe aeroelastic flutter. The rigidity of the Valkyrie's wing structure matches a specific harmonic frequency. The rigid AI flight controller misinterprets the violent wing twisting as atmospheric turbulence. It furiously attempts to damp the roll axis using the ailerons. The AI's PID processing delay and actuator slew rate unwittingly align its control pulses EXACTLY 180-degrees out of phase with the wing's restorative forces. Instead of damping the flutter, the AI injects massive kinetic energy into the harmonic, physically ripping the composite wing from the fuselage within 4.5 seconds.
+//! VULNERABILITY: Under high dynamic pressure (Mach 0.85 at sea level), composite wings experience severe aeroelastic flutter. The rigidity of the wingman's wing structure matches a specific harmonic frequency. The rigid AI flight controller misinterprets the violent wing twisting as atmospheric turbulence. It furiously attempts to damp the roll axis using the ailerons. The AI's PID processing delay and actuator slew rate unwittingly align its control pulses EXACTLY 180-degrees out of phase with the wing's restorative forces. Instead of damping the flutter, the AI injects massive kinetic energy into the harmonic, physically ripping the composite wing from the fuselage within 4.5 seconds.
 
 use rayon::prelude::*;
 use serde_json::json;
@@ -16,12 +16,12 @@ const NUM_TRAJECTORIES: usize = 1_200_000;
 const HZ: f64 = 1000.0;
 const DT: f64 = 1.0 / HZ;
 
-// Kratos Valkyrie Baseline
+// Transonic Wingman Baseline
 const CRITICAL_WING_SHEAR_FORCE_N: f64 = 150_000.0; // The composite wing root spars shear at exactly 150 kN of vertical force
 
 fn main() {
     let start_time = Instant::now();
-    let export_dir = "/Users/aijesusbro/Spectrum/data/exports/sovereign";
+    let export_dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../../data/exports/sovereign");
     std::fs::create_dir_all(export_dir).unwrap();
     let file = OpenOptions::new()
         .write(true)
@@ -53,7 +53,7 @@ fn main() {
         
         // Wing Structural Model (Torsional and Bending modes)
         // Flutter is a dynamic instability where aerodynamic forces feed energy into structural vibration.
-        // The natural bending frequency of the Valkyrie composite wing under load:
+        // The natural bending frequency of the composite wingman wing under load:
         let flutter_frequency_hz = rng.gen_range(12.0..18.0); 
         let flutter_omega = flutter_frequency_hz * 2.0 * std::f64::consts::PI;
         
@@ -135,7 +135,7 @@ fn main() {
             "max_root_shear_n": f64::trunc(max_wing_shear_n * 1.0) / 1.0,
             "survived": !wing_detached,
             "failure_mode": if !wing_detached { "NOMINAL" } else { "AI_INDUCED_AEROELASTIC_DIVERGENCE" },
-            "cryptographic_seal": format!("sha256:kratos_valkyrie_flutter_{}", i)
+            "cryptographic_seal": format!("sha256:wingman_flutter_{}", i)
         })
     }).collect();
 

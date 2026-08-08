@@ -1,8 +1,8 @@
 //! 1000Hz GENESIS CORE MODULE: QUADRUPED_LEG_THERMAL_SINK
 //! TARGET: Generic Commercial/Industrial Autonomous Systems
 //! CLASS: Quadrupedal Robotics
-//! SUBSYSTEM: Isaac Sim RL Locomotion Policy
-//! VULNERABILITY: Isaac Sim enforces rigid-body actuation and flat thermodynamics. In physical environments with extreme ambient variance (e.g., snow at -10C), the aluminum leg casing acts as a massive thermal sink, dynamically freezing the joint grease and increasing static stiction by 500%. The RL policy, unaware of temperature, fails to inject the breakaway torque required to lift the leg, resulting in face-plants.
+//! SUBSYSTEM: Idealized RL Locomotion Policy
+//! VULNERABILITY: Idealized trainers enforce rigid-body actuation and flat thermodynamics. In physical environments with extreme ambient variance (e.g., snow at -10C), the aluminum leg casing acts as a massive thermal sink, dynamically freezing the joint grease and increasing static stiction by 500%. The RL policy, unaware of temperature, fails to inject the breakaway torque required to lift the leg, resulting in face-plants.
 
 use rayon::prelude::*;
 use serde_json::json;
@@ -22,7 +22,7 @@ const MAX_AVAILABLE_TORQUE_NM: f64 = 23.0; // Peak torque for the knee actuator
 
 fn main() {
     let start_time = Instant::now();
-    let export_dir = "/Users/aijesusbro/Spectrum/data/exports/sovereign";
+    let export_dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../../data/exports/sovereign");
     std::fs::create_dir_all(export_dir).unwrap();
     let file = OpenOptions::new()
         .write(true)
@@ -89,7 +89,7 @@ fn main() {
             "actual_grease_stiction_Nm": f64::trunc(actual_stiction_nm * 100.0) / 100.0,
             "rl_commanded_torque_Nm": f64::trunc(rl_commanded_torque_nm * 100.0) / 100.0,
             "survived": !step_execution_failed,
-            "failure_mode": if !step_execution_failed { "NOMINAL" } else { "ISAAC_SIM_UNMODELED_THERMAL_STICTION_TRIP" },
+            "failure_mode": if !step_execution_failed { "NOMINAL" } else { "UNMODELED_THERMAL_STICTION_TRIP" },
             "cryptographic_seal": format!("sha256:quadruped_thermal_stiction_{}", i)
         })
     }).collect();

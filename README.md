@@ -1,27 +1,51 @@
 # genesis-core
 
-**The G^G physics engine. 14 domains, 113 Monte Carlo simulations, pure CPU Rust. No external physics libraries.**
+**The G^G physics engine.** Pure CPU Rust. First-principles domains. SHA-256 ProofChain on every trajectory. **No external physics libraries.**
 
 [![Website](https://img.shields.io/badge/Web-zerotrustphysics.com-000000?style=flat-square)](https://zerotrustphysics.com)
 [![Dataset](https://img.shields.io/badge/HuggingFace-gg--physical--ground--truth-FF6B00?style=flat-square)](https://huggingface.co/datasets/spiderpilot89/gg-physical-ground-truth)
 [![Paper](https://img.shields.io/badge/Paper-Zero_Trust_Physics-1a1a2e?style=flat-square)](https://zerotrustphysics.com/Zero-Trust-Physics.pdf)
 [![Kernel](https://img.shields.io/badge/FFI_Kernel-ztp--runtime-555555?style=flat-square)](https://github.com/johnkruze/ztp-runtime)
 
----
+| | |
+|--|--|
+| **Brand** | Zero-Trust Physics |
+| **Bins** | ~133 Monte Carlo / audit binaries under `src/bin/` |
+| **Physics** | 14+ first-principles modules in `src/physics/` (including molecular, bioreactor, materials, tribology, plasma_facing, dexterous, …) |
+| **Language** | Domain physics only — no third-party product or simulator brand names in source |
 
-This engine generates the proprioceptive ground truth that lets autonomous systems feel forces instead of just measuring them — the substrate for physically-grounded decision making across 14 environments from Terran soil to transmon qubits.
-
-Every equation in this codebase traces to a verified mechanical reference. Every integration step is signed into a running SHA-256 attestation chain. The corpus it generates is on [HuggingFace](https://huggingface.co/datasets/spiderpilot89/gg-physical-ground-truth) and anchored on the Internet Computer.
+This engine generates sealed trajectory banks so systems can be checked against physical envelopes instead of theater. Every integration path can carry a running SHA-256 attestation chain. Public teaser cuts live on [HuggingFace](https://huggingface.co/datasets/spiderpilot89/gg-physical-ground-truth) (`spiderpilot89`).
 
 ```bash
+# From this crate root
+cargo run --release --bin multi_domain_proof_sweep
 cargo run --release --bin corpus_sweep -- 1000 --export data/corpus/
+```
+
+**Exports:** Prefer `SPECTRUM_ROOT` or paths derived from `CARGO_MANIFEST_DIR`. Product bins default to sibling monorepo data paths when present (writes **truncate** the target file — match intended run scale).
+
+---
+
+## Sealed product trajectory bins
+
+Industrial sealed banks (default **n=2500** for product-scale exports):
+
+| Domain | Binaries (examples) |
+|--------|---------------------|
+| **Bio / process** | `biomolecular_design_monte_carlo`, `genotype_phenotype_terran_monte_carlo`, `microbiome_predictive_engineering_monte_carlo`, `bioreactor_biomanufacturing_monte_carlo`, `genome_engineering_multiplex_monte_carlo`, `compounding_pharmaceutical_monte_carlo` |
+| **Materials** | `materials_inverse_design_monte_carlo`, `materials_inverse_properties_monte_carlo`, `materials_plasma_facing_monte_carlo`, `materials_accelerated_aging_monte_carlo`, `stress_tensor_forge_monte_carlo` (+ `stress_tensor_forge` → mesh OBJ) |
+| **Edge / lab** | `autolab_dexterous_grasp_monte_carlo`, `autolab_atheric_network_monte_carlo`, `autolab_fleet_orchestration_monte_carlo`, `autolab_soma_memory_monte_carlo` |
+
+```bash
+cargo run --release --bin materials_inverse_design_monte_carlo -- 2500
+cargo run --release --bin autolab_dexterous_grasp_monte_carlo -- 2500
 ```
 
 ---
 
 ## Physics Modules
 
-Fourteen physical domains, each implemented from first principles in `src/physics/`:
+Baseline first-principles modules in `src/physics/` (subset):
 
 | Module | Physics |
 |--------|---------|
@@ -44,7 +68,7 @@ Fourteen physical domains, each implemented from first principles in `src/physic
 
 ## Simulation Library
 
-113 Monte Carlo binaries in `src/bin/`. Each one models a specific physical failure mode from first principles.
+Monte Carlo binaries in `src/bin/` (~133). Each models a specific physical failure mode or process envelope from first principles.
 
 ### Humanoid & Legged Systems
 
@@ -228,9 +252,9 @@ Fourteen physical domains, each implemented from first principles in `src/physic
 
 ---
 
-## G^G Product Binaries
+## HF teaser domains
 
-Five commercial physics domains with open baseline data on HuggingFace:
+Five open baseline domains (public HF teaser pack):
 
 ```bash
 cargo run --release --bin humanoid_impedance_monte_carlo -- --export data/products/
@@ -240,21 +264,27 @@ cargo run --release --bin orbital_tumble_monte_carlo -- --export data/products/
 cargo run --release --bin hgv_plasma_monte_carlo -- --export data/products/
 ```
 
+Multi-domain proof harness (domain batches only; not a product SKU):
+
+```bash
+cargo run --release --bin multi_domain_proof_sweep
+```
+
 ---
 
 ## Corpus Pipeline
 
-Full corpus sweep across all domains:
+Full corpus sweep across domains:
 
 ```bash
 # Run N trajectories, export to data/corpus/
 cargo run --release --bin corpus_sweep -- 1000 --export data/corpus/
 
-# Body sweep — all 8 body daemons sequentially
+# Body sweep — body daemons sequentially
 cargo run --release --bin body_sweep -- 1000 --root ../../data/corpus
 ```
 
-Integration rates are live-measured per domain. The `corpus_sweep` binary reports current rates — do not trust constants in source.
+Integration rates are live-measured per domain. The `corpus_sweep` binary reports current rates — do not trust constants in source tables.
 
 ---
 

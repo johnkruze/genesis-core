@@ -16,13 +16,13 @@ const NUM_TRAJECTORIES: usize = 1_200_000;
 const HZ: f64 = 1000.0;
 const DT: f64 = 1.0 / HZ;
 
-// Leidos Heavy Lift Drone Baseline
+// Heavy-Lift Cargo Drone Baseline
 const VRS_INDUCED_VELOCITY_RATIO_THRESHOLD: f64 = 0.5; // If descent rate > 50% of hover induced velocity, VRS begins
 const VRS_FULL_COLLAPSE_RATIO: f64 = 1.25; // If descent rate > 1.25x induced velocity, total lift collapse (<0.1x efficiency)
 
 fn main() {
     let start_time = Instant::now();
-    let export_dir = "/Users/aijesusbro/Spectrum/data/exports/sovereign";
+    let export_dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../../data/exports/sovereign");
     std::fs::create_dir_all(export_dir).unwrap();
     let file = OpenOptions::new()
         .write(true)
@@ -148,7 +148,7 @@ fn main() {
             "impact_velocity_ms": f64::trunc(drone_velocity_ms.abs() * 10.0) / 10.0,
             "survived": !drone_destroyed,
             "failure_mode": if !drone_destroyed { "NOMINAL" } else { "VORTEX_RING_STATE_DYNAMIC_STALL_CRASH" },
-            "cryptographic_seal": format!("sha256:leidos_cargo_vrs_{}", i)
+            "cryptographic_seal": format!("sha256:cargo_drone_vrs_{}", i)
         })
     }).collect();
 

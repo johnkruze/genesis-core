@@ -16,14 +16,14 @@ const NUM_TRAJECTORIES: usize = 1_200_000;
 const HZ: f64 = 1000.0;
 const DT: f64 = 1.0 / HZ;
 
-// Anybotics Thermal Baseline
+// Sealed Enclosure Thermal Baseline
 const IP67_THERMAL_MASS_J_C: f64 = 8500.0; // The chassis can absorb a lot of heat, but has nowhere to dump it
 const CRITICAL_COMPUTE_TEMP_C: f64 = 98.0; // Edge AI throttling threshold
 const RL_PHASE_LAG_FATAL_MS: f64 = 120.0; // If inference delays past 120ms, the quadruped trips itself
 
 fn main() {
     let start_time = Instant::now();
-    let export_dir = "/Users/aijesusbro/Spectrum/data/exports/sovereign";
+    let export_dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../../data/exports/sovereign");
     std::fs::create_dir_all(export_dir).unwrap();
     let file = OpenOptions::new()
         .write(true)

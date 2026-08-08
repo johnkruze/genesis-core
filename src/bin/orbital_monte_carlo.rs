@@ -91,7 +91,7 @@ fn run_single_trajectory(
     // Randomize spacecraft parameters
     let (persona, i_base, wheel_torque, wheel_momentum, thruster_torque) = match rng.index(4) {
         0 => ("MAVEN Satellite", rng.range(1000.0, 3000.0), rng.range(1.0, 5.0), rng.range(50.0, 150.0), rng.range(20.0, 100.0)),
-        1 => ("Starlink v2", rng.range(500.0, 1000.0), rng.range(0.5, 2.0), rng.range(10.0, 50.0), rng.range(5.0, 20.0)),
+        1 => ("mega-constellation v2", rng.range(500.0, 1000.0), rng.range(0.5, 2.0), rng.range(10.0, 50.0), rng.range(5.0, 20.0)),
         2 => ("6U CubeSat", rng.range(0.1, 0.5), rng.range(0.001, 0.01), rng.range(0.01, 0.1), rng.range(0.01, 0.1)),
         _ => ("Spy Satellite", rng.range(5000.0, 15000.0), rng.range(10.0, 50.0), rng.range(200.0, 1000.0), rng.range(100.0, 500.0)),
     };

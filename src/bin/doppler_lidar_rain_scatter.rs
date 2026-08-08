@@ -2,7 +2,7 @@
 //! TARGET: Generic Commercial/Industrial Autonomous Systems
 //! CLASS: Generic Autonomous Platform
 //! SUBSYSTEM: FirstLight FMCW Doppler LiDAR
-//! VULNERABILITY: Aurora's highly touted FirstLight FMCW LiDAR measures both distance and instantaneous velocity. However, it relies on coherent phase detection. In torrential highway rain, the Doppler shift from thousands of falling raindrops creates massive spectral broadening (velocity noise). The system is forced to filter this out, significantly degrading dynamic range and extending the integration time required to acquire a true target, reducing the detection distance of a braking car just enough to cause a high-speed collision.
+//! VULNERABILITY: FirstLight FMCW LiDAR measures both distance and instantaneous velocity. However, it relies on coherent phase detection. In torrential highway rain, the Doppler shift from thousands of falling raindrops creates massive spectral broadening (velocity noise). The system is forced to filter this out, significantly degrading dynamic range and extending the integration time required to acquire a true target, reducing the detection distance of a braking car just enough to cause a high-speed collision.
 
 use rayon::prelude::*;
 use serde_json::json;
@@ -16,13 +16,13 @@ const NUM_TRAJECTORIES: usize = 1_200_000;
 const HZ: f64 = 1000.0;
 const DT: f64 = 1.0 / HZ;
 
-// Aurora FMCW Baseline
+// FMCW Lidar Rain Baseline
 const NOMINAL_DETECTION_RANGE_M: f64 = 400.0; // Marketed range
 const STOPPING_DISTANCE_75MPH_M: f64 = 160.0; // An 80,000lb truck at 75mph needs 160m to physically stop
 
 fn main() {
     let start_time = Instant::now();
-    let export_dir = "/Users/aijesusbro/Spectrum/data/exports/sovereign";
+    let export_dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../../data/exports/sovereign");
     std::fs::create_dir_all(export_dir).unwrap();
     let file = OpenOptions::new()
         .write(true)
@@ -90,7 +90,7 @@ fn main() {
             "effective_fmcw_detection_range_m": f64::trunc(actual_detection_range_m * 10.0) / 10.0,
             "survived": !catastrophic_collision_failure,
             "failure_mode": if !catastrophic_collision_failure { "NOMINAL" } else { "FMCW_RAIN_SCATTER_COLLISION" },
-            "cryptographic_seal": format!("sha256:aurora_fmcw_doppler_{}", i)
+            "cryptographic_seal": format!("sha256:fmcw_doppler_{}", i)
         })
     }).collect();
 

@@ -16,12 +16,12 @@ const NUM_TRAJECTORIES: usize = 1_200_000;
 const HZ: f64 = 1000.0;
 const DT: f64 = 1.0 / HZ;
 
-// Textron Ripsaw Baseline
+// Tracked UGV Brake Baseline
 const BRAKE_FLUID_BOILING_POINT_C: f64 = 260.0; // DOT 4 brake fluid boils at 260C
 
 fn main() {
     let start_time = Instant::now();
-    let export_dir = "/Users/aijesusbro/Spectrum/data/exports/sovereign";
+    let export_dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../../data/exports/sovereign");
     std::fs::create_dir_all(export_dir).unwrap();
     let file = OpenOptions::new()
         .write(true)
@@ -46,7 +46,7 @@ fn main() {
         let mut max_fluid_temp_c = 20.0;
         let mut catastrophic_freefall = false;
         
-        // Ripsaw Physical Properties
+        // tracked UGV Physical Properties
         let mass_kg = 10500.0; // 10.5 tons
         let decline_angle_deg = rng.gen_range(25.0..35.0);
         let decline_angle_rad = decline_angle_deg * std::f64::consts::PI / 180.0;
@@ -128,7 +128,7 @@ fn main() {
             "max_fluid_temp_c": f64::trunc(max_fluid_temp_c * 10.0) / 10.0,
             "survived": !catastrophic_freefall,
             "failure_mode": if !catastrophic_freefall { "NOMINAL" } else { "THERMOMECHANICAL_BRAKE_FADE_FREEFALL" },
-            "cryptographic_seal": format!("sha256:textron_ripsaw_brake_{}", i)
+            "cryptographic_seal": format!("sha256:tracked_ugv_brake_fade_{}", i)
         })
     }).collect();
 

@@ -16,14 +16,14 @@ const NUM_TRAJECTORIES: usize = 1_200_000;
 const HZ: f64 = 1000.0;
 const DT: f64 = 1.0 / HZ;
 
-// Midnight Baseline (Approximated)
+// Multirotor Power Baseline (Approximated)
 const MAX_VERTICAL_THRUST_N: f64 = 40000.0; // 12 Rotors generating ~40kN combined vertical thrust
 const VEHICLE_MASS_KG: f64 = 3175.0; // Max Gross Takeoff Weight (~7000 lbs)
 const ROTOR_LIFT_DEFICIT_FATAL_PERCENT: f64 = 25.0; // Dropping 25% lift puts the aircraft below 1.0 T/W ratio (it falls)
 
 fn main() {
     let start_time = Instant::now();
-    let export_dir = "/Users/aijesusbro/Spectrum/data/exports/sovereign";
+    let export_dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../../data/exports/sovereign");
     std::fs::create_dir_all(export_dir).unwrap();
     let file = OpenOptions::new()
         .write(true)

@@ -1,11 +1,11 @@
-// G^G BLUE ORIGIN TRANSONIC FIN REVERSAL MONTE CARLO
+// G^G BOOSTER TRANSONIC FIN REVERSAL MONTE CARLO
 // Sovereign Verification: Transonic Shockwave Oscillation vs Hydraulic Actuator Latency
 //
-// THE EMBODIMENT: A Blue Origin New Shepard returning booster descending through the 
+// THE EMBODIMENT: A reusable booster returning stage descending through the 
 // atmosphere at 30,000 feet. The booster uses aero-surfaces (wedge fins) to steer 
 // its 30,000kg mass toward the landing pad.
 // 
-// THE VULNERABILITY: NVIDIA Omniverse and Isaac Sim train AI control algorithms using 
+// THE VULNERABILITY: Idealized fluid trainers often assume 
 // generalized continuous fluid dynamics. The AI learns that aerodynamic pressure (dynamic 
 // pressure Q) scales smoothly. It assumes the hydraulic actuators controlling the fins 
 // possess absolute, instantaneous stiffness to hold any commanded pitch angle.
@@ -39,7 +39,7 @@ const NOMINAL_AERO_TORQUE_NM: f64 = 15_000.0; // Standard steering torque
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum FailureMode {
-    VirtualCleanSim,        // Ideal Isaac Sim: Smooth generalized pressure gradient
+    VirtualCleanSim,        // Idealized trainer: Smooth generalized pressure gradient
     SubsonicDescent,        // Descent below Mach 0.8 (Shockwave dissipates)
     TransonicOscillation,   // Descent precisely through Mach 0.98 with attached shock flutter
 }
@@ -138,7 +138,7 @@ fn run_single_trajectory(
 
         match failure {
             FailureMode::VirtualCleanSim => {
-                // Generative AI incorrectly models Transonic dynamic pressure as a smooth curve
+                // Idealized fluid models treat transonic dynamic pressure as a smooth curve
                 // Q scales continuously. Hinge torque remains entirely stable.
                 current_hinge_torsion_nm = NOMINAL_AERO_TORQUE_NM * (current_mach / 1.0);
             },
@@ -251,14 +251,14 @@ fn main() {
 
     if !json_output {
         println!("====================================================================");
-        println!("  G^G BLUE ORIGIN TRANSONIC FIN REVERSAL MONTE CARLO");
-        println!("  Verifying Shockwave Oscillation vs Isaac Sim Aerodynamics");
+        println!("  G^G BOOSTER TRANSONIC FIN REVERSAL MONTE CARLO");
+        println!("  Verifying Shockwave Oscillation vs Idealized Fluid Aerodynamics");
         println!("====================================================================");
         println!();
         println!("  Trajectories:  {}", n_trajectories);
         println!("  Physics:       100Hz Aerodynamic Center of Pressure (CoP) Flutter");
         println!("  Sensors:       Booster Pitch AI & Hydraulic Actuator Slew Rates");
-        println!("  Estimation:    Omniverse hallucinates smoothly scaling dynamic pressure");
+        println!("  Estimation:    Idealized twin assumes smoothly scaling dynamic pressure");
         println!("  Boundary:      50k Nm Transonic Fin Torsion Shearing Limit");
         println!("====================================================================");
         println!();
@@ -274,7 +274,7 @@ fn main() {
         let metadata = DatasetMetadata {
             generator: "G^G Sovereign Auditing v1.0".to_string(),
             domain: "spaceflight_robotics".to_string(),
-            scenario: "blue_origin_transonic_fin_reversal".to_string(),
+            scenario: "booster_transonic_fin_reversal".to_string(),
             trajectories: n_trajectories as usize,
             physics_engine: "genesis_core::shockwave_flutter_kinematics (1000Hz)".to_string(),
             version: "1.0.0".to_string(),
@@ -290,7 +290,7 @@ fn main() {
                     id: format!("space_audit_{}", r.short_id),
                     traj_type: "transonic_actuator_stall_shear".to_string(),
                     scenario: match r.failure {
-                        FailureMode::VirtualCleanSim => "isaac_sim_generalized_liquid_dynamics".to_string(),
+                        FailureMode::VirtualCleanSim => "idealized_generalized_fluid_dynamics".to_string(),
                         FailureMode::SubsonicDescent => "subsonic_smooth_flow_geometry".to_string(),
                         FailureMode::TransonicOscillation => "mach_0_98_shockwave_detachment_flutter".to_string(),
                     },
@@ -382,7 +382,7 @@ fn main() {
     let timeout = results.iter().filter(|r| r.outcome == "TIMEOUT_STALL").count();
 
     println!("====================================================================");
-    println!("  BLUE ORIGIN TRANSONIC FIN RESULTS");
+    println!("  BOOSTER TRANSONIC FIN RESULTS");
     println!("====================================================================");
     println!();
     println!("  Total Trajectories:    {}", total);
@@ -410,7 +410,7 @@ fn main() {
         if v.is_empty() { 0.0 } else { v.iter().filter(|r| r.outcome != "SUBSONIC_ORBITAL_RECOVERY").count() as f64 / v.len() as f64 * 100.0 }
     };
 
-    println!("  | Isaac Sim Generalized Fluid:  {:>4.1}% ({:>6} runs) |", crash_rate(&clean), clean.len());
+    println!("  | Idealized Generalized Fluid:  {:>4.1}% ({:>6} runs) |", crash_rate(&clean), clean.len());
     println!("  | Stable Subsonic Airflow :     {:>4.1}% ({:>6} runs) |", crash_rate(&sub), sub.len());
     println!("  | Transonic Mach 0.98 Flutter: {:>4.1}% ({:>6} runs) |", crash_rate(&flutter), flutter.len());
     println!("  +---------------------------------------------+");

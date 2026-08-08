@@ -1,8 +1,8 @@
 //! 1000Hz GENESIS CORE MODULE: ACTUATOR_METALLURGIC_SHEAR
 //! TARGET: Generic Commercial/Industrial Autonomous Systems
 //! CLASS: Bipedal Humanoid
-//! SUBSYSTEM: High-Ratio Gearboxes & Isaac Sim RL Porting
-//! VULNERABILITY: Isaac Sim RL policies command instantaneous torque spikes that exceed the shear yield stress of non-hardened, mass-produced gear teeth.
+//! SUBSYSTEM: High-Ratio Gearboxes & Idealized RL Porting
+//! VULNERABILITY: Idealized RL policies command instantaneous torque spikes that exceed the shear yield stress of non-hardened, mass-produced gear teeth.
 
 use rayon::prelude::*;
 use serde_json::json;
@@ -21,7 +21,7 @@ const GEAR_TOOTH_SHEAR_YIELD_NM: f64 = 120.0; // The physical torque limit befor
 
 fn main() {
     let start_time = Instant::now();
-    let export_dir = "/Users/aijesusbro/Spectrum/data/exports/sovereign";
+    let export_dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../../data/exports/sovereign");
     std::fs::create_dir_all(export_dir).unwrap();
     let file = OpenOptions::new()
         .write(true)
@@ -43,7 +43,7 @@ fn main() {
     let results: Vec<serde_json::Value> = (0..NUM_TRAJECTORIES).into_par_iter().map(|i| {
         let mut rng = rand::thread_rng();
         
-        // In Isaac Sim / MuJoCo, gears are treated as perfectly elastic geometric primitives.
+        // In idealized rigid-body trainers, gears are treated as perfectly elastic geometric primitives.
         // They can mathematically transmit infinite instantaneous torque.
         // Commercial platforms port these RL policies directly onto cheap, non-hardened steel/aluminum hybrid gearboxes.
 
@@ -56,7 +56,7 @@ fn main() {
             
             // The RL policy attempts to forcefully correct an inversion error (like catching itself from falling).
             // It commands a massive, instantaneous step-function of torque.
-            // Isaac Sim allows this. Physical metallurgy does not.
+            // Idealized trainers allow this. Physical metallurgy does not.
             let rl_torque_spike_nm = dynamic_payload_kg * rng.gen_range(5.0..12.0);
             
             // Further amplified by unmodeled mechanical backlash snapping into contact
@@ -85,7 +85,7 @@ fn main() {
             "max_torque_spike_demanded_NM": f64::trunc(max_torque_demanded * 100.0) / 100.0,
             "metallurgic_yield_limit_NM": GEAR_TOOTH_SHEAR_YIELD_NM,
             "survived": !gear_teeth_sheared,
-            "failure_mode": if !gear_teeth_sheared { "NOMINAL" } else { "ISAAC_SIM_METALLURGIC_GEAR_SHEAR" },
+            "failure_mode": if !gear_teeth_sheared { "NOMINAL" } else { "UNMODELED_METALLURGIC_GEAR_SHEAR" },
             "cryptographic_seal": format!("sha256:actuator_metallurgic_shear_{}", i)
         })
     }).collect();

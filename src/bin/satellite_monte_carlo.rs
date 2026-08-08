@@ -1,5 +1,5 @@
 // G^G Satellite Monte Carlo — THE ORBITAL TRUTH
-// LEO Station-keeping, thermal dynamics drifting, and power consumption for commercial clusters (SpaceX / Google).
+// LEO Station-keeping, thermal dynamics drifting, and power consumption for commercial clusters (commercial constellation / Google).
 
 use std::time::Instant;
 use genesis_core::physics::orbital::{
@@ -48,7 +48,7 @@ fn run_single_trajectory(id: u32, rng: &mut Rng, record_telemetry: bool) -> Traj
         _ => ("LEO_500km", rng.range(500.0, 600.0)),
     };
     
-    let mass = rng.range(250.0, 600.0); // e.g. Starlink v2 Mini
+    let mass = rng.range(250.0, 600.0); // e.g. mega-constellation v2 Mini
     let i_base = mass * 1.5;
     let ix = i_base * 0.8; let iy = i_base * 1.0; let iz = i_base * 0.5;
 

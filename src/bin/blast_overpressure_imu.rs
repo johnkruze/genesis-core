@@ -16,13 +16,13 @@ const NUM_TRAJECTORIES: usize = 1_200_000;
 const HZ: f64 = 1000.0;
 const DT: f64 = 1.0 / HZ;
 
-// GDLS RCV Baseline
+// Robotic Combat Vehicle IMU Baseline
 const IMU_MEMS_CLIP_LIMIT_G: f64 = 50.0; // 50 Gs is typical clipping limit for navigating IMUs
 const IED_DETONATION_DISTANCE_M: f64 = 15.0; // Proximity of the blast
 
 fn main() {
     let start_time = Instant::now();
-    let export_dir = "/Users/aijesusbro/Spectrum/data/exports/sovereign";
+    let export_dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../../data/exports/sovereign");
     std::fs::create_dir_all(export_dir).unwrap();
     let file = OpenOptions::new()
         .write(true)
@@ -124,7 +124,7 @@ fn main() {
             "heading_divergence_deg": f64::trunc(actual_heading.abs() * 10.0) / 10.0,
             "survived": !internal_ekf_diverged,
             "failure_mode": if !internal_ekf_diverged { "NOMINAL" } else { "IMU_OVERPRESSURE_EKF_COLLAPSE" },
-            "cryptographic_seal": format!("sha256:gdls_blast_imu_{}", i)
+            "cryptographic_seal": format!("sha256:rcv_blast_imu_{}", i)
         })
     }).collect();
 

@@ -1,8 +1,8 @@
 //! 1000Hz GENESIS CORE MODULE: HUMANOID_ACTUATOR_BACKLASH_GAIT
 //! TARGET: Generic Commercial/Industrial Autonomous Systems
 //! CLASS: Bipedal Humanoid
-//! SUBSYSTEM: Isaac Sim RL Locomotion Policy
-//! VULNERABILITY: Isaac Sim enforces perfect, immediate torque transfer. It does not natively model the 0.5-2.0 degrees of mechanical backlash (slop) in high-ratio planetary gearboxes. Over millions of steps, this persistent unmodeled deadband accumulates catastrophic phase-lag in the walking gait cycle, leading to resonance and self-destruction.
+//! SUBSYSTEM: Idealized RL Locomotion Policy
+//! VULNERABILITY: Idealized trainers enforce perfect, immediate torque transfer. It does not natively model the 0.5-2.0 degrees of mechanical backlash (slop) in high-ratio planetary gearboxes. Over millions of steps, this persistent unmodeled deadband accumulates catastrophic phase-lag in the walking gait cycle, leading to resonance and self-destruction.
 
 use rayon::prelude::*;
 use serde_json::json;
@@ -22,7 +22,7 @@ const CRITICAL_PHASE_LAG_S: f64 = 0.15; // Being 150ms out-of-phase with the COM
 
 fn main() {
     let start_time = Instant::now();
-    let export_dir = "/Users/aijesusbro/Spectrum/data/exports/sovereign";
+    let export_dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../../data/exports/sovereign");
     std::fs::create_dir_all(export_dir).unwrap();
     let file = OpenOptions::new()
         .write(true)
@@ -91,7 +91,7 @@ fn main() {
             "gearbox_backlash_deg": f64::trunc(gearbox_backlash_deg * 100.0) / 100.0,
             "accumulated_phase_lag_s": f64::trunc(accumulated_phase_lag_s * 1000.0) / 1000.0,
             "survived": !catastrophic_fall,
-            "failure_mode": if !catastrophic_fall { "NOMINAL" } else { "ISAAC_SIM_UNMODELED_BACKLASH_RESONANCE_FALL" },
+            "failure_mode": if !catastrophic_fall { "NOMINAL" } else { "UNMODELED_BACKLASH_RESONANCE_FALL" },
             "cryptographic_seal": format!("sha256:humanoid_gait_backlash_{}", i)
         })
     }).collect();

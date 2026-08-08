@@ -2,7 +2,7 @@
 //! TARGET: Generic Commercial/Industrial Autonomous Systems
 //! CLASS: Unmanned Ground Vehicles (UGVs)
 //! SUBSYSTEM: Multi-axis Active AI Suspension
-//! VULNERABILITY: The Cottonmouth uses AI-driven active suspension to stabilize the incredibly heavy internal C4ISR (Command/Control/Comm) server racks across chaotic off-road terrain. However, if the ARV drives over evenly spaced urban obstacles (like a series of highway rumble strips, speed bumps, or a corrugated logging road) at precisely 40mph, the physical impact frequency mathematically aligns perfectly with the PID controller's resonant response frequency. The AI's dampening loop enters a destabilizing harmonic lock. The active suspension actually *amplifies* the bounce with every hit. Within 10 seconds, the 60G acceleration spikes violently tear the expensive internal C2 hardware racks completely off their mounts, destroying the vehicle's reconnaissance capability.
+//! VULNERABILITY: The ARV uses AI-driven active suspension to stabilize the incredibly heavy internal C4ISR (Command/Control/Comm) server racks across chaotic off-road terrain. However, if the ARV drives over evenly spaced urban obstacles (like a series of highway rumble strips, speed bumps, or a corrugated logging road) at precisely 40mph, the physical impact frequency mathematically aligns perfectly with the PID controller's resonant response frequency. The AI's dampening loop enters a destabilizing harmonic lock. The active suspension actually *amplifies* the bounce with every hit. Within 10 seconds, the 60G acceleration spikes violently tear the expensive internal C2 hardware racks completely off their mounts, destroying the vehicle's reconnaissance capability.
 
 use rayon::prelude::*;
 use serde_json::json;
@@ -16,12 +16,12 @@ const NUM_TRAJECTORIES: usize = 1_200_000;
 const HZ: f64 = 1000.0;
 const DT: f64 = 1.0 / HZ;
 
-// Textron ARV Baseline
+// Active-Suspension ARV Baseline
 const HARDWARE_MOUNT_SHEAR_LIMIT_M_S2: f64 = 588.6; // 60 Gs of vertical acceleration shears the Grade 8 bolts holding the server racks
 
 fn main() {
     let start_time = Instant::now();
-    let export_dir = "/Users/aijesusbro/Spectrum/data/exports/sovereign";
+    let export_dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../../data/exports/sovereign");
     std::fs::create_dir_all(export_dir).unwrap();
     let file = OpenOptions::new()
         .write(true)
@@ -154,7 +154,7 @@ fn main() {
             "max_chassis_g_force": f64::trunc(max_vertical_accel_gs * 10.0) / 10.0,
             "survived": !c4isr_hardware_destroyed,
             "failure_mode": if !c4isr_hardware_destroyed { "NOMINAL" } else { "RESONANT_HARDWARE_MOUNT_SHEAR" },
-            "cryptographic_seal": format!("sha256:textron_cottonmouth_harmonic_{}", i)
+            "cryptographic_seal": format!("sha256:arv_suspension_harmonic_{}", i)
         })
     }).collect();
 

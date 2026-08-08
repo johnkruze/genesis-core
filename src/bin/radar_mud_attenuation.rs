@@ -16,13 +16,13 @@ const NUM_TRAJECTORIES: usize = 1_200_000;
 const HZ: f64 = 1000.0;
 const DT: f64 = 1.0 / HZ;
 
-// GDLS APS Baseline
+// Active Protection Radar Baseline
 const MIN_APS_INTERCEPT_DISTANCE_M: f64 = 15.0; // The APS explosive charge cannot arm and fire if the RPG is closer than 15 meters
 const NOMINAL_RPG_DETECTION_RANGE_M: f64 = 400.0;
 
 fn main() {
     let start_time = Instant::now();
-    let export_dir = "/Users/aijesusbro/Spectrum/data/exports/sovereign";
+    let export_dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../../data/exports/sovereign");
     std::fs::create_dir_all(export_dir).unwrap();
     let file = OpenOptions::new()
         .write(true)
@@ -105,7 +105,7 @@ fn main() {
             "actual_detection_range_m": f64::trunc(actual_detection_distance_m * 10.0) / 10.0,
             "survived": !aps_intercept_failure,
             "failure_mode": if !aps_intercept_failure { "NOMINAL" } else { "APS_MUD_SNR_COLLAPSE_IMPACT" },
-            "cryptographic_seal": format!("sha256:gdls_radar_mud_{}", i)
+            "cryptographic_seal": format!("sha256:aps_radar_mud_{}", i)
         })
     }).collect();
 

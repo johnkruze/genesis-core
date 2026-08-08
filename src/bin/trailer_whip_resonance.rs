@@ -1,7 +1,7 @@
 //! 1000Hz GENESIS CORE MODULE: TRAILER_WHIP_RESONANCE
 //! TARGET: Generic Commercial/Industrial Autonomous Systems
 //! CLASS: Generic Autonomous Platform
-//! SUBSYSTEM: Generative AI Simulation Hallucination
+//! SUBSYSTEM: Idealized Dynamics Prior
 //! VULNERABILITY: Synthetic physics ignore the harmonic aerodynamic yaw oscillations of a 53ft empty sail under high crosswinds, leading to trailer whip and rollover.
 
 use rayon::prelude::*;
@@ -23,7 +23,7 @@ const CRITICAL_YAW_ANGLE_RADIANS: f64 = 0.35; // ~20 degrees yaw relative to cab
 
 fn main() {
     let start_time = Instant::now();
-    let export_dir = "/Users/aijesusbro/Spectrum/data/exports/sovereign";
+    let export_dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../../data/exports/sovereign");
     std::fs::create_dir_all(export_dir).unwrap();
     let file = OpenOptions::new()
         .write(true)

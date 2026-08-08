@@ -1,18 +1,18 @@
-// G^G AMAZON FAR BIPEDAL RESMIMIC COLLAPSE MONTE CARLO
+// G^G BIPEDAL WHOLE-BODY LIFT COLLAPSE MONTE CARLO
 // Sovereign Verification: Inverted Pendulum Slip vs Fluctuating Warehouse Friction
 //
 // THE EMBODIMENT: An Autonomous 50kg Humanoid
-// G1 or Fauna Robotics "Sprout") attempting to lift a 20kg Amazon fulfillment package.
+// G1 or Fauna Robotics "Sprout") attempting to lift a 20kg warehouse fulfillment package.
 // 
-// THE VULNERABILITY: Amazon's "ResMimic" AI system teaches robots to lift objects 
+// THE VULNERABILITY: Whole-body imitation policies teach robots to lift objects 
 // using whole-body core and leg tension. To leverage the 20kg box upward, the robot 
-// squats and pushes its feet forward against the ground. NVIDIA Isaac Sim reinforcement 
+// squats and pushes its feet forward against the ground. Idealized RL training 
 // learning hallucinates that standard concrete floor friction (Mu = 0.7) is a guaranteed 
 // physical constant.
 //
-// THE MATHEMATICAL REALITY: Amazon fulfillment centers accumulate microscopic cardboard 
+// THE MATHEMATICAL REALITY: warehouse fulfillment centers accumulate microscopic cardboard 
 // dust. A thin layer of dust drops the local static friction coefficient from 0.7 to 0.4.
-// When the humanoid executes the ResMimic lift, the horizontal shear force generated 
+// When the humanoid executes the whole-body lift, the horizontal shear force generated 
 // by the robot's heels instantly breaches the degraded static friction wall.
 //
 // THE FATALITY: Static friction breaks into sliding kinetic friction (Mu = 0.2). The 
@@ -39,7 +39,7 @@ const FEET_FORWARD_OFFSET: f64 = 0.3; // Distance feet are planted in front of C
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum FailureMode {
-    VirtualCleanSim,        // Ideal Isaac Sim lab concrete (Mu = 0.8)
+    VirtualCleanSim,        // Idealized lab concrete (Mu = 0.8)
     NominalWarehouse,       // Standard clean warehouse floor (Mu = 0.6)
     MicroDustAccumulation,  // Cardboard dust drops friction (Mu = 0.35)
 }
@@ -47,7 +47,7 @@ enum FailureMode {
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum Phase {
     ApproachingPackage,     // Walking to the package
-    ResMimicTensionLift,    // Engaging whole-body core tension to heave the 20kg box
+    WholeBodyTensionLift,    // Engaging whole-body core tension to heave the 20kg box
     KineticFrictionSlip,    // The feet break static hold and slip forward
     PendulumCollapse,       // The humanoid falls backwards uncontrollably
     LiftSuccess,            // The humanoid successfully lifts the package
@@ -57,7 +57,7 @@ impl Phase {
     fn as_str(&self) -> &'static str {
         match self {
             Phase::ApproachingPackage => "APPROACHING_PACKAGE",
-            Phase::ResMimicTensionLift => "RESMIMIC_TENSION_LIFT",
+            Phase::WholeBodyTensionLift => "WHOLE_BODY_TENSION_LIFT",
             Phase::KineticFrictionSlip => "KINETIC_FRICTION_SLIP",
             Phase::PendulumCollapse => "INVERTED_PENDULUM_COLLAPSE",
             Phase::LiftSuccess => "LIFT_SUCCESS",
@@ -134,16 +134,16 @@ fn run_single_trajectory(
 
         let total_normal_force = TOTAL_MASS * GRAVITY;
 
-        // 1. THE RESMIMIC HEAVE (Isaac Sim Hallucinated Command)
+        // 1. THE WHOLE-BODY HEAVE (idealized commanded lift)
         let mut commanded_shear_force = 0.0;
 
         if t >= lift_initiation_time && phase == Phase::ApproachingPackage {
-            phase = Phase::ResMimicTensionLift;
+            phase = Phase::WholeBodyTensionLift;
         }
 
-        if phase == Phase::ResMimicTensionLift || phase == Phase::KineticFrictionSlip {
+        if phase == Phase::WholeBodyTensionLift || phase == Phase::KineticFrictionSlip {
             // To lift 20kg (half its body weight), the 50kg robot CANNOT just use its arms.
-            // ResMimic commands a whole-body heave. The hips violently throw backward horizontally
+            // The policy commands a whole-body heave. The hips violently throw backward horizontally
             // to act as a counter-lever. This generates massive horizontal shear force at the feet.
             let horizontal_heave_accel = 4.5; // m/s^2 horizontal acceleration of the torso
             commanded_shear_force = TOTAL_MASS * horizontal_heave_accel; 
@@ -199,7 +199,7 @@ fn run_single_trajectory(
 
         if t > 3.0 && !is_slipping {
             phase = Phase::LiftSuccess;
-            final_outcome = "RESMIMIC_LIFT_SUCCESS";
+            final_outcome = "WHOLE_BODY_LIFT_SUCCESS";
             break;
         }
 
@@ -256,14 +256,14 @@ fn main() {
 
     if !json_output {
         println!("====================================================================");
-        println!("  G^G AMAZON FAR BIPEDAL RESMIMIC COLLAPSE MONTE CARLO");
-        println!("  Verifying Inverted Pendulum Stability vs Isaac Sim Fluidity");
+        println!("  G^G BIPEDAL WHOLE-BODY LIFT COLLAPSE MONTE CARLO");
+        println!("  Verifying Inverted Pendulum Stability vs Idealized Gait Fluidity");
         println!("====================================================================");
         println!();
         println!("  Trajectories:  {}", n_trajectories);
         println!("  Physics:       1000Hz High-Friction Static to Low-Mu Kinetic Shear");
         println!("  Sensors:       Humanoid Internal IMU & Ground Toe-Push Matrix");
-        println!("  Estimation:    Isaac Sim assumes concrete Mu is perfectly static");
+        println!("  Estimation:    Idealized trainers assume concrete Mu is perfectly static");
         println!("  Boundary:      Unrecoverable Inverted Pendulum Battery Rupture");
         println!("====================================================================");
         println!();
@@ -279,7 +279,7 @@ fn main() {
         let metadata = DatasetMetadata {
             generator: "G^G Sovereign Auditing v1.0".to_string(),
             domain: "bipedal_robotics".to_string(),
-            scenario: "humanoid_amazon_far_resmimic_collapse".to_string(),
+            scenario: "humanoid_whole_body_lift_collapse".to_string(),
             trajectories: n_trajectories as usize,
             physics_engine: "genesis_core::inverted_pendulum_friction (1000Hz)".to_string(),
             version: "1.0.0".to_string(),
@@ -295,19 +295,19 @@ fn main() {
                     id: format!("biped_audit_{}", r.short_id),
                     traj_type: "bipedal_friction_slip_collapse".to_string(),
                     scenario: match r.failure {
-                        FailureMode::VirtualCleanSim => "isaac_sim_immaculate_concrete".to_string(),
+                        FailureMode::VirtualCleanSim => "idealized_immaculate_concrete".to_string(),
                         FailureMode::NominalWarehouse => "nominal_clean_warehouse_friction".to_string(),
                         FailureMode::MicroDustAccumulation => "cardboard_dust_shear_friction_drop".to_string(),
                     },
                     steps: r.steps,
                     score: serde_json::json!({
-                        "survived": r.outcome == "RESMIMIC_LIFT_SUCCESS",
+                        "survived": r.outcome == "WHOLE_BODY_LIFT_SUCCESS",
                         "final_pitch_deg": (r.final_pitch_angle.to_degrees() * 100.0).round() / 100.0,
                         "spine_shattered": r.outcome == "BATTERY_CASING_RUPTURE_FATALITY",
                     }),
                     proof_hash: r.proof_hash.clone(),
                     reasoning_context: serde_json::json!({
-                        "is_anomaly": r.outcome != "RESMIMIC_LIFT_SUCCESS",
+                        "is_anomaly": r.outcome != "WHOLE_BODY_LIFT_SUCCESS",
                         "anomaly_type": r.outcome,
                         "snapshot": {
                             "failure": format!("{:?}", r.failure),
@@ -382,12 +382,12 @@ fn main() {
     }
 
     let total = results.len();
-    let success = results.iter().filter(|r| r.outcome == "RESMIMIC_LIFT_SUCCESS").count();
+    let success = results.iter().filter(|r| r.outcome == "WHOLE_BODY_LIFT_SUCCESS").count();
     let collapse = results.iter().filter(|r| r.outcome == "BATTERY_CASING_RUPTURE_FATALITY").count();
     let timeout = results.iter().filter(|r| r.outcome == "TIMEOUT_STALL").count();
 
     println!("====================================================================");
-    println!("  AMAZON FAR BIPEDAL LIFT RESULTS");
+    println!("  WHOLE-BODY BIPEDAL LIFT RESULTS");
     println!("====================================================================");
     println!();
     println!("  Total Trajectories:    {}", total);
@@ -397,7 +397,7 @@ fn main() {
     println!("  +---------------------------------------------+");
     println!("  | OUTCOME DISTRIBUTION                         |");
     println!("  +---------------------------------------------+");
-    println!("  | RESMIMIC LIFT SUCCESS:       {:>6} ({:>5.1}%)  |", success, success as f64 / total as f64 * 100.0);
+    println!("  | WHOLE-BODY LIFT SUCCESS:       {:>6} ({:>5.1}%)  |", success, success as f64 / total as f64 * 100.0);
     println!("  | BATTERY RUPTURE (FATAL):     {:>6} ({:>5.1}%)  |", collapse, collapse as f64 / total as f64 * 100.0);
     println!("  | TIMEOUT PERDITION:           {:>6} ({:>5.1}%)  |", timeout, timeout as f64 / total as f64 * 100.0);
     println!("  +---------------------------------------------+");
@@ -412,10 +412,10 @@ fn main() {
     let dust: Vec<&TrajectoryResult> = results.iter().filter(|r| matches!(r.failure, FailureMode::MicroDustAccumulation)).collect();
 
     let crash_rate = |v: &[&TrajectoryResult]| -> f64 {
-        if v.is_empty() { 0.0 } else { v.iter().filter(|r| r.outcome != "RESMIMIC_LIFT_SUCCESS").count() as f64 / v.len() as f64 * 100.0 }
+        if v.is_empty() { 0.0 } else { v.iter().filter(|r| r.outcome != "WHOLE_BODY_LIFT_SUCCESS").count() as f64 / v.len() as f64 * 100.0 }
     };
 
-    println!("  | Isaac Sim Immaculate (Mu 0.8): {:>4.1}% ({:>6} runs) |", crash_rate(&clean), clean.len());
+    println!("  | Idealized Immaculate (Mu 0.8): {:>4.1}% ({:>6} runs) |", crash_rate(&clean), clean.len());
     println!("  | Nominal Warehouse (Mu 0.6):   {:>4.1}% ({:>6} runs) |", crash_rate(&lab), lab.len());
     println!("  | Dust Degraded Floor (Mu 0.35): {:>4.1}% ({:>6} runs) |", crash_rate(&dust), dust.len());
     println!("  +---------------------------------------------+");

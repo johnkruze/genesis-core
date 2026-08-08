@@ -137,6 +137,30 @@ pub fn evaluate_grasp_dynamics(
         0.0f32
     };
 
+    // Integrate linear slip velocity from shear excess (m/s) — sealed product column source
+    let mass = state.object_mass.max(0.01f32);
+    if macro_slip_detected {
+        let excess_shear = (total_shear_mag - friction_limit).max(0.0f32);
+        // Accel ≈ excess_force / mass; scale for taxel aggregate → object frame
+        let a = (excess_shear * 0.15f32) / mass;
+        state.slip_velocity = (state.slip_velocity + a * dt).clamp(0.0f32, 0.85f32);
+    } else if micro_slip_detected {
+        let a = 0.08f32 * (1.0f32 - margin) / mass.sqrt();
+        state.slip_velocity = (state.slip_velocity + a * dt).clamp(0.0f32, 0.35f32);
+    } else {
+        // Stick recovery — exponential decay toward zero
+        state.slip_velocity *= (-8.0f32 * dt).exp();
+        if state.slip_velocity.abs() < 1e-4 {
+            state.slip_velocity = 0.0;
+        }
+    }
+    if rotational_slip_detected {
+        state.slip_angular_velocity =
+            (state.slip_angular_velocity + 12.0f32 * (1.0f32 - margin) * dt).clamp(0.0f32, 4.0f32);
+    } else {
+        state.slip_angular_velocity *= (-6.0f32 * dt).exp();
+    }
+
     // Grasp reflex logic:
     // If micro-slip, macro-slip, or rotational slip is active, trigger an immediate proportional force correction.
     let mut target_force = state.normal_force;
@@ -157,8 +181,13 @@ pub fn evaluate_grasp_dynamics(
         target_force = target_force.min(45.0f32);
         state.normal_force = target_force;
         
-        // If the margin recovers and slip halts, disengage reflex
-        if margin > 0.25f32 && !micro_slip_detected && !macro_slip_detected && !rotational_slip_detected {
+        // If the margin recovers and slip is damped, disengage reflex
+        if margin > 0.25f32
+            && !micro_slip_detected
+            && !macro_slip_detected
+            && !rotational_slip_detected
+            && state.slip_velocity < 0.01f32
+        {
             state.reflex_active = false;
         }
     }

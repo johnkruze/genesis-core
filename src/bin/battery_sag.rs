@@ -16,14 +16,14 @@ const NUM_TRAJECTORIES: usize = 1_200_000;
 const HZ: f64 = 1000.0;
 const DT: f64 = 1.0 / HZ;
 
-// Midnight Baseline (Approximated)
+// Multirotor Power Baseline (Approximated)
 const NOMINAL_BUS_VOLTAGE_V: f64 = 800.0; 
 const BATTERY_INTERNAL_RESISTANCE_OHMS: f64 = 0.08; // High power pack
 const CRITICAL_VOLTAGE_SAG_V: f64 = 180.0; // Dropping below 620V starves the ESCs of the power needed to track the FBW command
 
 fn main() {
     let start_time = Instant::now();
-    let export_dir = "/Users/aijesusbro/Spectrum/data/exports/sovereign";
+    let export_dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../../data/exports/sovereign");
     std::fs::create_dir_all(export_dir).unwrap();
     let file = OpenOptions::new()
         .write(true)

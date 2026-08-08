@@ -2,7 +2,7 @@
 //! TARGET: Generic Commercial/Industrial Autonomous Systems
 //! CLASS: Generic Autonomous Platform
 //! SUBSYSTEM: Drive-by-Wire Pneumatic Brake Actuation
-//! VULNERABILITY: Class 8 trucks rely on compressed air to engage the foundation brakes. The Aurora Driver sends a digital braking signal, which triggers a solenoid to release 120 PSI of air down 60 feet of plastic tubing. When ABS pulses at 5-10Hz, it induces a standing acoustic pressure wave (water hammer) inside the air lines. If the commanded pulse frequency matches the pipe's natural acoustic resonance, the air flow chokes, effectively severing braking force to the rear axles.
+//! VULNERABILITY: Class 8 trucks rely on compressed air to engage the foundation brakes. The highway autonomy stack sends a digital braking signal, which triggers a solenoid to release 120 PSI of air down 60 feet of plastic tubing. When ABS pulses at 5-10Hz, it induces a standing acoustic pressure wave (water hammer) inside the air lines. If the commanded pulse frequency matches the pipe's natural acoustic resonance, the air flow chokes, effectively severing braking force to the rear axles.
 
 use rayon::prelude::*;
 use serde_json::json;
@@ -16,14 +16,14 @@ const NUM_TRAJECTORIES: usize = 1_200_000;
 const HZ: f64 = 1000.0;
 const DT: f64 = 1.0 / HZ;
 
-// Aurora Pneumatic Baseline
+// Class-8 Pneumatic Brake Baseline
 const SPEED_OF_SOUND_AIR_MS: f64 = 343.0; // Speed of sound dictates pressure wave propagation
 const CRITICAL_BRAKE_PRESSURE_PSI: f64 = 60.0; // Needs at least 60 PSI to maintain safe stopping deceleration
 const SYSTEM_AIR_PRESSURE_PSI: f64 = 120.0;
 
 fn main() {
     let start_time = Instant::now();
-    let export_dir = "/Users/aijesusbro/Spectrum/data/exports/sovereign";
+    let export_dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../../data/exports/sovereign");
     std::fs::create_dir_all(export_dir).unwrap();
     let file = OpenOptions::new()
         .write(true)
@@ -54,7 +54,7 @@ fn main() {
         // Acoustic resonance frequency of a pipe open at both ends (solenoid to brake chamber)
         let natural_acoustic_frequency_hz = SPEED_OF_SOUND_AIR_MS / (2.0 * pneumatic_line_length_m);
         
-        // Aurora's digital ABS controller pulses the brakes to prevent jackknifing on wet roads
+        // The digital ABS controller pulses the brakes to prevent jackknifing on wet roads
         let abs_command_hz = rng.gen_range(5.0..12.0); 
 
         // If the AI commands an ABS frequency that happens to match the natural harmonic of the 53ft trailer's air lines...
@@ -106,7 +106,7 @@ fn main() {
             "min_delivered_pressure_PSI": f64::trunc(min_delivered_pressure_psi * 10.0) / 10.0,
             "survived": !pneumatic_choke_failure,
             "failure_mode": if !pneumatic_choke_failure { "NOMINAL" } else { "PNEUMATIC_STANDING_WAVE_ABS_CHOKE" },
-            "cryptographic_seal": format!("sha256:aurora_pneumatic_resonance_{}", i)
+            "cryptographic_seal": format!("sha256:pneumatic_resonance_{}", i)
         })
     }).collect();
 

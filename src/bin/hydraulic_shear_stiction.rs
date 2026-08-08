@@ -16,12 +16,12 @@ const NUM_TRAJECTORIES: usize = 1_200_000;
 const HZ: f64 = 1000.0;
 const DT: f64 = 1.0 / HZ;
 
-// GDLS Hydraulic Baseline
+// Arctic Hydraulic Baseline
 const CRITICAL_TRACKING_ERROR_DEG: f64 = 8.0; // If the turret misses by > 8 degrees, it loses radar-lock on the drone.
 
 fn main() {
     let start_time = Instant::now();
-    let export_dir = "/Users/aijesusbro/Spectrum/data/exports/sovereign";
+    let export_dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../../data/exports/sovereign");
     std::fs::create_dir_all(export_dir).unwrap();
     let file = OpenOptions::new()
         .write(true)
@@ -121,7 +121,7 @@ fn main() {
             "max_tracking_error_deg": f64::trunc(max_tracking_error_deg * 10.0) / 10.0,
             "survived": !radar_lock_loss_failure,
             "failure_mode": if !radar_lock_loss_failure { "NOMINAL" } else { "ARCTIC_VISCOUS_SLINGSHOT_DIVERGENCE" },
-            "cryptographic_seal": format!("sha256:gdls_arctic_hydraulics_{}", i)
+            "cryptographic_seal": format!("sha256:arctic_hydraulic_stiction_{}", i)
         })
     }).collect();
 

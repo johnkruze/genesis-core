@@ -16,12 +16,12 @@ const NUM_TRAJECTORIES: usize = 1_200_000;
 const HZ: f64 = 1000.0;
 const DT: f64 = 1.0 / HZ;
 
-// L3Harris Thermal Sight Baseline
+// Thermal Sight Baseline
 const MINIMUM_CONTRAST_THRESHOLD: f64 = 0.05; // If contrast drops below 5%, the target bounding box drops
 
 fn main() {
     let start_time = Instant::now();
-    let export_dir = "/Users/aijesusbro/Spectrum/data/exports/sovereign";
+    let export_dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../../data/exports/sovereign");
     std::fs::create_dir_all(export_dir).unwrap();
     let file = OpenOptions::new()
         .write(true)
@@ -120,7 +120,7 @@ fn main() {
             "blindness_duration_s": f64::trunc(max_blind_duration_s * 10.0) / 10.0,
             "survived": !target_lost,
             "failure_mode": if !target_lost { "NOMINAL" } else { "THERMAL_AGC_DYNAMIC_RANGE_COLLAPSE" },
-            "cryptographic_seal": format!("sha256:l3harris_thermal_blind_{}", i)
+            "cryptographic_seal": format!("sha256:thermal_sight_blind_{}", i)
         })
     }).collect();
 
