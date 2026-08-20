@@ -1,34 +1,33 @@
-# genesis-core
+# genesis-core — the Forge
 
-**The G^G physics engine.** Pure CPU Rust. First-principles domains. SHA-256 ProofChain on every trajectory. **No external physics libraries.**
+**First-principles failure-boundary engine.** Pure CPU Rust. No external physics libraries. Dual-regime Monte Carlo (success **and** failure as first-class flags). SHA-256 ProofChain on every trajectory.
 
-[![Website](https://img.shields.io/badge/Web-zerotrustphysics.com-000000?style=flat-square)](https://zerotrustphysics.com)
-[![Dataset](https://img.shields.io/badge/HuggingFace-gg--physical--ground--truth-FF6B00?style=flat-square)](https://huggingface.co/datasets/spiderpilot89/gg-physical-ground-truth)
-[![Paper](https://img.shields.io/badge/Paper-Zero_Trust_Physics-1a1a2e?style=flat-square)](https://zerotrustphysics.com/Zero-Trust-Physics.pdf)
-[![Kernel](https://img.shields.io/badge/FFI_Kernel-ztp--runtime-555555?style=flat-square)](https://github.com/johnkruze/ztp-runtime)
+Happy-path simulators assume friction holds, the RF link lives, and the material does not fracture. This crate computes the boundary where those assumptions die, then seals the run.
+
+The **Reflex** (1000 Hz C library on the metal) is a different object: [ztp-runtime](https://github.com/johnkruze/ztp-runtime). Do not merge them.
+
+[zerotrustphysics.com](https://zerotrustphysics.com) · commercial: [48-Hour Forge Run](https://zerotrustphysics.com/offerings#micro) · [paper](https://zerotrustphysics.com/Zero-Trust-Physics.pdf) · samples: [spiderpilot89](https://huggingface.co/datasets/spiderpilot89/gg-physical-ground-truth)
 
 | | |
 |--|--|
-| **Brand** | Zero-Trust Physics |
-| **Bins** | ~133 Monte Carlo / audit binaries under `src/bin/` |
-| **Physics** | 14+ first-principles modules in `src/physics/` (including molecular, bioreactor, materials, tribology, plasma_facing, dexterous, …) |
-| **Language** | Domain physics only — no third-party product or simulator brand names in source |
-
-This engine generates sealed trajectory banks so systems can be checked against physical envelopes instead of theater. Every integration path can carry a running SHA-256 attestation chain. Public teaser cuts live on [HuggingFace](https://huggingface.co/datasets/spiderpilot89/gg-physical-ground-truth) (`spiderpilot89`).
+| **Bins** | ~133 Monte Carlo binaries under `src/bin/` |
+| **Native tempo** | **n = 2,500** dual-regime bank (the 48-hour commercial unit of work) |
+| **Language** | Domain physics only — no third-party simulator brand names in source |
 
 ```bash
-# From this crate root
-cargo run --release --bin multi_domain_proof_sweep
-cargo run --release --bin corpus_sweep -- 1000 --export data/corpus/
+# From this crate root — n=2500 is product scale
+cargo run --release --bin autolab_dexterous_grasp_monte_carlo -- 2500
+cargo run --release --bin materials_plasma_facing_monte_carlo -- 2500
+cargo run --release --bin materials_inverse_design_monte_carlo -- 2500
 ```
 
-**Exports:** Prefer `SPECTRUM_ROOT` or paths derived from `CARGO_MANIFEST_DIR`. Product bins default to sibling monorepo data paths when present (writes **truncate** the target file — match intended run scale).
+Product bins default-export into sibling `doe-genesis/` when that tree is present (writes **truncate** the target file — match intended run scale).
 
 ---
 
 ## Sealed product trajectory bins
 
-Industrial sealed banks (default **n=2500** for product-scale exports):
+Industrial sealed banks (default **n=2500**):
 
 | Domain | Binaries (examples) |
 |--------|---------------------|
