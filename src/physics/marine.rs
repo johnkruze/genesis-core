@@ -12,6 +12,62 @@ pub const RHO_SEAWATER: f64 = 1025.0;    // kg/m^3
 pub const GRAVITY: f64 = 9.81;            // m/s^2
 pub const ATM_PRESSURE: f64 = 101325.0;   // Pa
 pub const SOUND_SPEED: f64 = 1500.0;      // m/s in seawater (approx)
+pub const SEAWATER_VAPOR_PA: f64 = 1228.0; // ~10 °C seawater vapor pressure
+pub const SEA_TEMP_C: f64 = 18.0;          // named sea for diesel/hull heat
+
+/// Mackenzie 1981 sound speed [m/s]. T in °C, S in psu, z depth in m.
+pub fn mackenzie_sound_speed(temp_c: f64, salinity_psu: f64, depth_m: f64) -> f64 {
+    let t = temp_c;
+    let d = depth_m;
+    let ds = salinity_psu - 35.0;
+    1448.96 + 4.591 * t - 5.304e-2 * t * t + 2.374e-4 * t * t * t
+        + 1.340 * ds + 1.630e-2 * d + 1.675e-7 * d * d
+        - 1.025e-2 * t * ds - 7.139e-13 * t * d * d * d
+}
+
+/// Deep-water gravity-wave celerity C = g T / (2π).
+pub fn deep_water_wave_celerity(period_s: f64) -> f64 {
+    GRAVITY * period_s / (2.0 * std::f64::consts::PI)
+}
+
+/// Head-on encounter frequency [Hz]: (1/T) (1 + U/C).
+pub fn head_on_encounter_hz(period_s: f64, speed_ms: f64) -> f64 {
+    let c = deep_water_wave_celerity(period_s).max(1e-6);
+    (1.0 / period_s.max(1e-6)) * (1.0 + speed_ms / c)
+}
+
+/// Snell circular-ray radius R = −c / (dc/dz). Positive R bends the ray downward.
+pub fn acoustic_ray_radius(sound_speed: f64, dc_dz: f64) -> f64 {
+    if dc_dz.abs() < 1e-12 {
+        return if dc_dz >= 0.0 { f64::INFINITY } else { f64::NEG_INFINITY };
+    }
+    -sound_speed / dc_dz
+}
+
+/// Vertical change of a horizontal ray at range `x` on a circular arc of radius R.
+/// Positive dz is downward. `folded` means the ray has gone vertical (x ≥ |R|).
+pub fn acoustic_ray_drop(radius_m: f64, range_m: f64) -> (f64, bool) {
+    let r_abs = radius_m.abs();
+    if !r_abs.is_finite() {
+        return (0.0, false); // no gradient: ray stays horizontal
+    }
+    if r_abs < 1e-9 {
+        return (range_m, true);
+    }
+    let folded = range_m >= r_abs;
+    let mag = if folded {
+        r_abs
+    } else {
+        r_abs - (r_abs * r_abs - range_m * range_m).sqrt()
+    };
+    let signed = if radius_m >= 0.0 { mag } else { -mag };
+    (signed, folded)
+}
+
+/// Small-angle roll natural frequency [rad/s]: ω = √(g GM / k²).
+pub fn roll_natural_omega(gm_m: f64, k_gyration_m: f64) -> f64 {
+    (GRAVITY * gm_m.max(1e-9) / k_gyration_m.max(1e-6).powi(2)).sqrt()
+}
 
 // ─── PHYSICS ENGINE ───
 

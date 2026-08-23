@@ -2,6 +2,7 @@
 // 1000Hz Euler Integration of chassis dynamics under Pacejka magic formula tire-slip.
 // Enforces compile-time assertion that the state struct size is exactly 128 bytes to align with UMA cache lines.
 
+use genesis_core::physics::terran::RHO_FRESHWATER;
 use genesis_core::rng::Rng;
 use rayon::prelude::*;
 use serde::Serialize;
@@ -240,7 +241,8 @@ fn run_single_trajectory(index: usize, seed: u64, scenario: &str) -> VehicleTraj
             "loaded" => (rng.range(0.30, 0.45) as f32, 0.08f32),
             _ => (0.85f32, 0.15f32),
         };
-        let mu_wet_dynamic = mu_wet / (1.0f32 + 0.0005f32 * vel_x * vel_x);
+        let rho_scale = (RHO_FRESHWATER as f32) / 1000.0;
+        let mu_wet_dynamic = mu_wet / (1.0f32 + 0.0005f32 * vel_x * vel_x * rho_scale);
         let mu_actual = mu_dry - (mu_dry - mu_wet_dynamic) * terrain_moisture;
         
         // Dynamic Weight Transfer (Lateral and Longitudinal)

@@ -4,6 +4,7 @@ pub mod taichi_bridge;
 pub mod rng;
 pub mod proof;
 pub mod output;
+pub mod last_state;
 
 #[unsafe(no_mangle)]
 pub extern "C" fn ztp_dexterous_evaluate_grasp(

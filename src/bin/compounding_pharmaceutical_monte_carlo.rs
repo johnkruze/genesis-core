@@ -11,7 +11,9 @@ use serde::Serialize;
 use genesis_core::proof::{self, ProofChain};
 use genesis_core::output;
 use genesis_core::rng::Rng;
-use genesis_core::physics::compounding::CompoundingState;
+use genesis_core::physics::compounding::{
+    CompoundingState, DISSOLUTION_STALL_PCT, POTENCY_COLLAPSE_PCT,
+};
 
 #[derive(Debug, Serialize)]
 struct CompoundingRunResult {
@@ -92,9 +94,8 @@ fn run_single_compounding(
     let dissolution_pct = ((initial_mass - final_solid) / initial_mass * 100.0).clamp(0.0, 100.0);
     let potency_pct = (state.active_potency * 100.0).clamp(0.0, 100.0);
 
-    let is_potency_collapsed = potency_pct < 80.0;
-    // Process gate: <70% dissolved in horizon = stalled
-    let is_dissolution_stalled = dissolution_pct < 70.0;
+    let is_potency_collapsed = potency_pct < POTENCY_COLLAPSE_PCT;
+    let is_dissolution_stalled = dissolution_pct < DISSOLUTION_STALL_PCT;
 
     proof.feed_f64(state.viscosity);
     proof.feed_f64(state.api_concentration);

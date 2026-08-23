@@ -19,10 +19,13 @@ pub struct HyphalEdge {
 }
 
 impl HyphalEdge {
-    /// Conductance: healthy edges conduct better, longer edges worse
+    /// Conductance: health over dimensionless length (50 m hyphal scale).
+    /// Raw health/meters made Kirchhoff too stiff to equilibrate in a minute.
     pub fn conductance(&self) -> f64 {
-        if !self.alive || self.health < 0.01 { return 0.0; }
-        self.health / self.length.max(0.1)
+        if !self.alive || self.health < 0.01 {
+            return 0.0;
+        }
+        self.health / (self.length / 50.0).max(0.25)
     }
 }
 
@@ -95,8 +98,10 @@ impl MycelialMesh {
             nodes[n_nodes - 1].is_sink = true;
         }
 
-        // Generate edges based on proximity and connectivity
-        let max_edge_length = radius * 0.4;
+        // Generate edges based on proximity and connectivity.
+        // 0.8 R spans a 2 R plot at n≈40; 0.4 R sat below geometric percolation
+        // and made every east-west pair look fragmented.
+        let max_edge_length = radius * 0.8;
         let mut edges = Vec::new();
         for i in 0..n_nodes {
             for j in (i + 1)..n_nodes {
@@ -116,13 +121,59 @@ impl MycelialMesh {
             }
         }
 
-        MycelialMesh {
+        let mut mesh = MycelialMesh {
             nodes,
             edges,
             propagation_rate: 0.05,
             decay_rate: 0.01,
             network_radius: radius,
+        };
+        mesh.mark_field_ports();
+        mesh
+    }
+
+    /// Source at minimum-x, sink at maximum-x. The signal has to cross the plot.
+    pub fn mark_field_ports(&mut self) {
+        let n = self.nodes.len();
+        if n < 2 {
+            return;
         }
+        for node in self.nodes.iter_mut() {
+            node.is_source = false;
+            node.is_sink = false;
+            node.signal_level = 0.0;
+        }
+        let mut degree = vec![0u32; n];
+        for e in &self.edges {
+            if e.alive {
+                degree[e.from] += 1;
+                degree[e.to] += 1;
+            }
+        }
+        let mut i_src = 0usize;
+        let mut i_snk = 0usize;
+        let mut x_min = f64::INFINITY;
+        let mut x_max = f64::NEG_INFINITY;
+        for (i, node) in self.nodes.iter().enumerate() {
+            if degree[i] == 0 {
+                continue;
+            }
+            if node.position[0] < x_min {
+                x_min = node.position[0];
+                i_src = i;
+            }
+            if node.position[0] > x_max {
+                x_max = node.position[0];
+                i_snk = i;
+            }
+        }
+        if i_src == i_snk {
+            i_snk = (i_src + 1) % n;
+        }
+        self.nodes[i_src].is_source = true;
+        self.nodes[i_src].nutrient_density = 1.0;
+        self.nodes[i_src].signal_level = 1.0;
+        self.nodes[i_snk].is_sink = true;
     }
 
     /// Propagate signals through the network (one step).

@@ -10,6 +10,9 @@
 // aggregate stability and yield stress. Biology strengthens the soil against
 // the machine. This is the coupling to Song 4.
 
+/// Fresh water — hydroplane / tire-terrain meridian.
+pub const RHO_FRESHWATER: f64 = 997.0;
+
 // ─── SOIL TYPES ─────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Copy)]

@@ -155,3 +155,20 @@ impl SpatialMicrobiomeField {
         }
     }
 }
+
+/// One-species FKPP with kill term. Threat-class sibling of the community field.
+/// ∂u/∂t = D ∇²u + r u (1−u) − k u. Dirichlet sterile ends.
+pub fn step_fkpp_1d(u: &[f64], nxt: &mut [f64], d: f64, r: f64, k: f64, dx: f64, dt: f64) {
+    let n = u.len();
+    if n < 3 || nxt.len() < n {
+        return;
+    }
+    let dx_sq = dx * dx;
+    nxt[0] = 0.0;
+    nxt[n - 1] = 0.0;
+    for i in 1..(n - 1) {
+        let lap = (u[i + 1] - 2.0 * u[i] + u[i - 1]) / dx_sq;
+        let reaction = r * u[i] * (1.0 - u[i]) - k * u[i];
+        nxt[i] = (u[i] + dt * (d * lap + reaction)).clamp(0.0, 1.0);
+    }
+}

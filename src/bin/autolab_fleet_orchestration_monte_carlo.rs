@@ -8,8 +8,9 @@ use parquet::basic::Compression;
 use parquet::file::properties::WriterProperties;
 use serde::Serialize;
 
-use genesis_core::proof::{self, ProofChain};
 use genesis_core::output;
+use genesis_core::physics::atheric::SPEED_OF_LIGHT;
+use genesis_core::proof::{self, ProofChain};
 use genesis_core::rng::Rng;
 
 #[derive(Debug, Serialize)]
@@ -35,7 +36,8 @@ fn run_single_fleet(
     // Sweep fleet velocity (0.5 to 4.5 m/s), inter-robot gap (0.5 to 8.0 m), comms latency (5 to 500 ms)
     let velocity = rng.range(0.5, 4.5);
     let gap = rng.range(0.5, 8.0);
-    let latency_ms = rng.range(5.0, 500.0);
+    let c_floor_ms = (gap / SPEED_OF_LIGHT) * 1e3;
+    let latency_ms = rng.range(5.0, 500.0).max(c_floor_ms);
     let brake_decel = rng.range(2.5, 6.0); // 2.5 to 6.0 m/s^2 emergency deceleration
 
     // Reaction distance d_react = velocity * (latency / 1000)

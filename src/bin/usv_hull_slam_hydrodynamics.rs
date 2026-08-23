@@ -1,165 +1,243 @@
-//! 1000Hz GENESIS CORE MODULE: USV_HULL_SLAM_HYDRODYNAMICS
-//! TARGET: Generic Commercial/Industrial Autonomous Systems
-//! CLASS: Maritime Surface/Subsurface Autonomous Vessels
-//! SUBSYSTEM: Autonomous High-Speed Navigation & Hydrofoil Trim AI
-//! VULNERABILITY: In Sea State 5, a high-speed USV experiences violent "hull slamming" as it impacts approaching wave faces. The massive upward acceleration is correctly sensed by the IMU. However, the AI incorrectly interprets this raw vertical acceleration as an unwanted positive pitch-up event. To maintain its speed, the AI aggressive commands the active hydrofoils to trim the bow *down* just as the USV crests the wave. This active, AI-induced nose-dive forces the USV to "submarine" directly into the face of the next wave trough, resulting in catastrophic structural failure or rollover.
+//! USV hull slam vs hydrofoil phase lag. Sea State 5 reduced-order pitch.
+//! Gates: pitch < −0.4 rad at speed (submarine into trough); slew-limited foil still
+//! bow-down as the crest passes. 1000 Hz clock. Not an AI-blame envelope.
 
-use rayon::prelude::*;
-use serde_json::json;
-use std::fs::{File, OpenOptions};
-use std::io::{BufWriter, Write};
-use std::sync::{Arc, Mutex};
+use genesis_core::output;
+use genesis_core::physics::marine;
+use genesis_core::proof::{self, ProofChain};
+use genesis_core::rng::Rng;
+use serde::Serialize;
+use std::sync::Arc;
 use std::time::Instant;
-use rand::Rng;
 
-const NUM_TRAJECTORIES: usize = 1_200_000;
+use arrow::array::{BooleanArray, Float64Array, StringArray};
+use arrow::datatypes::{DataType, Field, Schema};
+use arrow::record_batch::RecordBatch;
+use parquet::arrow::arrow_writer::ArrowWriter;
+use parquet::basic::Compression;
+use parquet::file::properties::WriterProperties;
+
 const HZ: f64 = 1000.0;
 const DT: f64 = 1.0 / HZ;
+const T_SIM: f64 = 10.0;
+const CRITICAL_PITCH_RAD: f64 = -0.4;
+const DAMPING_C: f64 = 2.0;
+const RESTORING_K: f64 = 10.0;
 
-// Surface Vessel Hull Baseline
-const CRITICAL_PITCH_ANGLE_RAD: f64 = -0.4; // Exceeding ~23 degrees nose-down at 40 knots results in catastrophic submarining
+#[derive(Debug, Serialize)]
+struct SlamRun {
+    id: u32,
+    short_id: String,
+    wave_height_m: f64,
+    wave_period_s: f64,
+    usv_speed_ms: f64,
+    encounter_hz: f64,
+    foil_slew_rate: f64,
+    kp: f64,
+    ki: f64,
+    min_pitch_rad: f64,
+    foil_moment_at_crest: f64,
+    is_submarined: bool,
+    is_foil_phase_lagged: bool,
+    proof_hash: String,
+}
 
-fn main() {
-    let start_time = Instant::now();
-    let export_dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../../data/exports/sovereign");
-    std::fs::create_dir_all(export_dir).unwrap();
-    let file = OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .open(format!("{}/usv_hull_slam_hydrodynamics.json", export_dir))
-        .unwrap();
-    let mut writer = BufWriter::new(file);
+fn run_one(id: u32, rng: &mut Rng) -> SlamRun {
+    let short_id = output::short_id(rng);
+    let hs = rng.range(2.0, 5.0);
+    let period = rng.range(4.0, 9.0);
+    let speed = rng.range(12.0, 24.0);
+    let slew = rng.range(12.0, 70.0);
+    let kp = rng.range(30.0, 160.0);
+    let ki = rng.range(8.0, 90.0);
+    let encounter_hz = marine::head_on_encounter_hz(period, speed);
+    let omega = 2.0 * std::f64::consts::PI * encounter_hz;
 
-    println!("=========================================================");
-    println!("G^G SOVEREIGN PHYSICS ENGINE: 1000Hz HYDRODYNAMIC AUDIT");
-    println!("TARGET: GENERIC COMMERCIAL SYSTEMS");
-    println!("MODULE: USV_HULL_SLAM_HYDRODYNAMICS");
-    println!("EXECUTING 1,200,000 TRAJECTORIES...");
-    println!("=========================================================\n");
+    let mut pitch = 0.0;
+    let mut pitch_vel = 0.0;
+    let mut integral = 0.0;
+    let mut foil = 0.0;
+    let mut min_pitch = 0.0;
+    let mut foil_at_crest = 0.0;
+    let mut saw_crest = false;
+    let mut submarined = false;
 
-    let failed_count = Arc::new(Mutex::new(0usize));
+    let mut proof = ProofChain::new();
+    proof.seed(&id.to_le_bytes());
+    proof.feed_f64(hs);
+    proof.feed_f64(period);
+    proof.feed_f64(speed);
+    proof.feed_f64(slew);
+    proof.feed_f64(kp);
+    proof.feed_f64(ki);
 
-    let results: Vec<serde_json::Value> = (0..NUM_TRAJECTORIES).into_par_iter().map(|i| {
-        let mut rng = rand::thread_rng();
-        
-        let mut min_pitch_angle_rad = 0.0; // Tracking catastrophic nose-down pitching
-        let mut usv_submarined = false;
-        
-        // Sea State 5 (Rough) parameters
-        let significant_wave_height_m = rng.gen_range(2.5..4.0);
-        let wave_period_s = rng.gen_range(5.0..8.0);
-        let usv_velocity_ms = 20.0; // ~40 knots, high speed
-        
-        // Encounter frequency (Doppler shift because the USV is steaming head-on into the waves)
-        let wave_celerity_ms = 1.56 * wave_period_s; // Deep water approximation
-        let encounter_frequency_hz = (1.0 / wave_period_s) * (1.0 + (usv_velocity_ms / wave_celerity_ms));
-        let omega_encounter = 2.0 * std::f64::consts::PI * encounter_frequency_hz;
-        
-        let mut usv_pitch_angle = 0.0;
-        let mut usv_pitch_velocity = 0.0;
-        
-        // PID state for the active hydrofoils
-        let mut hydrofoil_integral = 0.0;
-        let mut actual_hydrofoil_moment = 0.0;
+    let steps = (T_SIM * HZ) as usize;
+    for tick in 0..steps {
+        let t = tick as f64 * DT;
+        let phase = omega * t;
+        let elevation = phase.sin() * (hs / 2.0);
+        let approaching_crest = phase.cos() > 0.8 && elevation > 0.0;
+        let slam = if approaching_crest {
+            speed * speed * 0.015
+        } else {
+            0.0
+        };
+        let hydro = slam - DAMPING_C * pitch_vel - RESTORING_K * pitch;
+        let err = -pitch;
+        integral += err * DT;
+        let cmd = kp * err + ki * integral - 2.0 * pitch_vel;
+        let max_d = slew * DT;
+        let delta = (cmd - foil).clamp(-max_d, max_d);
+        foil += delta;
 
-        for tick in 0..(10.0 * HZ) as usize { // 10 seconds of high-speed wave cresting
-            
-            let time_s = tick as f64 * DT;
-            
-            // The wave profile acts as a forcing function on the hull
-            let wave_elevation = (omega_encounter * time_s).sin() * (significant_wave_height_m / 2.0);
-            
-            // "Hull Slamming": When the bow drops into the trough, it violently impacts the next rising wave face
-            // This generates a massive, non-linear upward force impulse (acting ahead of the center of gravity)
-            let mut slam_pitch_acceleration = 0.0;
-            
-            // Approaching the crest (slopes upward)
-            if (omega_encounter * time_s).cos() > 0.8 && wave_elevation > 0.0 {
-                // The bow impacts the wall of water. Pitch-up force relative to square of velocity
-                slam_pitch_acceleration = usv_velocity_ms.powi(2) * 0.015; 
-            }
-            
-            // 1. TRUE PHYSICS: Wave force dynamically pitches the USV up
-            let damping_c = 2.0;
-            let restoring_k = 10.0; // Hydrostatic restoring moment
-            
-            let natural_hydro_acceleration = slam_pitch_acceleration - (damping_c * usv_pitch_velocity) - (restoring_k * usv_pitch_angle);
+        pitch_vel += (hydro + foil) * DT;
+        pitch += pitch_vel * DT;
 
-            // 2. AI RESPONSE: The AI senses the massive upward slam via IMU 
-            // It runs a rigid PID controller attempting to hold a perfectly flat 0.0 degree deck angle to optimize radar 
-            let target_pitch = 0.0;
-            let current_pitch_error = target_pitch - usv_pitch_angle;
-            
-            let k_p = 200.0; // Ridiculously aggressive P gain
-            let k_i = 150.0; // The AI winds up trying to fight the wave
-            let k_d = 2.0;   // Under-damped
-            
-            hydrofoil_integral += current_pitch_error * DT;
-            
-            // The AI commands the bow flaps down to counteract the pitch up
-            let ai_trim_moment = (k_p * current_pitch_error) + (k_i * hydrofoil_integral) - (k_d * usv_pitch_velocity);
-            
-            // FATAL FLAW: Actuator Slew Rate (Phase Lag)
-            // The massive hydraulic rams moving the hydrofoils take time to adjust.
-            // By the time the foil moves to counteract the wave slam, the USV is already cresting the wave,
-            // resulting in maximum nose-down trim exactly as it plunges into the trough.
-            let actuator_slew_rate = 50.0; // Max moment change per second
-            if ai_trim_moment > actual_hydrofoil_moment {
-                actual_hydrofoil_moment += actuator_slew_rate * DT;
-            } else {
-                actual_hydrofoil_moment -= actuator_slew_rate * DT;
-            }
-            
-            // 3. INTEGRATION
-            let total_angular_acceleration = natural_hydro_acceleration + actual_hydrofoil_moment;
-            
-            usv_pitch_velocity += total_angular_acceleration * DT;
-            usv_pitch_angle += usv_pitch_velocity * DT;
-
-            // FATAL FLAW: Phase Margin Collapse
-            // The AI acts instantly to trim the nose down during the slam. 
-            // BUT by the time the massive hull rotates to comply, the USV has crested the wave.
-            // Suddenly, the natural hydro_acceleration drops to 0 (or negative as the wave passes under).
-            // The USV is left pointing down into the trough with the bow flaps fully deployed downward at 40 knots.
-            
-            if usv_pitch_angle < min_pitch_angle_rad {
-                min_pitch_angle_rad = usv_pitch_angle;
-            }
-
-            // Exceeding -0.4 rads (nose down) at 40 knots digs the bow into the next wave, 
-            // causing billions of pounds of water to crash over the sensor masts, sinking or violently tumbling the vessel.
-            if usv_pitch_angle < CRITICAL_PITCH_ANGLE_RAD {
-                usv_submarined = true;
-                break;
-            }
+        if approaching_crest {
+            foil_at_crest = foil;
+            saw_crest = true;
         }
-
-        if usv_submarined {
-            let mut fc = failed_count.lock().unwrap();
-            *fc += 1;
+        if pitch < min_pitch {
+            min_pitch = pitch;
         }
-
-        json!({
-            "trajectory_id": i,
-            "wave_height_meters": f64::trunc(significant_wave_height_m * 10.0) / 10.0,
-            "max_nose_dive_rad": f64::trunc(min_pitch_angle_rad * 100.0) / 100.0,
-            "survived": !usv_submarined,
-            "failure_mode": if !usv_submarined { "NOMINAL" } else { "AI_INDUCED_NOSE_DIVE_SUBMARINING" },
-            "cryptographic_seal": format!("sha256:hii_usv_slam_{}", i)
-        })
-    }).collect();
-
-    for res in results {
-        writeln!(writer, "{}", res.to_string()).unwrap();
+        if tick % 1000 == 0 {
+            proof.feed_f64(pitch);
+        }
+        if pitch < CRITICAL_PITCH_RAD {
+            submarined = true;
+            break;
+        }
     }
 
-    let fc = *failed_count.lock().unwrap();
-    let failure_rate = (fc as f64 / NUM_TRAJECTORIES as f64) * 100.0;
-    
-    println!("USV_HULL_SLAM_HYDRODYNAMICS PHYSICS AUDIT COMPLETE.");
-    println!("TOTAL TRAJECTORIES: {:?}", NUM_TRAJECTORIES);
-    println!("CATASTROPHIC SUBMARINING RATE: {} ({:.2}%)", fc, failure_rate);
-    println!("EXECUTION TIME: {:?}", start_time.elapsed());
-    println!("SEALED TO: {}/usv_hull_slam_hydrodynamics.json\n", export_dir);
+    // Bow-down foil as the crest is ridden: phase lag of the hydraulic ram.
+    let phase_lagged = saw_crest && foil_at_crest < -8.0;
+    proof.feed_f64(min_pitch);
+    proof.feed_str(if submarined {
+        "SUBMARINED"
+    } else if phase_lagged {
+        "FOIL_PHASE_LAG"
+    } else {
+        "DECK_HELD"
+    });
+
+    SlamRun {
+        id,
+        short_id,
+        wave_height_m: hs,
+        wave_period_s: period,
+        usv_speed_ms: speed,
+        encounter_hz,
+        foil_slew_rate: slew,
+        kp,
+        ki,
+        min_pitch_rad: min_pitch,
+        foil_moment_at_crest: foil_at_crest,
+        is_submarined: submarined,
+        is_foil_phase_lagged: phase_lagged,
+        proof_hash: proof.seal(),
+    }
+}
+
+fn main() {
+    let args: Vec<String> = std::env::args().collect();
+    let n: u32 = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(2500);
+    let out = args
+        .iter()
+        .position(|a| a == "--parquet")
+        .and_then(|i| args.get(i + 1))
+        .cloned()
+        .unwrap_or_else(|| {
+            format!(
+                "{}/../../grokd/data/usv_hull_slam.parquet",
+                env!("CARGO_MANIFEST_DIR")
+            )
+        });
+
+    println!("====================================================================");
+    println!("  G^G: USV HULL SLAM  (encounter freq vs hydrofoil slew)");
+    println!("  n={n}  1000 Hz  gate pitch < {CRITICAL_PITCH_RAD} rad");
+    println!("====================================================================\n");
+
+    let mut rng = Rng::new(0x5553_565f_534c_414d);
+    let t0 = Instant::now();
+    let mut rows = Vec::with_capacity(n as usize);
+    for i in 0..n {
+        rows.push(run_one(i, &mut rng));
+    }
+    let proofs: Vec<_> = rows.iter().map(|r| r.proof_hash.clone()).collect();
+    let run_proof = proof::seal_run(&proofs);
+
+    if let Some(p) = std::path::Path::new(&out).parent() {
+        std::fs::create_dir_all(p).ok();
+    }
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("trajectory_id", DataType::Utf8, false),
+        Field::new("wave_height_m", DataType::Float64, false),
+        Field::new("wave_period_s", DataType::Float64, false),
+        Field::new("usv_speed_ms", DataType::Float64, false),
+        Field::new("encounter_hz", DataType::Float64, false),
+        Field::new("foil_slew_rate", DataType::Float64, false),
+        Field::new("kp", DataType::Float64, false),
+        Field::new("ki", DataType::Float64, false),
+        Field::new("min_pitch_rad", DataType::Float64, false),
+        Field::new("foil_moment_at_crest", DataType::Float64, false),
+        Field::new("is_submarined", DataType::Boolean, false),
+        Field::new("is_foil_phase_lagged", DataType::Boolean, false),
+        Field::new("proof_hash", DataType::Utf8, false),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(rows.iter().map(|r| Some(format!("slam_{}", r.short_id))).collect::<StringArray>()),
+            Arc::new(rows.iter().map(|r| Some(r.wave_height_m)).collect::<Float64Array>()),
+            Arc::new(rows.iter().map(|r| Some(r.wave_period_s)).collect::<Float64Array>()),
+            Arc::new(rows.iter().map(|r| Some(r.usv_speed_ms)).collect::<Float64Array>()),
+            Arc::new(rows.iter().map(|r| Some(r.encounter_hz)).collect::<Float64Array>()),
+            Arc::new(rows.iter().map(|r| Some(r.foil_slew_rate)).collect::<Float64Array>()),
+            Arc::new(rows.iter().map(|r| Some(r.kp)).collect::<Float64Array>()),
+            Arc::new(rows.iter().map(|r| Some(r.ki)).collect::<Float64Array>()),
+            Arc::new(rows.iter().map(|r| Some(r.min_pitch_rad)).collect::<Float64Array>()),
+            Arc::new(rows.iter().map(|r| Some(r.foil_moment_at_crest)).collect::<Float64Array>()),
+            Arc::new(rows.iter().map(|r| Some(r.is_submarined)).collect::<BooleanArray>()),
+            Arc::new(rows.iter().map(|r| Some(r.is_foil_phase_lagged)).collect::<BooleanArray>()),
+            Arc::new(rows.iter().map(|r| Some(r.proof_hash.clone())).collect::<StringArray>()),
+        ],
+    )
+    .expect("batch");
+    let file = std::fs::File::create(&out).unwrap();
+    let props = WriterProperties::builder()
+        .set_compression(Compression::SNAPPY)
+        .set_key_value_metadata(Some(vec![
+            parquet::file::metadata::KeyValue::new("cryptographic_seal".to_string(), run_proof.clone()),
+            parquet::file::metadata::KeyValue::new(
+                "generator".to_string(),
+                "G^G USV hull slam dual-regime v1.0".to_string(),
+            ),
+        ]))
+        .build();
+    let mut w = ArrowWriter::try_new(file, schema, Some(props)).unwrap();
+    w.write(&batch).unwrap();
+    w.close().unwrap();
+
+    let n_f = n as f64;
+    let sub = rows.iter().filter(|r| r.is_submarined).count();
+    let lag = rows.iter().filter(|r| r.is_foil_phase_lagged).count();
+    let both = rows
+        .iter()
+        .filter(|r| r.is_submarined && r.is_foil_phase_lagged)
+        .count();
+    let held = rows
+        .iter()
+        .filter(|r| !r.is_submarined && !r.is_foil_phase_lagged)
+        .count();
+    println!(
+        "  submarined {sub} ({:.1}%)  foil_lag {lag} ({:.1}%)  both {both} ({:.1}%)  held {held} ({:.1}%)",
+        100.0 * sub as f64 / n_f,
+        100.0 * lag as f64 / n_f,
+        100.0 * both as f64 / n_f,
+        100.0 * held as f64 / n_f
+    );
+    println!("  seal {run_proof}");
+    println!("  parquet {out}");
+    println!("  {:?}", t0.elapsed());
 }

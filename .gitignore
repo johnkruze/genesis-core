@@ -4,10 +4,14 @@ data/corpus/
 data/products/
 *.json
 !Cargo.lock
+# Reconstructible Horizons kernel — not a 1.2e6 farm dump
+!data/jpl/
+!data/jpl/*.json
 .DS_Store
 .wrangler/
 __pycache__/
 *.log
+*.pyc
 
 # Local agent instruction files — never commit (personal/ops context)
 AGENTS.md

@@ -1,60 +1,9 @@
 // G^G SOVEREIGN FORGE STRUCTURAL STRESS TENSOR EVALUATOR
 // First-Principles Principal Stress Trajectory Alignment vs. Unaligned Uniform-Section Strut
 
+use genesis_core::physics::materials::CauchyStressTensor;
 use serde::Serialize;
 use std::time::Instant;
-
-// Struct to represent a 3D point in the design grid
-#[derive(Debug, Clone, Copy)]
-struct Point3D {
-    x: f32,
-    y: f32,
-    z: f32,
-}
-
-// 3D Cauchy Stress Tensor representation
-#[derive(Debug, Clone, Copy)]
-struct CauchyStressTensor {
-    sigma_xx: f32,
-    sigma_yy: f32,
-    sigma_zz: f32,
-    tau_xy: f32,
-    tau_xz: f32,
-    tau_yz: f32,
-}
-
-impl CauchyStressTensor {
-    // Calculates the eigenvalues (principal stresses) of the stress tensor (2D shear plane simplification)
-    fn solve_principal_stresses(&self) -> (f32, f32, [f32; 3], [f32; 3]) {
-        // We evaluate the principal stresses in the xz-bending shear plane
-        // sigma_2d = [ [ sigma_xx,  tau_xz   ],
-        //              [ tau_xz,    sigma_zz ] ]
-        let avg = 0.5 * (self.sigma_xx + self.sigma_zz);
-        let diff = 0.5 * (self.sigma_xx - self.sigma_zz);
-        let radius = (diff.powi(2) + self.tau_xz.powi(2)).sqrt();
-
-        let lambda_1 = avg + radius; // Maximum Principal Tensile Stress
-        let lambda_2 = avg - radius; // Minimum Principal Compressive Stress
-
-        // Calculate maximum principal stress direction (eigenvector) in the xz-plane
-        let mut v1 = [0.0f32; 3];
-        if self.tau_xz.abs() > 1e-6 {
-            let theta = 0.5 * (2.0 * self.tau_xz).atan2(self.sigma_xx - self.sigma_zz);
-            v1[0] = theta.cos();
-            v1[1] = 0.0;
-            v1[2] = theta.sin();
-        } else {
-            v1[0] = 1.0;
-            v1[1] = 0.0;
-            v1[2] = 0.0;
-        }
-
-        // Second eigenvector is orthogonal
-        let v2 = [-v1[2], 0.0, v1[0]];
-
-        (lambda_1, lambda_2, v1, v2)
-    }
-}
 
 // Struct to track structural performance results
 #[derive(Serialize, Debug)]
@@ -124,15 +73,16 @@ fn main() {
                          (1.0 - (z / r_bound).powi(2));
                          
             let tensor = CauchyStressTensor {
-                sigma_xx,
+                sigma_xx: sigma_xx as f64,
                 sigma_yy: 0.0,
                 sigma_zz: 0.0,
                 tau_xy: 0.0,
-                tau_xz,
+                tau_xz: tau_xz as f64,
                 tau_yz: 0.0,
             };
             
-            let (max_stress, _, _, _) = tensor.solve_principal_stresses();
+            let (principals, _) = tensor.solve_principal_eigensystem();
+            let max_stress = principals[0] as f32;
             if max_stress.abs() > ai_max_stress {
                 ai_max_stress = max_stress.abs();
             }
@@ -184,15 +134,16 @@ fn main() {
                          (1.0 - (z / r_bound).powi(2)) * 0.55; // aligned load distribution
                          
             let tensor = CauchyStressTensor {
-                sigma_xx,
+                sigma_xx: sigma_xx as f64,
                 sigma_yy: 0.0,
                 sigma_zz: 0.0,
                 tau_xy: 0.0,
-                tau_xz,
+                tau_xz: tau_xz as f64,
                 tau_yz: 0.0,
             };
             
-            let (max_stress, _, _, _) = tensor.solve_principal_stresses();
+            let (principals, _) = tensor.solve_principal_eigensystem();
+            let max_stress = principals[0] as f32;
             if max_stress.abs() > forge_max_stress {
                 forge_max_stress = max_stress.abs();
             }

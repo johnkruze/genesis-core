@@ -52,7 +52,7 @@ fn run_single_material(
 
     state.step(&params, 0.1);
 
-    // Full 3D Cauchy tensor from stepped physics (not post-hoc k×von_mises)
+    // Full 3D Cauchy tensor from stepped physics
     let t = state.stress_tensor;
     let sigma_xx = t.sigma_xx;
     let sigma_yy = t.sigma_yy;
@@ -61,13 +61,11 @@ fn run_single_material(
     let tau_xz = t.tau_xz;
     let tau_yz = t.tau_yz;
 
-    // 2D principal pair in the primary shear plane (xx–yy–xy) + zz as third principal approx
-    let avg = 0.5 * (sigma_xx + sigma_yy);
-    let diff = 0.5 * (sigma_xx - sigma_yy);
-    let radius = (diff.powi(2) + tau_xy.powi(2)).sqrt();
-    let p1 = avg + radius;
-    let p2 = avg - radius;
-    let p3 = sigma_zz;
+    // True closed-form 3D Cauchy eigensolve (principal stresses lambda_1 >= lambda_2 >= lambda_3)
+    let (principals, _eigenvectors) = t.solve_principal_eigensystem();
+    let p1 = principals[0];
+    let p2 = principals[1];
+    let p3 = principals[2];
 
     let mut proof = ProofChain::new();
     proof.seed(&id.to_le_bytes());
@@ -76,8 +74,10 @@ fn run_single_material(
     proof.feed_f64(yield_mpa);
     proof.feed_f64(alignment);
     proof.feed_f64(state.von_mises_stress_mpa);
-    proof.feed_f64(sigma_zz);
-    proof.feed_f64(tau_xz);
+    proof.feed_f64(p1);
+    proof.feed_f64(p2);
+    proof.feed_f64(p3);
+    proof.feed_f64(tau_yz);
 
     MaterialRunResult {
         id,

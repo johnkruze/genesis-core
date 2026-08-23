@@ -1,155 +1,242 @@
-//! 1000Hz GENESIS CORE MODULE: UUV_SONAR_THERMOCLINE_REFRACTION
-//! TARGET: Generic Commercial/Industrial Autonomous Systems
-//! CLASS: Maritime Surface/Subsurface Autonomous Vessels
-//! SUBSYSTEM: Autonomous Obstacle Avoidance AI (Active Sonar)
-//! VULNERABILITY: Autonomous UUVs map their path using high-frequency forward-looking sonar. In littoral waters, a sharp temperature gradient (thermocline) creates a severe change in acoustic impedance. Acoustic waves emitted by the UUV are physically refracted (bent) downwards according to Snell's Law as they pass through the thermocline. The rigid AI obstacle avoidance algorithm assumes linear sound propagation. It hallucinates a clear path forward, oblivious to the fact that its sonar "beam" has bent completely under an approaching submerged object (coral reef, sea mount, or mine). The UUV plows straight into the acoustic shadow at 15 knots.
+//! Forward-looking sonar under a thermocline. Mackenzie sound speed + Snell circular ray.
+//! Ping at 10 Hz (not 1000 Hz — that clock belongs to slip). Gate: beam still misses
+//! the target vertical span when range first drops inside the turning radius.
 
-use rayon::prelude::*;
-use serde_json::json;
-use std::fs::{File, OpenOptions};
-use std::io::{BufWriter, Write};
-use std::sync::{Arc, Mutex};
+use genesis_core::output;
+use genesis_core::physics::marine;
+use genesis_core::proof::{self, ProofChain};
+use genesis_core::rng::Rng;
+use serde::Serialize;
+use std::sync::Arc;
 use std::time::Instant;
-use rand::Rng;
 
-const NUM_TRAJECTORIES: usize = 1_200_000;
-const HZ: f64 = 1000.0;
-const DT: f64 = 1.0 / HZ;
+use arrow::array::{BooleanArray, Float64Array, StringArray};
+use arrow::datatypes::{DataType, Field, Schema};
+use arrow::record_batch::RecordBatch;
+use parquet::arrow::arrow_writer::ArrowWriter;
+use parquet::basic::Compression;
+use parquet::file::properties::WriterProperties;
 
-// Subsurface Sonar Baseline
-const CRITICAL_MISS_DISTANCE_M: f64 = 120.0; // Inertia & turning radius means if it approaches within 120m unseen, collision is mathematically unavoidable
+const PING_HZ: f64 = 10.0;
+const DT: f64 = 1.0 / PING_HZ;
 
-fn main() {
-    let start_time = Instant::now();
-    let export_dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../../data/exports/sovereign");
-    std::fs::create_dir_all(export_dir).unwrap();
-    let file = OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .open(format!("{}/uuv_sonar_thermocline_refraction.json", export_dir))
-        .unwrap();
-    let mut writer = BufWriter::new(file);
+#[derive(Debug, Serialize)]
+struct ThermoRun {
+    id: u32,
+    short_id: String,
+    temp_surface_c: f64,
+    temp_deep_c: f64,
+    salinity_psu: f64,
+    thermocline_thickness_m: f64,
+    uuv_depth_m: f64,
+    uuv_speed_ms: f64,
+    reef_range_m: f64,
+    turning_gate_m: f64,
+    sound_speed_gradient: f64,
+    ray_radius_m: f64,
+    z_drop_at_gate_m: f64,
+    ray_folded: bool,
+    beam_misses_target: bool,
+    inertial_collision: bool,
+    proof_hash: String,
+}
 
-    println!("=========================================================");
-    println!("G^G SOVEREIGN PHYSICS ENGINE: 1000Hz ACOUSTIC AUDIT");
-    println!("TARGET: GENERIC COMMERCIAL SYSTEMS");
-    println!("MODULE: UUV_SONAR_THERMOCLINE_REFRACTION");
-    println!("EXECUTING 1,200,000 TRAJECTORIES...");
-    println!("=========================================================\n");
+fn run_one(id: u32, rng: &mut Rng) -> ThermoRun {
+    let short_id = output::short_id(rng);
+    let t_surf = rng.range(12.0, 28.0);
+    let t_deep = rng.range(2.0, t_surf - 0.5);
+    let s = rng.range(32.0, 37.0);
+    let thickness = rng.range(10.0, 80.0);
+    let depth = rng.range(8.0, 40.0);
+    let speed = rng.range(4.0, 12.0);
+    let reef0 = rng.range(80.0, 350.0);
+    let gate = rng.range(80.0, 150.0);
 
-    let failed_count = Arc::new(Mutex::new(0usize));
+    let c_upper = marine::mackenzie_sound_speed(t_surf, s, depth);
+    let c_lower = marine::mackenzie_sound_speed(t_deep, s, depth + thickness);
+    let dc_dz = (c_lower - c_upper) / thickness;
+    let radius = marine::acoustic_ray_radius(c_upper, dc_dz);
 
-    let results: Vec<serde_json::Value> = (0..NUM_TRAJECTORIES).into_par_iter().map(|i| {
-        let mut rng = rand::thread_rng();
-        
-        let mut uuv_crashed_into_reef = false;
-        
-        // Environment Setup (Littoral waters, summer)
-        // Upper layer is warm, lower layer is cold
-        let temp_surface_c = rng.gen_range(20.0..25.0);
-        let temp_deep_c = rng.gen_range(5.0..10.0);
-        
-        // Approximate sound speed (Simplification of Mackenzie equation)
-        // c = 1448.96 + 4.591*T ...
-        let c_upper_layer_ms = 1448.96 + (4.591 * temp_surface_c); 
-        let c_lower_layer_ms = 1448.96 + (4.591 * temp_deep_c);
-        
-        // The UUV is cruising in the upper warm layer
-        let mut uuv_position_x_m = 0.0;
-        let uuv_depth_y_m = rng.gen_range(10.0..20.0);
-        let uuv_velocity_ms = 7.7; // 15 knots
-        
-        let thermocline_depth_m = uuv_depth_y_m + rng.gen_range(5.0..10.0); // Thermocline is just below the UUV
-        
-        // The obstacle (Sea Mount/Reef) starts 200m ahead.
-        // It's tall enough to pierce the thermocline and reach the UUV's depth.
-        let reef_x_position_m = 200.0;
-        let reef_top_depth_m = uuv_depth_y_m - 5.0; // Reef extends ABOVE the UUV
-        
-        // The Sonar AI scans ahead. The main lobe is aimed perfectly horizontal (0 degrees).
-        // But because of the thermocline right below it, the temperature gradient creates a downward refraction index.
-        
-        // Snell's Law continuous formulation for a linear sound speed gradient
-        // Simplification: Sound rays emitted horizontally are bent downwards with a radius of curvature R = -c / (dc/dz)
-        let sound_speed_gradient = (c_lower_layer_ms - c_upper_layer_ms) / 50.0; // Assume 50m thick thermocline layer
-        
-        let radius_of_curvature_m = -c_upper_layer_ms / sound_speed_gradient;
+    let reef_top = depth - 5.0;
+    let reef_bot = depth + 2.0;
 
-        for tick in 0..(30.0 * HZ) as usize { // 30 seconds of cruising
-            
-            uuv_position_x_m += uuv_velocity_ms * DT;
-            
-            let distance_to_reef_m = reef_x_position_m - uuv_position_x_m;
-            
-            // AI runs its sonar ping.
-            // Where does the horizontal center ray of the sonar actually go at distance X?
-            // Equation of a circle (the bent acoustic ray): (z - R)^2 + x^2 = R^2
-            // Vertical drop z = R - sqrt(R^2 - x^2)
-            
-            // X is the lookahead distance
-            let look_ahead_distance = distance_to_reef_m;
-            
-            let mut sonar_beam_vertical_drop_m = 0.0;
-            if radius_of_curvature_m > look_ahead_distance {
-                sonar_beam_vertical_drop_m = radius_of_curvature_m - (radius_of_curvature_m.powi(2) - look_ahead_distance.powi(2)).sqrt();
-            }
-            
-            let actual_depth_of_sonar_beam_at_reef_m = uuv_depth_y_m + sonar_beam_vertical_drop_m;
-            
-            // The AI only avoids what the ping returns.
-            // If the acoustic ray bends downwards severely, it strikes the sea floor or deep water INSTEAD of the reef.
-            // If the ray passes entirely UNDER the obstacle, the AI thinks the path is clear.
-            
-            // Let's say the reef's bottom is at 100m, but it is steep. If the beam hits below the thermocline (where the reef base is), 
-            // it might reflect, but because of the sharp downward bend, the return path is also disrupted, 
-            // or the AI categorizes the deep return as "sea floor", not "imminent collision at cruise depth".
-            // Worse, if the reef is an overhang or isolated pillar, the beam just misses it.
-            
-            // For this audit, we focus on the beam completely dropping below the core mass of the target (e.g. a moored naval mine).
-            // Assume the dangerous mass of the mine is from 5m above the UUV to 2m below the UUV.
-            let reef_bottom_depth_m = uuv_depth_y_m + 2.0;
-            
-            let mut reef_detected = false;
-            if actual_depth_of_sonar_beam_at_reef_m > reef_top_depth_m && actual_depth_of_sonar_beam_at_reef_m < reef_bottom_depth_m {
-                reef_detected = true;
-            }
+    let (dz0, fold0) = marine::acoustic_ray_drop(radius, reef0);
+    let miss_initial = {
+        let beam0 = depth + dz0;
+        !(beam0 > reef_top && beam0 < reef_bot)
+    };
 
-            if distance_to_reef_m < CRITICAL_MISS_DISTANCE_M {
-                if !reef_detected {
-                    // The UUV enters the inertial point-of-no-return without ever having seen the reef 
-                    // because its entire acoustic field of view was bent underneath it.
-                    uuv_crashed_into_reef = true;
-                }
-                break;
-            }
+    let mut x = 0.0;
+    let mut detected = !miss_initial;
+    let mut folded_any = fold0;
+    let mut z_at_gate = dz0;
+
+    let mut proof = ProofChain::new();
+    proof.seed(&id.to_le_bytes());
+    proof.feed_f64(t_surf);
+    proof.feed_f64(t_deep);
+    proof.feed_f64(s);
+    proof.feed_f64(thickness);
+    proof.feed_f64(depth);
+    proof.feed_f64(reef0);
+    proof.feed_f64(gate);
+    proof.feed_f64(dz0);
+
+    // Straight-line cruise. Re-ping as look-ahead shrinks — drop falls as x falls.
+    let max_steps = ((reef0 / speed.max(0.1)) / DT).ceil() as usize + 2;
+    for step in 0..max_steps {
+        let look = (reef0 - x).max(0.0);
+        let (dz, folded) = marine::acoustic_ray_drop(radius, look);
+        folded_any |= folded;
+        let beam_z = depth + dz;
+        let hits = beam_z > reef_top && beam_z < reef_bot;
+        if hits {
+            detected = true;
         }
-
-        if uuv_crashed_into_reef {
-            let mut fc = failed_count.lock().unwrap();
-            *fc += 1;
+        if look <= gate {
+            z_at_gate = dz;
+            break;
         }
-
-        json!({
-            "trajectory_id": i,
-            "sound_speed_gradient": f64::trunc(sound_speed_gradient * 1000.0) / 1000.0,
-            "acoustic_radius_of_curvature_m": f64::trunc(radius_of_curvature_m * 10.0) / 10.0,
-            "survived": !uuv_crashed_into_reef,
-            "failure_mode": if !uuv_crashed_into_reef { "NOMINAL" } else { "ACOUSTIC_SHADOW_COLLISION" },
-            "cryptographic_seal": format!("sha256:hii_uuv_thermocline_{}", i)
-        })
-    }).collect();
-
-    for res in results {
-        writeln!(writer, "{}", res.to_string()).unwrap();
+        if step % 10 == 0 {
+            proof.feed_f64(dz);
+        }
+        x += speed * DT;
     }
 
-    let fc = *failed_count.lock().unwrap();
-    let failure_rate = (fc as f64 / NUM_TRAJECTORIES as f64) * 100.0;
-    
-    println!("UUV_SONAR_THERMOCLINE_REFRACTION PHYSICS AUDIT COMPLETE.");
-    println!("TOTAL TRAJECTORIES: {:?}", NUM_TRAJECTORIES);
-    println!("CATASTROPHIC ACOUSTIC SHADOW COLLISION RATE: {} ({:.2}%)", fc, failure_rate);
-    println!("EXECUTION TIME: {:?}", start_time.elapsed());
-    println!("SEALED TO: {}/uuv_sonar_thermocline_refraction.json\n", export_dir);
+    let collision = !detected;
+    proof.feed_f64(z_at_gate);
+    proof.feed_str(if collision {
+        "ACOUSTIC_SHADOW"
+    } else if miss_initial {
+        "LATE_DETECT"
+    } else {
+        "TARGET_IN_BEAM"
+    });
+
+    ThermoRun {
+        id,
+        short_id,
+        temp_surface_c: t_surf,
+        temp_deep_c: t_deep,
+        salinity_psu: s,
+        thermocline_thickness_m: thickness,
+        uuv_depth_m: depth,
+        uuv_speed_ms: speed,
+        reef_range_m: reef0,
+        turning_gate_m: gate,
+        sound_speed_gradient: dc_dz,
+        ray_radius_m: radius,
+        z_drop_at_gate_m: z_at_gate,
+        ray_folded: folded_any,
+        beam_misses_target: miss_initial,
+        inertial_collision: collision,
+        proof_hash: proof.seal(),
+    }
+}
+
+fn main() {
+    let args: Vec<String> = std::env::args().collect();
+    let n: u32 = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(2500);
+    let out = args
+        .iter()
+        .position(|a| a == "--parquet")
+        .and_then(|i| args.get(i + 1))
+        .cloned()
+        .unwrap_or_else(|| {
+            format!(
+                "{}/../../grokd/data/uuv_thermocline_refraction.parquet",
+                env!("CARGO_MANIFEST_DIR")
+            )
+        });
+
+    println!("====================================================================");
+    println!("  G^G: UUV THERMOCLINE  (Mackenzie + Snell ray vs turning gate)");
+    println!("  n={n}  ping {PING_HZ} Hz");
+    println!("====================================================================\n");
+
+    let mut rng = Rng::new(0x5555_565f_5448_524d);
+    let t0 = Instant::now();
+    let mut rows = Vec::with_capacity(n as usize);
+    for i in 0..n {
+        rows.push(run_one(i, &mut rng));
+    }
+    let proofs: Vec<_> = rows.iter().map(|r| r.proof_hash.clone()).collect();
+    let run_proof = proof::seal_run(&proofs);
+
+    if let Some(p) = std::path::Path::new(&out).parent() {
+        std::fs::create_dir_all(p).ok();
+    }
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("trajectory_id", DataType::Utf8, false),
+        Field::new("temp_surface_c", DataType::Float64, false),
+        Field::new("temp_deep_c", DataType::Float64, false),
+        Field::new("salinity_psu", DataType::Float64, false),
+        Field::new("thermocline_thickness_m", DataType::Float64, false),
+        Field::new("uuv_depth_m", DataType::Float64, false),
+        Field::new("uuv_speed_ms", DataType::Float64, false),
+        Field::new("reef_range_m", DataType::Float64, false),
+        Field::new("turning_gate_m", DataType::Float64, false),
+        Field::new("sound_speed_gradient", DataType::Float64, false),
+        Field::new("ray_radius_m", DataType::Float64, false),
+        Field::new("z_drop_at_gate_m", DataType::Float64, false),
+        Field::new("ray_folded", DataType::Boolean, false),
+        Field::new("beam_misses_target", DataType::Boolean, false),
+        Field::new("inertial_collision", DataType::Boolean, false),
+        Field::new("proof_hash", DataType::Utf8, false),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(rows.iter().map(|r| Some(format!("thm_{}", r.short_id))).collect::<StringArray>()),
+            Arc::new(rows.iter().map(|r| Some(r.temp_surface_c)).collect::<Float64Array>()),
+            Arc::new(rows.iter().map(|r| Some(r.temp_deep_c)).collect::<Float64Array>()),
+            Arc::new(rows.iter().map(|r| Some(r.salinity_psu)).collect::<Float64Array>()),
+            Arc::new(rows.iter().map(|r| Some(r.thermocline_thickness_m)).collect::<Float64Array>()),
+            Arc::new(rows.iter().map(|r| Some(r.uuv_depth_m)).collect::<Float64Array>()),
+            Arc::new(rows.iter().map(|r| Some(r.uuv_speed_ms)).collect::<Float64Array>()),
+            Arc::new(rows.iter().map(|r| Some(r.reef_range_m)).collect::<Float64Array>()),
+            Arc::new(rows.iter().map(|r| Some(r.turning_gate_m)).collect::<Float64Array>()),
+            Arc::new(rows.iter().map(|r| Some(r.sound_speed_gradient)).collect::<Float64Array>()),
+            Arc::new(rows.iter().map(|r| Some(r.ray_radius_m)).collect::<Float64Array>()),
+            Arc::new(rows.iter().map(|r| Some(r.z_drop_at_gate_m)).collect::<Float64Array>()),
+            Arc::new(rows.iter().map(|r| Some(r.ray_folded)).collect::<BooleanArray>()),
+            Arc::new(rows.iter().map(|r| Some(r.beam_misses_target)).collect::<BooleanArray>()),
+            Arc::new(rows.iter().map(|r| Some(r.inertial_collision)).collect::<BooleanArray>()),
+            Arc::new(rows.iter().map(|r| Some(r.proof_hash.clone())).collect::<StringArray>()),
+        ],
+    )
+    .expect("batch");
+    let file = std::fs::File::create(&out).unwrap();
+    let props = WriterProperties::builder()
+        .set_compression(Compression::SNAPPY)
+        .set_key_value_metadata(Some(vec![
+            parquet::file::metadata::KeyValue::new("cryptographic_seal".to_string(), run_proof.clone()),
+            parquet::file::metadata::KeyValue::new(
+                "generator".to_string(),
+                "G^G UUV thermocline refraction dual-regime v1.0".to_string(),
+            ),
+        ]))
+        .build();
+    let mut w = ArrowWriter::try_new(file, schema, Some(props)).unwrap();
+    w.write(&batch).unwrap();
+    w.close().unwrap();
+
+    let n_f = n as f64;
+    let miss = rows.iter().filter(|r| r.beam_misses_target).count();
+    let crash = rows.iter().filter(|r| r.inertial_collision).count();
+    let late = rows
+        .iter()
+        .filter(|r| r.beam_misses_target && !r.inertial_collision)
+        .count();
+    let fold = rows.iter().filter(|r| r.ray_folded).count();
+    println!(
+        "  miss_initial {miss} ({:.1}%)  collision {crash} ({:.1}%)  late_detect {late} ({:.1}%)  folded {fold} ({:.1}%)",
+        100.0 * miss as f64 / n_f,
+        100.0 * crash as f64 / n_f,
+        100.0 * late as f64 / n_f,
+        100.0 * fold as f64 / n_f
+    );
+    println!("  seal {run_proof}");
+    println!("  parquet {out}");
+    println!("  {:?}", t0.elapsed());
 }

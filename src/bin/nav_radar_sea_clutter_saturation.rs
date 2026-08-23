@@ -1,129 +1,228 @@
-//! 1000Hz GENESIS CORE MODULE: NAV_RADAR_SEA_CLUTTER_SATURATION
-//! TARGET: Generic Commercial/Industrial Autonomous Systems
-//! CLASS: Generic Autonomous Platform
-//! SUBSYSTEM: Autonomous Air Defense / Phased Array AI Radar
-//! VULNERABILITY: Modern naval AI radar systems use Constant False Alarm Rate (CFAR) algorithms to adaptively raise the detection threshold in areas of high background noise (like heavy rain or crashing waves). In Sea State 6, the chaotic electromagnetic scattering off the massive wave crests creates an immense base "sea clutter" return. Because the AI is hardcoded to prevent false-positive target locks, it aggressively raises the threshold. A stealthy, low-RCS (Radar Cross Section) sea-skimming anti-ship missile flies underneath this artificially raised AI threshold, remaining completely invisible to the $1B radar system until the kinetic impact.
+//! Sea-skimming contact vs CA-CFAR threshold. R^4 range law + clutter floor.
+//! Dual-regime: buried the whole way (never above CFAR) vs track never reaches 80
+//! before impact. Radar clock 20 Hz — 1000 Hz was costume on a 50 s intercept.
 
-use rayon::prelude::*;
-use serde_json::json;
-use std::fs::{File, OpenOptions};
-use std::io::{BufWriter, Write};
-use std::sync::{Arc, Mutex};
+use genesis_core::output;
+use genesis_core::physics::marine;
+use genesis_core::proof::{self, ProofChain};
+use genesis_core::rng::Rng;
+use serde::Serialize;
+use std::sync::Arc;
 use std::time::Instant;
-use rand::Rng;
 
-const NUM_TRAJECTORIES: usize = 1_200_000;
-const HZ: f64 = 1000.0;
+use arrow::array::{BooleanArray, Float64Array, StringArray};
+use arrow::datatypes::{DataType, Field, Schema};
+use arrow::record_batch::RecordBatch;
+use parquet::arrow::arrow_writer::ArrowWriter;
+use parquet::basic::Compression;
+use parquet::file::properties::WriterProperties;
+
+const HZ: f64 = 20.0;
 const DT: f64 = 1.0 / HZ;
+const TRACK_GATE: f64 = 80.0;
 
-// Marine Nav Radar Baseline
-fn main() {
-    let start_time = Instant::now();
-    let export_dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../../data/exports/sovereign");
-    std::fs::create_dir_all(export_dir).unwrap();
-    let file = OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .open(format!("{}/nav_radar_sea_clutter_saturation.json", export_dir))
-        .unwrap();
-    let mut writer = BufWriter::new(file);
+#[derive(Debug, Serialize)]
+struct ClutterRun {
+    id: u32,
+    short_id: String,
+    rcs_dbsm: f64,
+    clutter_db: f64,
+    cfar_margin_db: f64,
+    radar_const_db: f64,
+    missile_ms: f64,
+    peak_snr_db: f64,
+    peak_track: f64,
+    t_first_detect_s: f64,
+    is_cfar_buried: bool,
+    is_impact: bool,
+    proof_hash: String,
+}
 
-    println!("=========================================================");
-    println!("G^G SOVEREIGN PHYSICS ENGINE: 1000Hz RF/RADAR AUDIT");
-    println!("TARGET: GENERIC COMMERCIAL SYSTEMS");
-    println!("MODULE: NAV_RADAR_SEA_CLUTTER_SATURATION");
-    println!("EXECUTING 1,200,000 TRAJECTORIES...");
-    println!("=========================================================\n");
+fn run_one(id: u32, rng: &mut Rng) -> ClutterRun {
+    let short_id = output::short_id(rng);
+    let rcs = rng.range(-18.0, 8.0);
+    let clutter = rng.range(8.0, 38.0);
+    let margin = rng.range(8.0, 18.0);
+    let radar_c = rng.range(58.0, 95.0);
+    let v_m = rng.range(220.0, 340.0);
+    let mut range = rng.range(10_000.0, 18_000.0);
 
-    let failed_count = Arc::new(Mutex::new(0usize));
+    let mut track = 0.0;
+    let mut peak_snr = -80.0;
+    let mut peak_track = 0.0;
+    let mut ever_above = false;
+    let mut t_det = -1.0;
+    let mut impact = true;
+    let mut elapsed = 0.0;
 
-    let results: Vec<serde_json::Value> = (0..NUM_TRAJECTORIES).into_par_iter().map(|i| {
-        let mut rng = rand::thread_rng();
-        
-        let mut missile_impact = true; // Assume true until the AI locks it 
-        
-        // Threat Profile: Advanced Sea-Skimming Missile (e.g. RBS-15 / NSM derivative)
-        let missile_velocity_ms = 300.0; // High subsonic
-        let mut distance_to_ship_m = 15000.0; // Starts 15km out
-        let target_rcs_dbsm = rng.gen_range(-15.0..-10.0); // Very stealthy, returns low power
-        
-        // Environment: Sea State 6 (Very Rough)
-        // High winds and breaking waves create massive multipath scattering
-        let sea_state = 6;
-        let base_sea_clutter_db = rng.gen_range(20.0..35.0); // Chaotic baseline return from the water wall
-        
-        let mut ekf_track_confidence = 0.0;
+    let mut proof = ProofChain::new();
+    proof.seed(&id.to_le_bytes());
+    proof.feed_f64(rcs);
+    proof.feed_f64(clutter);
+    proof.feed_f64(margin);
+    proof.feed_f64(radar_c);
+    proof.feed_f64(marine::SOUND_SPEED);
 
-        for tick in 0..(55.0 * HZ) as usize { // 55 secs of flight time
-            
-            distance_to_ship_m -= missile_velocity_ms * DT;
-            
-            // The Radar equation dictates signal power drops by R^4
-            let range_km = distance_to_ship_m / 1000.0;
-            let radar_signal_power_db = target_rcs_dbsm - (40.0 * range_km.log10().max(0.1)); // Approximation
-
-            // The AI evaluates the cell containing the incoming missile.
-            // CFAR Algorithm (Cell-Averaging CFAR) averages the noise in the surrounding radar cells
-            // and dynamically raises the detection threshold to ensure a false positive never drops below 10^-6.
-            
-            // The surrounding cells are filled with Sea State 6 clutter (waves, foam).
-            // Plus, the closer the missile gets, the steeper the grazing angle relative to the waves, increasing clutter.
-            let grazing_angle_effect = 10.0 / range_km.max(1.0);
-            let average_cell_noise_db = base_sea_clutter_db + grazing_angle_effect + rng.gen_range(-5.0..5.0);
-            
-            let cfar_threshold_margin_db = 15.0; // The AI adds 15dB over the noise floor to prevent false alarms
-            let ai_dynamic_threshold_db = average_cell_noise_db + cfar_threshold_margin_db;
-
-            // Physical Audit: 
-            // The Generative Models training the AI usually train on clear-weather range data or low-fidelity Gaussian noise.
-            // In Sea State 6, the actual radar signal of the stealth missile is entirely buried by the dynamically raised threshold.
-            
-            if radar_signal_power_db > ai_dynamic_threshold_db {
-                // The AI successfully rips the target out of the noise floor.
-                ekf_track_confidence += 10.0 * DT;
-            } else {
-                ekf_track_confidence -= 5.0 * DT; // Track drops instantly if obscured by wave crests
-            }
-            ekf_track_confidence = ekf_track_confidence.clamp(0.0, 100.0);
-
-            // To launch an interceptor, the AI needs a solid track (e.g. > 80% confidence)
-            if ekf_track_confidence > 80.0 {
-                // CIWS/Interceptor fires, defending the ship
-                missile_impact = false;
-                break;
-            }
-            
-            if distance_to_ship_m <= 0.0 {
-                break; // Impact
-            }
+    let max_t = range / v_m + 2.0;
+    while elapsed < max_t && range > 0.0 {
+        range -= v_m * DT;
+        elapsed += DT;
+        let r_km = (range / 1000.0).max(0.05);
+        let signal = rcs + radar_c - 40.0 * r_km.log10();
+        let grazing = 8.0 / r_km.max(1.0);
+        let thresh = clutter + grazing + margin;
+        let snr = signal - thresh;
+        if snr > peak_snr {
+            peak_snr = snr;
         }
-
-        if missile_impact {
-            let mut fc = failed_count.lock().unwrap();
-            *fc += 1;
+        // Detects inside 2.5 km cannot cue an interceptor in time — not a useful lock.
+        let useful = range > 2500.0;
+        if snr > 0.0 {
+            if useful {
+                ever_above = true;
+                if t_det < 0.0 {
+                    t_det = elapsed;
+                }
+            }
+            track += 4.5 * DT;
+        } else {
+            track -= 6.0 * DT;
         }
-
-        json!({
-            "trajectory_id": i,
-            "target_rcs_dbsm": f64::trunc(target_rcs_dbsm * 10.0) / 10.0,
-            "peak_sea_clutter_db": f64::trunc(base_sea_clutter_db * 10.0) / 10.0,
-            "survived": !missile_impact,
-            "failure_mode": if !missile_impact { "NOMINAL" } else { "CFAR_SATURATION_MISSILE_IMPACT" },
-            "cryptographic_seal": format!("sha256:hii_cfar_saturation_{}", i)
-        })
-    }).collect();
-
-    for res in results {
-        writeln!(writer, "{}", res.to_string()).unwrap();
+        track = track.clamp(0.0, 100.0);
+        if track > peak_track {
+            peak_track = track;
+        }
+        if track > TRACK_GATE {
+            impact = false;
+            break;
+        }
+        if (elapsed / DT) as u64 % 20 == 0 {
+            proof.feed_f64(snr);
+        }
     }
 
-    let fc = *failed_count.lock().unwrap();
-    let failure_rate = (fc as f64 / NUM_TRAJECTORIES as f64) * 100.0;
-    
-    println!("NAV_RADAR_SEA_CLUTTER_SATURATION PHYSICS AUDIT COMPLETE.");
-    println!("TOTAL TRAJECTORIES: {:?}", NUM_TRAJECTORIES);
-    println!("CATASTROPHIC MISSILE IMPACT RATE: {} ({:.2}%)", fc, failure_rate);
-    println!("EXECUTION TIME: {:?}", start_time.elapsed());
-    println!("SEALED TO: {}/nav_radar_sea_clutter_saturation.json\n", export_dir);
+    let buried = !ever_above;
+    proof.feed_f64(peak_snr);
+    proof.feed_str(if !impact {
+        "TRACK_HELD"
+    } else if buried {
+        "CFAR_BURIED"
+    } else {
+        "LATE_TRACK"
+    });
+
+    ClutterRun {
+        id,
+        short_id,
+        rcs_dbsm: rcs,
+        clutter_db: clutter,
+        cfar_margin_db: margin,
+        radar_const_db: radar_c,
+        missile_ms: v_m,
+        peak_snr_db: peak_snr,
+        peak_track,
+        t_first_detect_s: t_det,
+        is_cfar_buried: buried,
+        is_impact: impact,
+        proof_hash: proof.seal(),
+    }
+}
+
+fn main() {
+    let args: Vec<String> = std::env::args().collect();
+    let n: u32 = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(2500);
+    let out = args
+        .iter()
+        .position(|a| a == "--parquet")
+        .and_then(|i| args.get(i + 1))
+        .cloned()
+        .unwrap_or_else(|| {
+            format!(
+                "{}/../../grokd/data/nav_sea_clutter.parquet",
+                env!("CARGO_MANIFEST_DIR")
+            )
+        });
+
+    println!("====================================================================");
+    println!("  G^G: SEA CLUTTER CFAR  (R^4 vs clutter floor, track gate {TRACK_GATE})");
+    println!("  n={n}  {HZ} Hz");
+    println!("====================================================================\n");
+
+    let mut rng = Rng::new(0x4346_4152_5345_4153);
+    let t0 = Instant::now();
+    let mut rows = Vec::with_capacity(n as usize);
+    for i in 0..n {
+        rows.push(run_one(i, &mut rng));
+    }
+    let proofs: Vec<_> = rows.iter().map(|r| r.proof_hash.clone()).collect();
+    let run_proof = proof::seal_run(&proofs);
+
+    if let Some(p) = std::path::Path::new(&out).parent() {
+        std::fs::create_dir_all(p).ok();
+    }
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("trajectory_id", DataType::Utf8, false),
+        Field::new("rcs_dbsm", DataType::Float64, false),
+        Field::new("clutter_db", DataType::Float64, false),
+        Field::new("cfar_margin_db", DataType::Float64, false),
+        Field::new("radar_const_db", DataType::Float64, false),
+        Field::new("missile_ms", DataType::Float64, false),
+        Field::new("peak_snr_db", DataType::Float64, false),
+        Field::new("peak_track", DataType::Float64, false),
+        Field::new("t_first_detect_s", DataType::Float64, false),
+        Field::new("is_cfar_buried", DataType::Boolean, false),
+        Field::new("is_impact", DataType::Boolean, false),
+        Field::new("proof_hash", DataType::Utf8, false),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(rows.iter().map(|r| Some(format!("cfr_{}", r.short_id))).collect::<StringArray>()),
+            Arc::new(rows.iter().map(|r| Some(r.rcs_dbsm)).collect::<Float64Array>()),
+            Arc::new(rows.iter().map(|r| Some(r.clutter_db)).collect::<Float64Array>()),
+            Arc::new(rows.iter().map(|r| Some(r.cfar_margin_db)).collect::<Float64Array>()),
+            Arc::new(rows.iter().map(|r| Some(r.radar_const_db)).collect::<Float64Array>()),
+            Arc::new(rows.iter().map(|r| Some(r.missile_ms)).collect::<Float64Array>()),
+            Arc::new(rows.iter().map(|r| Some(r.peak_snr_db)).collect::<Float64Array>()),
+            Arc::new(rows.iter().map(|r| Some(r.peak_track)).collect::<Float64Array>()),
+            Arc::new(rows.iter().map(|r| Some(r.t_first_detect_s)).collect::<Float64Array>()),
+            Arc::new(rows.iter().map(|r| Some(r.is_cfar_buried)).collect::<BooleanArray>()),
+            Arc::new(rows.iter().map(|r| Some(r.is_impact)).collect::<BooleanArray>()),
+            Arc::new(rows.iter().map(|r| Some(r.proof_hash.clone())).collect::<StringArray>()),
+        ],
+    )
+    .expect("batch");
+    let file = std::fs::File::create(&out).unwrap();
+    let props = WriterProperties::builder()
+        .set_compression(Compression::SNAPPY)
+        .set_key_value_metadata(Some(vec![
+            parquet::file::metadata::KeyValue::new("cryptographic_seal".to_string(), run_proof.clone()),
+            parquet::file::metadata::KeyValue::new(
+                "generator".to_string(),
+                "G^G nav sea clutter CFAR dual-regime v1.0".to_string(),
+            ),
+        ]))
+        .build();
+    let mut w = ArrowWriter::try_new(file, schema, Some(props)).unwrap();
+    w.write(&batch).unwrap();
+    w.close().unwrap();
+
+    let n_f = n as f64;
+    let buried = rows.iter().filter(|r| r.is_cfar_buried).count();
+    let hit = rows.iter().filter(|r| r.is_impact).count();
+    let late = rows
+        .iter()
+        .filter(|r| r.is_impact && !r.is_cfar_buried)
+        .count();
+    let held = rows.iter().filter(|r| !r.is_impact).count();
+    println!(
+        "  buried {buried} ({:.1}%)  impact {hit} ({:.1}%)  late_track {late} ({:.1}%)  held {held} ({:.1}%)",
+        100.0 * buried as f64 / n_f,
+        100.0 * hit as f64 / n_f,
+        100.0 * late as f64 / n_f,
+        100.0 * held as f64 / n_f
+    );
+    println!("  seal {run_proof}");
+    println!("  parquet {out}");
+    println!("  {:?}", t0.elapsed());
 }

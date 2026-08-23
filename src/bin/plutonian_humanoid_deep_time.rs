@@ -13,20 +13,28 @@
 // Uses Rayon for multi-core parallelism and Arrow/Parquet + SHA-256 seals.
 // =====================================================================
 
+use genesis_core::physics::plutonian::{self, PU238_HALF_LIFE_YEARS as PU238_T_HALF};
 use genesis_core::rng::Rng;
 use rayon::prelude::*;
 use serde::Serialize;
 use std::fs::File;
+use std::sync::Arc;
 use std::time::Instant;
 use sha2::{Sha256, Digest};
+
+use arrow::array::{BooleanArray, Float64Array, StringArray};
+use arrow::datatypes::{DataType, Field, Schema};
+use arrow::record_batch::RecordBatch;
+use parquet::arrow::arrow_writer::ArrowWriter;
+use parquet::basic::Compression;
+use parquet::file::properties::WriterProperties;
 
 // Physical Constants
 const M_TOTAL: f32 = 120.0;             // kg - 120kg Humanoid
 const G: f32 = 9.81;                    // m/s^2
 const H_COM: f32 = 0.9;                 // m - COM height
 const I_PELVIS: f32 = 15.0;             // kg*m^2 - pitch rotational inertia
-const PU238_HALF_LIFE_YEARS: f32 = 87.7;
-const LAMBDA_DECAY: f32 = 0.693147 / PU238_HALF_LIFE_YEARS; // ln(2) / t_half
+const PU238_HALF_LIFE_YEARS: f32 = PU238_T_HALF as f32;
 
 // 32-Dimensional State Struct (128 bytes cache aligned)
 #[allow(dead_code)]
@@ -59,8 +67,13 @@ struct TrajectorySummary {
     id: u32,
     short_id: String,
     survived_100_years: bool,
+    is_gait_collapsed: bool,
+    is_power_starved: bool,
+    is_backlash_locked: bool,
     final_year: f32,
     final_rtg_power_watts: f32,
+    final_tendon_mm: f32,
+    final_backlash_rad: f32,
     final_coherence: f32,
     final_entropy: f32,
     total_steps: usize,
@@ -92,12 +105,12 @@ fn run_single_trajectory(
     // Baseline Parameters
     let bol_power_watts = rng.range(1800.0, 2400.0) as f32; // Pu-238 RTG initial thermal output
     let max_torque_base = rng.range(250.0, 350.0) as f32;   // Base motor torque limit (N*m)
-    let wear_rate = rng.range(0.002, 0.008) as f32;          // Wear rate per decade
-    let tendon_creep_rate = rng.range(0.05, 0.15) as f32;   // mm per decade
+    let wear_rate = rng.range(0.004, 0.016) as f32;
+    let tendon_creep_rate = rng.range(0.06, 0.18) as f32;
     let _friction_mu = rng.range(0.3, 0.8) as f32;
 
-    // Simulation Horizon: 100 Years in 100 Epochs (1 year per epoch)
-    let total_years = 100;
+    // Horizon past one half-life so 0.4× BOL can bind (t½ = 87.7 y).
+    let total_years = 130; // past t½; 0.4× BOL ~ year 114 can bind without wiping the green class
     let dt_step = 0.001; // 1000Hz integration for gait cycle
     let steps_per_epoch = 200; // 0.2s gait snapshot per year
 
@@ -108,7 +121,10 @@ fn run_single_trajectory(
     let mut com_z;
     let mut gear_wear = 0.0f32;
     let mut tendon_mm = 0.0f32;
-    let mut backlash;
+    let mut backlash = 0.0f32;
+    let mut gait_collapsed = false;
+    let mut power_starved = false;
+    let mut backlash_locked = false;
 
     let mut survived = true;
     let mut failure_reason = "CRYSTALLIZED_SYNTROPIC_EQUILIBRIUM".to_string();
@@ -125,7 +141,7 @@ fn run_single_trajectory(
         final_year = year;
 
         // 1. Calculate Pu-238 Decay & Available Power
-        let rtg_power = bol_power_watts * (-LAMBDA_DECAY * year).exp();
+        let rtg_power = plutonian::rtg_power_watts(bol_power_watts as f64, year as f64) as f32;
         let rtg_pct = (rtg_power / bol_power_watts) * 100.0;
         final_power = rtg_power;
 
@@ -224,13 +240,15 @@ fn run_single_trajectory(
             // 1. Buckling Failure: Pitch exceeds 0.45 rad or COM drops below 0.4m
             if pitch_rad.abs() > 0.45 || com_z < 0.40 {
                 survived = false;
-                failure_reason = "BUCKLING_INSTABILITY_COLLAPSE".to_string();
+                gait_collapsed = true;
+                failure_reason = "GAIT_COLLAPSE".to_string();
                 break 'outer;
             }
 
             // 2. Power Starvation: RTG drops below 30% of BOL power and torque cannot maintain stance
-            if rtg_pct < 30.0 && max_torque_current < 90.0 {
+            if rtg_pct < 40.0 && max_torque_current < 110.0 {
                 survived = false;
+                power_starved = true;
                 failure_reason = "RTG_POWER_STARVATION".to_string();
                 break 'outer;
             }
@@ -238,6 +256,7 @@ fn run_single_trajectory(
             // 3. Actuator Backlash Slop Fault
             if backlash > 0.025 {
                 survived = false;
+                backlash_locked = true;
                 failure_reason = "HARMONIC_DRIVE_BACKLASH_LOCKED".to_string();
                 break 'outer;
             }
@@ -250,8 +269,13 @@ fn run_single_trajectory(
         id,
         short_id,
         survived_100_years: survived,
+        is_gait_collapsed: gait_collapsed,
+        is_power_starved: power_starved,
+        is_backlash_locked: backlash_locked,
         final_year,
         final_rtg_power_watts: final_power,
+        final_tendon_mm: tendon_mm,
+        final_backlash_rad: backlash,
         final_coherence: final_coherence,
         final_entropy: final_entropy,
         total_steps,
@@ -266,14 +290,14 @@ fn main() {
     let args: Vec<String> = std::env::args().collect();
     let n_trajectories: usize = args.get(1)
         .and_then(|s| s.parse().ok())
-        .unwrap_or(30_000);
+        .unwrap_or(2_500);
 
-    let output_path = args.get(2)
-        .cloned()
-        .unwrap_or_else(|| "../../data/products/plutonian_humanoid_30k_deep_time.parquet".to_string());
+    let output_path = args.iter().position(|a| a == "--parquet").and_then(|i| args.get(i + 1)).cloned()
+        .or_else(|| args.get(2).cloned())
+        .unwrap_or_else(|| "../../grokd/data/humanoid_rtg_deep_time.parquet".to_string());
 
     println!("================================================================================");
-    println!("   PLUTONIAN-HUMANOID DEEP TIME CROSS-POLLINATION MONTE CARLO (30,000 SWEEP)");
+    println!("   HUMANOID × Pu-238 RTG DEEP TIME  (watts and millimeters)");
     println!("================================================================================");
     println!("  Trajectories Target: {}", n_trajectories);
     println!("  Output Parquet File: {}", output_path);
@@ -324,9 +348,55 @@ fn main() {
         "sample_summaries": results.iter().take(10).map(|(s, _)| s).collect::<Vec<_>>()
     });
 
-    let manifest_path = output_path.replace(".parquet", "_manifest.json");
-    if let Ok(f) = File::create(&manifest_path) {
-        serde_json::to_writer_pretty(f, &summary_manifest).unwrap();
-        println!("✅ Master Summary Manifest written to: {}", manifest_path);
+    if let Some(p) = std::path::Path::new(&output_path).parent() {
+        std::fs::create_dir_all(p).ok();
     }
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("trajectory_id", DataType::Utf8, false),
+        Field::new("survived_horizon", DataType::Boolean, false),
+        Field::new("is_gait_collapsed", DataType::Boolean, false),
+        Field::new("is_power_starved", DataType::Boolean, false),
+        Field::new("is_backlash_locked", DataType::Boolean, false),
+        Field::new("final_year", DataType::Float64, false),
+        Field::new("final_rtg_power_watts", DataType::Float64, false),
+        Field::new("final_tendon_mm", DataType::Float64, false),
+        Field::new("final_backlash_rad", DataType::Float64, false),
+        Field::new("proof_hash", DataType::Utf8, false),
+    ]));
+    let summaries: Vec<&TrajectorySummary> = results.iter().map(|(s, _)| s).collect();
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(summaries.iter().map(|s| Some(format!("rtg_{}", s.short_id))).collect::<StringArray>()),
+            Arc::new(summaries.iter().map(|s| Some(s.survived_100_years)).collect::<BooleanArray>()),
+            Arc::new(summaries.iter().map(|s| Some(s.is_gait_collapsed)).collect::<BooleanArray>()),
+            Arc::new(summaries.iter().map(|s| Some(s.is_power_starved)).collect::<BooleanArray>()),
+            Arc::new(summaries.iter().map(|s| Some(s.is_backlash_locked)).collect::<BooleanArray>()),
+            Arc::new(summaries.iter().map(|s| Some(s.final_year as f64)).collect::<Float64Array>()),
+            Arc::new(summaries.iter().map(|s| Some(s.final_rtg_power_watts as f64)).collect::<Float64Array>()),
+            Arc::new(summaries.iter().map(|s| Some(s.final_tendon_mm as f64)).collect::<Float64Array>()),
+            Arc::new(summaries.iter().map(|s| Some(s.final_backlash_rad as f64)).collect::<Float64Array>()),
+            Arc::new(summaries.iter().map(|s| Some(s.proof_hash.clone())).collect::<StringArray>()),
+        ],
+    )
+    .expect("batch");
+    let file = File::create(&output_path).expect("parquet");
+    let props = WriterProperties::builder()
+        .set_compression(Compression::SNAPPY)
+        .set_key_value_metadata(Some(vec![
+            parquet::file::metadata::KeyValue::new("cryptographic_seal".to_string(), master_proof.clone()),
+            parquet::file::metadata::KeyValue::new("generator".to_string(), "G^G humanoid Pu-238 RTG deep time v1.1".to_string()),
+        ]))
+        .build();
+    let mut w = ArrowWriter::try_new(file, schema, Some(props)).unwrap();
+    w.write(&batch).unwrap();
+    w.close().unwrap();
+    println!("  parquet {}", output_path);
+
+    let gait = summaries.iter().filter(|s| s.is_gait_collapsed).count();
+    let pwr = summaries.iter().filter(|s| s.is_power_starved).count();
+    let bak = summaries.iter().filter(|s| s.is_backlash_locked).count();
+    println!("  gait_collapse {gait}  power_starved {pwr}  backlash {bak}");
+
+    let _ = summary_manifest;
 }

@@ -12,6 +12,7 @@ use sha2::{Sha256, Digest};
 use genesis_core::proof::{self, ProofChain};
 use genesis_core::output;
 use genesis_core::rng::Rng;
+use genesis_core::physics::materials::CauchyStressTensor;
 
 #[derive(Debug, Serialize)]
 struct ForgeRunResult {
@@ -51,19 +52,41 @@ fn run_single_forge(
     let inertia_unaligned_yy = std::f64::consts::PI * r_bound.powi(4) / 4.0;
     let yield_unaligned_mpa = 85.0f64;
 
-    // 1. Unaligned Baseline Strut
+    // 1. Unaligned Baseline Strut (3D Cauchy Tensor Solve)
     let unaligned_mass_kg = 2.40f64;
     let moment_max = tip_load_n * length_mm;
-    let unaligned_peak_stress = moment_max * (height_mm * 0.5) / inertia_unaligned_yy;
+    let sigma_xx_unaligned = moment_max * (height_mm * 0.5) / inertia_unaligned_yy;
+    let tau_xz_unaligned = tip_load_n / (std::f64::consts::PI * r_bound.powi(2));
+    let unaligned_tensor = CauchyStressTensor {
+        sigma_xx: sigma_xx_unaligned,
+        sigma_yy: sigma_xx_unaligned * 0.1,
+        sigma_zz: sigma_xx_unaligned * 0.05,
+        tau_xy: tau_xz_unaligned * 0.3,
+        tau_xz: tau_xz_unaligned,
+        tau_yz: tau_xz_unaligned * 0.15,
+    };
+    let (unaligned_principals, _) = unaligned_tensor.solve_principal_eigensystem();
+    let unaligned_peak_stress = unaligned_principals[0]; // Maximum 3D principal stress
     let unaligned_failure_load_kn = (tip_load_kn * (yield_unaligned_mpa / unaligned_peak_stress)).max(0.1);
     let unaligned_safety_margin_local = (yield_unaligned_mpa / unaligned_peak_stress) - 1.0;
     let is_unaligned_yielded_local = unaligned_safety_margin_local < 0.0;
 
-    // 2. Sovereign Forge Eigenvector Aligned Strut
+    // 2. Sovereign Forge Eigenvector Aligned Strut (3D Cauchy Tensor Solve)
     let forge_mass_kg = unaligned_mass_kg * (0.65 - 0.25 * alignment_score); // 35% to 60% mass savings
     let yield_aligned_mpa = 150.0 + 700.0 * alignment_score; // 150 to 850 MPa strength
     let inertia_forge_yy = inertia_unaligned_yy * section_eff;
-    let forge_peak_stress = moment_max * (height_mm * 0.5) / inertia_forge_yy;
+    let sigma_xx_forge = moment_max * (height_mm * 0.5) / inertia_forge_yy;
+    let tau_xz_forge = tau_xz_unaligned * (1.0 - 0.45 * alignment_score);
+    let forge_tensor = CauchyStressTensor {
+        sigma_xx: sigma_xx_forge,
+        sigma_yy: sigma_xx_forge * 0.1,
+        sigma_zz: sigma_xx_forge * 0.05,
+        tau_xy: tau_xz_forge * 0.2,
+        tau_xz: tau_xz_forge,
+        tau_yz: tau_xz_forge * 0.1,
+    };
+    let (forge_principals, _) = forge_tensor.solve_principal_eigensystem();
+    let forge_peak_stress = forge_principals[0]; // Maximum 3D principal stress
     let forge_failure_load_kn = tip_load_kn * (yield_aligned_mpa / forge_peak_stress);
     let forge_safety_margin = (yield_aligned_mpa / forge_peak_stress) - 1.0;
     let is_forge_yielded = forge_safety_margin < 0.0;
@@ -76,6 +99,9 @@ fn run_single_forge(
     proof.feed_f64(tip_load_kn);
     proof.feed_f64(unaligned_peak_stress);
     proof.feed_f64(forge_peak_stress);
+    proof.feed_f64(forge_principals[0]);
+    proof.feed_f64(forge_principals[1]);
+    proof.feed_f64(forge_principals[2]);
     proof.feed_f64(load_capacity_ratio);
 
     ForgeRunResult {

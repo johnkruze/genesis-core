@@ -3,6 +3,17 @@
 
 use crate::proof::ProofChain;
 
+/// Reconstructible gates. Must match `ztp-runtime` compounding FFI defaults.
+pub const POTENCY_COLLAPSE_PCT: f64 = 80.0;
+pub const DISSOLUTION_STALL_PCT: f64 = 70.0;
+pub const SHEAR_GATE_BROTH_PA: f64 = 15.0;
+pub const SHEAR_GATE_DEFAULT_PA: f64 = 500.0;
+pub const OSTWALD_K: f64 = 0.015;
+pub const OSTWALD_N: f64 = 0.70;
+pub const NOYES_D: f64 = 5.0e-10;
+pub const NOYES_H: f64 = 1.0e-5;
+pub const NOYES_CS: f64 = 50.0;
+
 #[derive(Debug, Clone)]
 pub struct CompoundingState {
     // Spatial coordinates/velocity (as SPH-representative particle / packet)
@@ -56,13 +67,13 @@ impl Default for CompoundingState {
             ph: 1.5,                      // Gastric pH
             shear_rate: 1.0,
             viscosity: 0.001,             // Viscosity of water-like solvent at start
-            flow_consistency_index_k: 0.015, // K for standard biological slurry
-            flow_behavior_index_n: 0.70,   // Shear thinning (pseudoplastic)
-            diffusion_coefficient: 5.0e-10, // Standard small molecule diffusion rate
-            boundary_layer_h: 1.0e-5,      // 10 microns
-            solubility_limit_cs: 50.0,     // 50 kg/m^3 solubility limit
+            flow_consistency_index_k: OSTWALD_K,
+            flow_behavior_index_n: OSTWALD_N,
+            diffusion_coefficient: NOYES_D,
+            boundary_layer_h: NOYES_H,
+            solubility_limit_cs: NOYES_CS,
             accumulated_shear_stress: 0.0,
-            critical_shear_limit: 500.0,   // Critical shear stress before denaturing
+            critical_shear_limit: SHEAR_GATE_DEFAULT_PA,
             active_potency: 1.0,           // Potency multiplier
             time_s: 0.0,
             proof: ProofChain::new(),
@@ -100,7 +111,7 @@ impl CompoundingState {
         state.ph = 7.2;
         state.flow_consistency_index_k = 0.015;  // Thicker biologic broth with cells
         state.flow_behavior_index_n = 0.85;     // Shear-thinning cell broth
-        state.critical_shear_limit = 15.0;       // Fragile cells/proteins denature at 15 Pa*s cumulative stress
+        state.critical_shear_limit = SHEAR_GATE_BROTH_PA;
         state.solid_mass_kg = 0.0;
         state.solid_surface_area_m2 = 0.0;
         state.api_concentration = 5.0;           // 5 kg/m^3 of active protein

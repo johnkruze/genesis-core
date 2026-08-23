@@ -31,7 +31,7 @@ pub fn watts_to_dbm(watts: f64) -> f64 {
 }
 
 /// Free-space received power (Friis equation, isotropic antennas, clamped).
-/// At 432Hz harmonics the wavelengths are enormous — path loss is gentle.
+/// Lab path-loss is live at BASE_FREQUENCY (2.4 GHz ISM).
 pub fn free_space_received(tx_w: f64, freq_hz: f64, distance_m: f64) -> f64 {
     if distance_m <= 0.0 { return tx_w; }
     let wavelength = SPEED_OF_LIGHT / freq_hz;
@@ -84,7 +84,7 @@ pub struct AthericSystem {
 }
 
 impl AthericSystem {
-    /// Build N channels at 432Hz harmonics.
+    /// Build N channels at BASE_FREQUENCY harmonics (2.4 GHz ISM).
     pub fn new(
         n_channels: usize,
         tx_power: f64,

@@ -1,7 +1,17 @@
-//! Deep Time & Phase Shift Physics (Plutonian Domain)
-//! Models reality decay curves, phase transitions, and deep time temporal substrates.
+//! Plutonian core — the vision: outcomes without explosion.
+//! Reconstructible twin: `plutonian_humanoid_deep_time` (Pu-238 watts, tendon mm, gait).
+//! This module is the phase-shift language of that same seeing. They are one organ.
 
 use std::collections::HashMap;
+
+/// Pu-238 RTG — reconstructible deep time. t½ = 87.7 y.
+pub const PU238_HALF_LIFE_YEARS: f64 = 87.7;
+pub const PU238_LAMBDA: f64 = std::f64::consts::LN_2 / PU238_HALF_LIFE_YEARS;
+
+/// P(t) = P0 e^{−λt}. Watts at year t.
+pub fn rtg_power_watts(p0: f64, t_years: f64) -> f64 {
+    p0 * (-PU238_LAMBDA * t_years).exp()
+}
 
 #[derive(Debug, Clone)]
 pub struct PhaseState {

@@ -1,176 +1,241 @@
-// G^G Autonomous Boat Monte Carlo — THE MARINE TRUTH
-// High-speed surface vessel dynamics, wave slamming, and surface current tracking.
+//! USV roll/capsize. Metacentric restoring vs encounter-driven roll.
+//! Dual-regime: capsize (|φ| > 70°) is not the same column as wave-drag speed loss.
+//! Capsize is integrated, not rng.chance.
 
-use std::time::Instant;
-use genesis_core::physics::marine::*;
-use genesis_core::rng::Rng;
+use genesis_core::output;
+use genesis_core::physics::marine;
 use genesis_core::proof::{self, ProofChain};
-use genesis_core::output::{self, DatasetMetadata, TrajectoryRecord, Dataset};
+use genesis_core::rng::Rng;
+use serde::Serialize;
+use std::sync::Arc;
+use std::time::Instant;
 
-#[derive(Debug, Clone, Copy, PartialEq)]
-enum Phase { Cruising, WaveSlam, Capsized, Complete }
-impl Phase { fn as_str(&self) -> &'static str { match self { Phase::Cruising => "CRUISING", Phase::WaveSlam => "WAVE_SLAM", Phase::Capsized => "CAPSIZED", Phase::Complete => "COMPLETE" } } }
+use arrow::array::{BooleanArray, Float64Array, StringArray};
+use arrow::datatypes::{DataType, Field, Schema};
+use arrow::record_batch::RecordBatch;
+use parquet::arrow::arrow_writer::ArrowWriter;
+use parquet::basic::Compression;
+use parquet::file::properties::WriterProperties;
 
-#[derive(Debug)]
-#[allow(dead_code)]
-struct TrajectoryResult {
+const HZ: f64 = 50.0;
+const DT: f64 = 1.0 / HZ;
+const T_SIM: f64 = 60.0;
+const CAPSIZE_RAD: f64 = 1.22; // ~70°
+
+#[derive(Debug, Serialize)]
+struct BoatRun {
     id: u32,
     short_id: String,
-    persona: &'static str,
-    mission_success: bool,
-    max_speed_knots: f64,
     wave_height_m: f64,
-    outcome: &'static str,
-    phase: Phase,
-    steps: usize,
+    wave_period_s: f64,
+    gm_m: f64,
+    beam_m: f64,
+    target_speed_ms: f64,
+    encounter_hz: f64,
+    roll_fn_hz: f64,
+    max_roll_rad: f64,
+    final_speed_ms: f64,
+    is_capsized: bool,
+    is_speed_limited: bool,
     proof_hash: String,
-    sea_state: &'static str,
-    telemetry: Vec<serde_json::Value>,
 }
 
-fn run_single_trajectory(id: u32, rng: &mut Rng, record_telemetry: bool) -> TrajectoryResult {
-    let short_id = output::short_id(rng);
-    let persona = "Japan_USV_Interceptor";
-    let mass = rng.range(500.0, 1500.0);
-    
-    // Wave state
-    let (sea_state, wave_height_m) = match rng.index(4) {
-        0 => ("Calm", rng.range(0.1, 0.5)), // Calm
-        1 => ("Choppy", rng.range(0.5, 1.5)), // Choppy
-        2 => ("Rough", rng.range(1.5, 3.0)), // Rough
-        _ => ("Storm", rng.range(3.0, 6.0)), // Storm
-    };
+fn sea_label(hs: f64) -> &'static str {
+    if hs < 0.5 {
+        "calm"
+    } else if hs < 1.25 {
+        "smooth"
+    } else if hs < 2.5 {
+        "moderate"
+    } else if hs < 4.0 {
+        "rough"
+    } else {
+        "very_rough"
+    }
+}
 
-    let dt = 0.05;
-    let max_steps = 3000;
-    let mut step = 0;
-    
-    let mut phase = Phase::Cruising;
-    let mut speed_ms = 0.0_f64;
-    let target_speed_ms = rng.range(10.0, 25.0); // 20-50 knots
-    let thrust_force = mass * 5.0; // High power/weight
-    
-    let mut max_speed = 0.0;
+fn run_one(id: u32, rng: &mut Rng) -> BoatRun {
+    let short_id = output::short_id(rng);
+    let hs = rng.range(0.2, 5.5);
+    let period = rng.range(3.5, 10.0);
+    let gm = rng.range(0.25, 1.30);
+    let beam = rng.range(2.2, 5.5);
+    let k_gyr = beam * rng.range(0.28, 0.42);
+    let target = rng.range(8.0, 22.0);
+    let mass = rng.range(500.0, 1600.0);
+    let area = rng.range(0.35, 0.80);
+
+    let omega_n = marine::roll_natural_omega(gm, k_gyr);
+    let zeta = rng.range(0.06, 0.22);
+    let enc_hz = marine::head_on_encounter_hz(period, target);
+    let omega_e = 2.0 * std::f64::consts::PI * enc_hz;
+
+    let mut phi: f64 = 0.0;
+    let mut phi_d: f64 = 0.0;
+    let mut speed = 0.0;
+    let mut max_phi = 0.0;
+    let mut capsized = false;
+    let thrust = mass * 7.0;
+
     let mut proof = ProofChain::new();
     proof.seed(&id.to_le_bytes());
-    proof.feed_f64(mass);
-    proof.feed_f64(wave_height_m);
+    proof.feed_f64(hs);
+    proof.feed_f64(gm);
+    proof.feed_f64(beam);
+    proof.feed_f64(target);
+    proof.feed_str(sea_label(hs));
 
-    let mut telemetry = Vec::new();
-
-    while step < max_steps {
-        // Simple 1D surface dynamics for high-speed
-        let drag = 0.5 * RHO_SEAWATER * speed_ms * speed_ms * 0.4 * 0.5; // Drag ~ V^2
-        let accel = (thrust_force - drag) / mass;
-        speed_ms += accel * dt;
-        if speed_ms > max_speed { max_speed = speed_ms; }
-
-        if speed_ms > target_speed_ms { speed_ms = target_speed_ms; }
-
-        // Wave interactions
-        if wave_height_m > 2.0 && rng.chance(0.01 * wave_height_m) {
-            phase = Phase::WaveSlam;
-            speed_ms *= 0.6; // Lose speed on slam
-            // Capsize risk
-            if rng.chance(0.05 * (wave_height_m / 6.0)) {
-                phase = Phase::Capsized;
-                break;
-            }
-        } else if phase == Phase::WaveSlam {
-            phase = Phase::Cruising;
+    let steps = (T_SIM * HZ) as usize;
+    for tick in 0..steps {
+        let t = tick as f64 * DT;
+        let wave_drag = 1.0 + 0.35 * hs;
+        let drag = 0.5 * marine::RHO_SEAWATER * speed * speed * 0.45 * area * wave_drag;
+        let acc = (thrust - drag) / mass;
+        speed += acc * DT;
+        if speed > target {
+            speed = target;
         }
-
-        if step > 2500 && phase != Phase::Capsized { phase = Phase::Complete; }
-
-        if step % 50 == 0 {
-            proof.feed_f64(speed_ms);
-            if record_telemetry {
-                telemetry.push(serde_json::json!({
-                    "t": step as f64 * dt, "phase": phase.as_str(),
-                    "speed_knots": (speed_ms * 1.94384 * 10.0).round() / 10.0,
-                    "wave_height_m": wave_height_m,
-                }));
-            }
+        let omega_f = omega_e.min(4.0);
+        let forcing = (hs / beam) * omega_f * omega_f * 0.40 * (omega_e * t).sin();
+        let phi_dd = -omega_n * omega_n * phi.sin() - 2.0 * zeta * omega_n * phi_d + forcing;
+        phi_d += phi_dd * DT;
+        phi += phi_d * DT;
+        let ap = phi.abs();
+        if ap > max_phi {
+            max_phi = ap;
         }
-        step += 1;
+        if tick % 50 == 0 {
+            proof.feed_f64(phi);
+        }
+        if ap > CAPSIZE_RAD {
+            capsized = true;
+            break;
+        }
     }
 
-    let mission_success = phase == Phase::Complete || phase == Phase::Cruising;
-    let outcome = if phase == Phase::Capsized { "HULL_CAPSIZED" } else { "ROUTE_COMPLETE" };
+    let speed_limited = !capsized && speed < 0.58 * target;
+    proof.feed_f64(max_phi);
+    proof.feed_str(if capsized {
+        "CAPSIZED"
+    } else if speed_limited {
+        "SPEED_LIMITED"
+    } else {
+        "ROUTE_HELD"
+    });
 
-    proof.feed_str(outcome);
-
-    TrajectoryResult {
-        id, short_id, persona, mission_success, max_speed_knots: max_speed * 1.94384,
-        wave_height_m, outcome, phase, steps: step,
-        proof_hash: proof.seal(), sea_state, telemetry,
+    BoatRun {
+        id,
+        short_id,
+        wave_height_m: hs,
+        wave_period_s: period,
+        gm_m: gm,
+        beam_m: beam,
+        target_speed_ms: target,
+        encounter_hz: enc_hz,
+        roll_fn_hz: omega_n / (2.0 * std::f64::consts::PI),
+        max_roll_rad: max_phi,
+        final_speed_ms: speed,
+        is_capsized: capsized,
+        is_speed_limited: speed_limited,
+        proof_hash: proof.seal(),
     }
 }
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
-    let n_trajectories: u32 = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(10_000);
-    let json_output = args.iter().any(|a| a == "--json");
-    let out_dir = args.iter().position(|a| a == "--out-dir").and_then(|i| args.get(i + 1)).cloned();
+    let n: u32 = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(2500);
+    let out = args
+        .iter()
+        .position(|a| a == "--parquet")
+        .and_then(|i| args.get(i + 1))
+        .cloned()
+        .unwrap_or_else(|| {
+            format!(
+                "{}/../../grokd/data/usv_boat_roll.parquet",
+                env!("CARGO_MANIFEST_DIR")
+            )
+        });
 
-    let mut rng = Rng::new(0xB0A7_1933_3333_3333);
-    let start = Instant::now();
-    let mut results = Vec::with_capacity(n_trajectories as usize);
-    let record_telemetry = json_output || out_dir.is_some();
+    println!("====================================================================");
+    println!("  G^G: USV BOAT ROLL  (GM restoring vs encounter roll)");
+    println!("  n={n}  {HZ} Hz  capsize {CAPSIZE_RAD} rad");
+    println!("====================================================================\n");
 
-    for i in 0..n_trajectories { results.push(run_single_trajectory(i, &mut rng, record_telemetry)); }
-
-    if !json_output {
-        let success = results.iter().filter(|r| r.mission_success).count();
-        println!("  G^G AUTONOMOUS BOAT MONTE CARLO | {} runs | {:.2}s", n_trajectories, start.elapsed().as_secs_f64());
-        println!("  | ROUTE_COMPLETE:  {:>6} ({:>5.1}%)  |", success, success as f64 / n_trajectories as f64 * 100.0);
+    let mut rng = Rng::new(0x424f_4154_524f_4c4c);
+    let t0 = Instant::now();
+    let mut rows = Vec::with_capacity(n as usize);
+    for i in 0..n {
+        rows.push(run_one(i, &mut rng));
     }
+    let proofs: Vec<_> = rows.iter().map(|r| r.proof_hash.clone()).collect();
+    let run_proof = proof::seal_run(&proofs);
 
-    if let Some(base_dir) = out_dir {
-        let date_str = &output::now_iso()[0..10]; // YYYY-MM-DD
-        let mut grouped: std::collections::HashMap<String, Vec<&TrajectoryResult>> = std::collections::HashMap::new();
-
-        for r in &results {
-            grouped.entry(r.sea_state.to_string()).or_default().push(r);
-        }
-
-        let mut hash_list = Vec::new();
-
-        for (state_name, state_results) in grouped {
-            let dir_path = format!("{}/{}/{}", base_dir, date_str, state_name);
-            std::fs::create_dir_all(&dir_path).expect("Failed to create deeply nested data folders");
-
-            let records: Vec<_> = state_results.iter().map(|r| {
-                TrajectoryRecord {
-                    id: format!("autonomous_boat_{}_{}", r.short_id, state_name),
-                    traj_type: "usv_surface_route".to_string(),
-                    scenario: format!("{}_high_speed_surface_chase", state_name),
-                    steps: r.steps,
-                    score: serde_json::json!({ "success": r.mission_success, "max_speed_knots": r.max_speed_knots }),
-                    proof_hash: r.proof_hash.clone(), reasoning_context: serde_json::json!({ "outcome": r.outcome, "wave_height_m": r.wave_height_m, "sea_state": state_name }),
-                    data: r.telemetry.clone(),
-                }
-            }).collect();
-
-            let proof_hashes: Vec<String> = state_results.iter().map(|r| r.proof_hash.clone()).collect();
-            let run_proof = proof::seal_run(&proof_hashes);
-            hash_list.push(run_proof);
-
-            let dataset = Dataset {
-                dataset_metadata: DatasetMetadata {
-                    generator: "G^G ASV Monte Carlo".to_string(), domain: "marine_surface".to_string(),
-                    scenario: "autonomous_boat".to_string(), trajectories: state_results.len(),
-                    physics_engine: "genesis_core::marine_surface".to_string(), version: "1.0.0".to_string(), generated_at: output::now_iso(),
-                }, trajectories: records,
-            };
-
-            let chunk_id = output::short_id(&mut rng);
-            let file_path = format!("{}/dataset_{}_{}.json", dir_path, state_name, chunk_id);
-            output::write_dataset(&file_path, &dataset).expect("Failed to write dataset");
-        }
-        let master_proof = proof::seal_run(&hash_list);
-        if !json_output {
-            println!("  SHA-256 Run Proof: {}", master_proof);
-        }
+    if let Some(p) = std::path::Path::new(&out).parent() {
+        std::fs::create_dir_all(p).ok();
     }
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("trajectory_id", DataType::Utf8, false),
+        Field::new("wave_height_m", DataType::Float64, false),
+        Field::new("wave_period_s", DataType::Float64, false),
+        Field::new("gm_m", DataType::Float64, false),
+        Field::new("beam_m", DataType::Float64, false),
+        Field::new("target_speed_ms", DataType::Float64, false),
+        Field::new("encounter_hz", DataType::Float64, false),
+        Field::new("roll_fn_hz", DataType::Float64, false),
+        Field::new("max_roll_rad", DataType::Float64, false),
+        Field::new("final_speed_ms", DataType::Float64, false),
+        Field::new("is_capsized", DataType::Boolean, false),
+        Field::new("is_speed_limited", DataType::Boolean, false),
+        Field::new("proof_hash", DataType::Utf8, false),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(rows.iter().map(|r| Some(format!("bot_{}", r.short_id))).collect::<StringArray>()),
+            Arc::new(rows.iter().map(|r| Some(r.wave_height_m)).collect::<Float64Array>()),
+            Arc::new(rows.iter().map(|r| Some(r.wave_period_s)).collect::<Float64Array>()),
+            Arc::new(rows.iter().map(|r| Some(r.gm_m)).collect::<Float64Array>()),
+            Arc::new(rows.iter().map(|r| Some(r.beam_m)).collect::<Float64Array>()),
+            Arc::new(rows.iter().map(|r| Some(r.target_speed_ms)).collect::<Float64Array>()),
+            Arc::new(rows.iter().map(|r| Some(r.encounter_hz)).collect::<Float64Array>()),
+            Arc::new(rows.iter().map(|r| Some(r.roll_fn_hz)).collect::<Float64Array>()),
+            Arc::new(rows.iter().map(|r| Some(r.max_roll_rad)).collect::<Float64Array>()),
+            Arc::new(rows.iter().map(|r| Some(r.final_speed_ms)).collect::<Float64Array>()),
+            Arc::new(rows.iter().map(|r| Some(r.is_capsized)).collect::<BooleanArray>()),
+            Arc::new(rows.iter().map(|r| Some(r.is_speed_limited)).collect::<BooleanArray>()),
+            Arc::new(rows.iter().map(|r| Some(r.proof_hash.clone())).collect::<StringArray>()),
+        ],
+    )
+    .expect("batch");
+    let file = std::fs::File::create(&out).unwrap();
+    let props = WriterProperties::builder()
+        .set_compression(Compression::SNAPPY)
+        .set_key_value_metadata(Some(vec![
+            parquet::file::metadata::KeyValue::new("cryptographic_seal".to_string(), run_proof.clone()),
+            parquet::file::metadata::KeyValue::new(
+                "generator".to_string(),
+                "G^G USV boat roll dual-regime v1.0".to_string(),
+            ),
+        ]))
+        .build();
+    let mut w = ArrowWriter::try_new(file, schema, Some(props)).unwrap();
+    w.write(&batch).unwrap();
+    w.close().unwrap();
+
+    let n_f = n as f64;
+    let cap = rows.iter().filter(|r| r.is_capsized).count();
+    let slow = rows.iter().filter(|r| r.is_speed_limited).count();
+    let held = rows
+        .iter()
+        .filter(|r| !r.is_capsized && !r.is_speed_limited)
+        .count();
+    println!(
+        "  capsized {cap} ({:.1}%)  speed_limited {slow} ({:.1}%)  held {held} ({:.1}%)",
+        100.0 * cap as f64 / n_f,
+        100.0 * slow as f64 / n_f,
+        100.0 * held as f64 / n_f
+    );
+    println!("  seal {run_proof}");
+    println!("  parquet {out}");
+    println!("  {:?}", t0.elapsed());
 }
