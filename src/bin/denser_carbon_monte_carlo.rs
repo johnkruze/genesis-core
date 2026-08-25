@@ -21,7 +21,7 @@ const COG_SPIN_M: f64 = 0.95;
 const NOSE_MIN_MM: f64 = 5.0;
 
 #[derive(Debug, Serialize)]
-struct PopeRow {
+struct CarbonRow {
     id: u32,
     short_id: String,
     density_gcc: f64,
@@ -36,7 +36,7 @@ struct PopeRow {
     proof_hash: String,
 }
 
-fn run_one(id: u32, rng: &mut Rng) -> PopeRow {
+fn run_one(id: u32, rng: &mut Rng) -> CarbonRow {
     let short_id = output::short_id(rng);
     let density = rng.range(1.55, 2.35);
     let is_cc = density < CC_DENSITY_GCC;
@@ -53,7 +53,7 @@ fn run_one(id: u32, rng: &mut Rng) -> PopeRow {
     let heat = rng.range(0.85, 1.25); // trajectory-to-trajectory heating
     let mass0 = rng.range(1100.0, 1400.0);
     let nose0 = rng.range(18.0, 28.0); // mm
-    // Calibrated so ~1.7 g/cc loses CoG near 66 s, ~2.1 near 97 s (Pope walkthrough shape).
+    // Calibrated so ~1.7 g/cc loses CoG near 66 s, ~2.1 near 97 s.
     let rec_mm_s = 0.12 * porosity * heat; // nose lasts; CoG is the spin clock
     let mass_rate = mass0 * 0.00475 * porosity * heat;
 
@@ -94,7 +94,7 @@ fn run_one(id: u32, rng: &mut Rng) -> PopeRow {
     proof.feed_str(stack);
     proof.feed_str(if survived { "TERMINAL_SURVIVED" } else { "DEPARTURE_SPIN" });
 
-    PopeRow {
+    CarbonRow {
         id,
         short_id,
         density_gcc: density,
@@ -118,7 +118,7 @@ fn main() {
         .position(|a| a == "--parquet")
         .and_then(|i| args.get(i + 1))
         .cloned()
-        .unwrap_or_else(|| "../../grokd/data/forge_pope_supercarbon.parquet".to_string());
+        .unwrap_or_else(|| "../../grokd/data/forge_denser_carbon.parquet".to_string());
 
     println!("====================================================================");
     println!("  G^G CUSTOM PHYSICAL FORGE  ·  C-C vs Supercarbon");
@@ -172,7 +172,7 @@ fn main() {
         .set_compression(Compression::SNAPPY)
         .set_key_value_metadata(Some(vec![
             parquet::file::metadata::KeyValue::new("cryptographic_seal".to_string(), run_proof.clone()),
-            parquet::file::metadata::KeyValue::new("generator".to_string(), "G^G Pope C-C vs Supercarbon v1.0".to_string()),
+            parquet::file::metadata::KeyValue::new("generator".to_string(), "G^G C-C vs denser carbon stack v1.0".to_string()),
         ]))
         .build();
     let mut w = ArrowWriter::try_new(file, schema, Some(props)).unwrap();
