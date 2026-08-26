@@ -10,7 +10,7 @@ The **Reflex** (1000 Hz C library on the metal) is a different object: [ztp-runt
 
 | | |
 |--|--|
-| **Bins** | 140 binaries under `src/bin/` (receipt / mesh / inline / json-farm — `GARDEN.md`) |
+| **Bins** | 140 binaries under `src/bin/` |
 | **Native tempo** | **n = 2,500** dual-regime bank (the 48-hour commercial unit of work) |
 | **Language** | Domain physics only — no third-party simulator brand names in source |
 
