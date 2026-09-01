@@ -356,7 +356,7 @@ fn resolve_bank_path(args: &[String]) -> String {
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
-    let n_trajectories: u32 = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(1_000);
+    let n_trajectories: u32 = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(2_500);
 
     let out_parquet = args
         .iter()

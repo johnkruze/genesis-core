@@ -165,7 +165,7 @@ fn main() {
     let n_trajectories: u32 = args
         .get(1)
         .and_then(|s| s.parse().ok())
-        .unwrap_or(1_000);
+        .unwrap_or(2_500);
 
     let out_parquet = args
         .iter()

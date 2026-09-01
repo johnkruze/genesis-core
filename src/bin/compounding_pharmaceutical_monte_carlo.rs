@@ -199,7 +199,7 @@ fn main() {
     let args: Vec<String> = std::env::args().collect();
     let n_trajectories: u32 = args.get(1)
         .and_then(|s| s.parse().ok())
-        .unwrap_or(1_000);
+        .unwrap_or(2_500);
 
     let out_parquet = args.iter().position(|a| a == "--parquet")
         .and_then(|i| args.get(i + 1))

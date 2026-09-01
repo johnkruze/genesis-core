@@ -23,7 +23,5 @@ pub mod materials;
 pub mod tribology;
 pub mod plasma_facing;
 pub mod inverse_properties;
-
-
-
-
+pub mod resonance;
+pub mod tesseract;
