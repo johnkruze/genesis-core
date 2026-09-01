@@ -1,242 +1,202 @@
-// HUMANOID BIPEDAL GAIT — YAW ANGULAR MOMENTUM ACCUMULATION
-//
-// From the Euler binary: τ_z = Ω_x × L_y = 4.9 Nm yaw coupling torque
-// at v=2.5 m/s, 60kg load, 0.5m load height.
-//
-// Simplified controllers (ZMP-based) model only the sagittal and frontal planes.
-// They do not model τ_z — the yaw coupling torque from swing leg angular momentum.
-//
-// This torque accumulates over steps. The ankle provides counter-torque via
-// ground friction. When accumulated yaw angular momentum exceeds the ankle's
-// friction authority, the robot begins yawing into a fall.
-//
-// Governing equations (per step):
-//   ΔL_z = τ_z × T_step         (yaw momentum added per step)
-//   τ_friction_max = μ × M × g × r_ankle
-//   If cumulative |L_z| > τ_friction_max × T_step: ankle authority exceeded
-//
-// Critical step count: N_crit = τ_friction_max / |τ_z|
-//
-// This binary sweeps (speed, load, terrain_friction) and maps N_crit.
-// The finding: simplified controllers that ignore τ_z will walk into a fall
-// at N > N_crit steps without any warning from their ZMP diagnostics.
+//! Humanoid Bipedal Gait — Yaw Angular Momentum Accumulation
+//!
+//! \tau_z = \Omega_x \times L_y, N_{crit} = \tau_{friction\_max} / \tau_z
+//! Organ: resonance (zmp_from_ankle_torque_m).
+//! Sovereign Receipt n=2500 Dual-Regime Parquet.
 
-use genesis_core::proof::seal_run;
+use arrow::array::{BooleanArray, Float64Array, StringArray, UInt32Array};
+use arrow::datatypes::{DataType, Field, Schema};
+use arrow::record_batch::RecordBatch;
+use genesis_core::output;
+use genesis_core::physics::resonance::zmp_from_ankle_torque_m;
+use genesis_core::proof::{self, ProofChain};
 use genesis_core::rng::Rng;
-use rayon::prelude::*;
+use parquet::arrow::arrow_writer::ArrowWriter;
 use serde::Serialize;
-use std::fs::File;
-use std::io::Write;
+use std::sync::Arc;
 use std::time::Instant;
-use sha2::{Sha256, Digest};
 
-// Robot parameters (Atlas-class)
-const M_BODY: f64 = 80.0;
-const M_LEG: f64 = 12.0;
-const L_LEG: f64 = 0.9;
-const STRIDE_L: f64 = 0.70;
-const R_ANKLE: f64 = 0.08;     // ankle moment arm for friction torque (m)
-const G: f64 = 9.81;
-const I_BODY_Z: f64 = 18.0;    // body yaw inertia (kg·m²) — from CAD of Atlas
-const I_SWING_YY: f64 = M_LEG * L_LEG * L_LEG / 12.0; // 0.81 kg·m²
-const I_SWING_ZZ: f64 = M_LEG * 0.06 * 0.06 / 2.0;    // 0.022 kg·m²
+const DEFAULT_N: usize = 2500;
 
-#[derive(Serialize, Clone)]
-struct YawAccRun {
+// Named constants (OEM custom-run geometry)
+pub const M_BODY: f64 = 80.0;     // kg — body mass
+pub const M_LEG: f64 = 12.0;      // kg — single leg mass
+pub const L_LEG: f64 = 0.9;       // m — leg length
+pub const STRIDE_L: f64 = 0.70;   // m — stride length
+pub const R_ANKLE: f64 = 0.08;    // m — ankle moment arm for friction torque
+pub const G: f64 = 9.81;          // m/s²
+pub const I_BODY_Z: f64 = 18.0;   // kg·m² — body yaw inertia
+pub const ZMP_BLIND_THRESHOLD_M: f64 = 0.00085; // m — yaw ZMP the sagittal controller ignores
+
+const I_SWING_YY: f64 = M_LEG * L_LEG * L_LEG / 12.0;
+
+#[derive(Debug, Serialize)]
+struct Run {
+    trajectory_id: u32,
+    short_id: String,
     speed_ms: f64,
     load_kg: f64,
     load_height_m: f64,
     friction_coeff: f64,
-    // Computed physics
-    tau_z_nm: f64,              // yaw coupling torque τ_z = Ω_x × L_y
-    tau_friction_max_nm: f64,   // max ankle friction counter-torque
-    step_freq_hz: f64,
-    t_step_s: f64,
-    delta_lz_per_step_nms: f64, // yaw momentum added per step
-    critical_step_count: f64,   // N_crit = τ_friction / τ_z
-    yaw_angle_at_100_steps_deg: f64,  // how much yaw at 100 steps
-    zmp_sees_nothing: bool,     // ZMP model shows no warning at N_crit
-    gait_distance_to_fall_m: f64,     // how far the robot walked before falling
+    tau_z_nm: f64,
+    tau_friction_max_nm: f64,
+    critical_step_count: f64,
+    gait_distance_to_fall_m: f64,
+    is_zmp_blind: bool,
+    is_short_walk_fall: bool,
+    proof_hash: String,
 }
 
-#[derive(Clone)]
-struct Cfg { speed: f64, load: f64, load_h: f64, friction: f64, seed: u64 }
+fn run_one(id: u32, rng: &mut Rng) -> Run {
+    let short_id = output::short_id(rng);
+    let speed = rng.range(0.6, 2.0);
+    let load = rng.range(0.0, 40.0);
+    let load_h = rng.range(0.0, 0.50);
+    let friction = rng.range(0.25, 0.85);
 
-fn simulate(cfg: &Cfg) -> (YawAccRun, String) {
-    let mut rng = Rng::new(cfg.seed);
+    let mut proof = ProofChain::new();
+    proof.seed(&id.to_le_bytes());
+    proof.feed_f64(speed);
+    proof.feed_f64(load);
+    proof.feed_f64(load_h);
+    proof.feed_f64(friction);
 
-    let m_total = M_BODY + cfg.load;
-    let f_step = cfg.speed / (2.0 * STRIDE_L);
-    let t_step = 1.0 / f_step.max(0.01);
+    let m_total = M_BODY + load;
+    let f_step = speed / (2.0 * STRIDE_L);
 
-    // Swing angular velocity (sagittal, dominant term)
     let omega_swing_y = std::f64::consts::PI * f_step * L_LEG / (STRIDE_L / 2.0);
+    let h_com_eff = (M_BODY * 1.0 + load * (1.0 + load_h)) / m_total;
+    let omega_body_x = 0.08 * speed / L_LEG * (1.0 + load * load_h / (m_total * h_com_eff))
+        + rng.gaussian(0.0, 0.01);
 
-    // Body roll rate from lateral sway — increases with load height
-    // From lateral ZMP dynamics: Ω_x ≈ v × sqrt(M_load × h_load / (M_total × H_com)) / L_leg
-    let h_com_eff = (M_BODY * 1.0 + cfg.load * (1.0 + cfg.load_h)) / m_total;
-    let omega_body_x = 0.08 * cfg.speed / L_LEG * (1.0 + cfg.load * cfg.load_h / (m_total * h_com_eff))
-                     + rng.gaussian(0.0, 0.01);
-
-    // L_y = I_swing_yy × ω_swing_y (sagittal angular momentum)
     let l_y = I_SWING_YY * omega_swing_y;
+    let tau_z = (omega_body_x * l_y).abs();
+    let tau_friction = friction * m_total * G * R_ANKLE;
 
-    // τ_z = Ω_x × L_y — yaw coupling from Euler cross product
-    // Full cross product: τ_z = Ω_x × L_y - Ω_y × L_x ≈ Ω_x × L_y (dominant term)
-    let tau_z = omega_body_x * l_y;
-
-    // Maximum ankle friction counter-torque
-    let tau_friction = cfg.friction * m_total * G * R_ANKLE;
-
-    // Yaw momentum increment per step
-    let delta_lz = tau_z * t_step;
-
-    // Critical step count: how many steps until cumulative L_z > friction authority
-    let n_crit = if tau_z > 0.01 {
-        (tau_friction / (tau_z + 1e-6)).min(10000.0)
-    } else { 10000.0 };
-
-    // Yaw angle accumulated at N_crit and at 100 steps
-    // φ(N) = Σ ΔL_z / I_body_z (per step)
-    let phi_per_step_rad = delta_lz / I_BODY_Z;
-    let phi_at_100_deg = (100.0 * phi_per_step_rad).to_degrees().abs();
-    let phi_at_ncrit_deg = (n_crit * phi_per_step_rad).to_degrees().abs();
-
-    // ZMP sees nothing: at N_crit, is the ZMP inside the support polygon?
-    // ZMP perturbation from tau_z ≈ tau_z / (M * g * L_step) [lateral moment arm]
-    let zmp_from_yaw = tau_z / (m_total * G * STRIDE_L);
-    let support_y_half = 0.12f64;
-    let zmp_sees_nothing = zmp_from_yaw.abs() < support_y_half; // ZMP still looks fine
-
-    // Distance walked to fall
-    let gait_dist = n_crit * STRIDE_L;
-
-    let r = YawAccRun {
-        speed_ms: cfg.speed,
-        load_kg: cfg.load,
-        load_height_m: cfg.load_h,
-        friction_coeff: cfg.friction,
-        tau_z_nm: tau_z,
-        tau_friction_max_nm: tau_friction,
-        step_freq_hz: f_step,
-        t_step_s: t_step,
-        delta_lz_per_step_nms: delta_lz,
-        critical_step_count: n_crit,
-        yaw_angle_at_100_steps_deg: phi_at_100_deg,
-        zmp_sees_nothing,
-        gait_distance_to_fall_m: gait_dist.min(10000.0),
+    let n_crit = if tau_z > 0.001 {
+        (tau_friction / tau_z).min(10000.0)
+    } else {
+        10000.0
     };
-    let mut h = Sha256::new();
-    h.update(n_crit.to_le_bytes());
-    h.update(tau_z.to_le_bytes());
-    (r, hex::encode(h.finalize()))
+
+    // Organ coupling: zmp_from_ankle_torque_m
+    let zmp_from_yaw = zmp_from_ankle_torque_m(tau_z, m_total * G);
+    let is_zmp_blind = zmp_from_yaw.abs() < ZMP_BLIND_THRESHOLD_M;
+
+    let gait_dist = (n_crit * STRIDE_L).min(10000.0);
+    // Hard: fall inside a short walk. Do not OR with a 105 m distance cap (that ate survive).
+    let is_short_walk = n_crit < 40.0;
+
+    proof.feed_f64(tau_z);
+    proof.feed_f64(n_crit);
+    proof.feed_str(if is_short_walk && is_zmp_blind {
+        "BLIND_SHORT_FALL"
+    } else if is_short_walk {
+        "SHORT_FALL"
+    } else if is_zmp_blind {
+        "ZMP_BLIND"
+    } else {
+        "NOMINAL"
+    });
+
+    Run {
+        trajectory_id: id,
+        short_id,
+        speed_ms: (speed * 1000.0).round() / 1000.0,
+        load_kg: (load * 100.0).round() / 100.0,
+        load_height_m: (load_h * 1000.0).round() / 1000.0,
+        friction_coeff: (friction * 1000.0).round() / 1000.0,
+        tau_z_nm: (tau_z * 1000.0).round() / 1000.0,
+        tau_friction_max_nm: (tau_friction * 100.0).round() / 100.0,
+        critical_step_count: (n_crit * 10.0).round() / 10.0,
+        gait_distance_to_fall_m: (gait_dist * 10.0).round() / 10.0,
+        is_zmp_blind,
+        is_short_walk_fall: is_short_walk,
+        proof_hash: proof.seal(),
+    }
 }
 
 fn main() {
-    println!("=== G^G KERNEL: HUMANOID YAW ACCUMULATION — INVISIBLE FAILURE MODE ===");
-    println!("τ_z = Ω_x × L_y  →  N_crit = τ_friction_max / τ_z");
-    println!("ZMP controllers never see this coming.");
-    let start = Instant::now();
+    let args: Vec<String> = std::env::args().collect();
+    let n: usize = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(DEFAULT_N);
+    let out = args
+        .iter()
+        .position(|a| a == "--parquet")
+        .and_then(|i| args.get(i + 1))
+        .cloned()
+        .unwrap_or_else(|| {
+            format!(
+                "{}/../../data/exports/sovereign/humanoid_yaw_accumulation.parquet",
+                env!("CARGO_MANIFEST_DIR")
+            )
+        });
 
-    let mut cfgs = Vec::new();
-    let mut seed = 0u64;
+    println!("====================================================================");
+    println!("  G^G: HUMANOID YAW ACCUMULATION (zmp_from_ankle_torque_m)");
+    println!("  n={n}  out={out}");
+    println!("====================================================================\n");
 
-    let speeds: Vec<f64> = (0..31).map(|i| 0.5 + i as f64 * 0.1).collect();
-    let loads: Vec<f64> = (0..21).map(|i| i as f64 * 4.0).collect();
-    let load_heights = [0.0f64, 0.3, 0.6];
-    let frictions = [0.2f64, 0.4, 0.6, 0.8]; // dry concrete to wet grass
+    let t0 = Instant::now();
+    let mut rng = Rng::new(0x7a77_a001);
+    let rows: Vec<Run> = (0..n as u32).map(|i| run_one(i, &mut rng)).collect();
+    let proofs: Vec<String> = rows.iter().map(|r| r.proof_hash.clone()).collect();
+    let seal = proof::seal_run(&proofs);
 
-    for &speed in &speeds {
-        for &load in &loads {
-            for &lh in &load_heights {
-                for &fric in &frictions {
-                    for _ in 0..4 {
-                        cfgs.push(Cfg { speed, load, load_h: lh, friction: fric, seed });
-                        seed += 1;
-                    }
-                }
-            }
-        }
+    if let Some(p) = std::path::Path::new(&out).parent() {
+        std::fs::create_dir_all(p).ok();
     }
 
-    let total = cfgs.len();
-    let results: Vec<(YawAccRun, String)> = cfgs.into_par_iter().map(|c| simulate(&c)).collect();
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("trajectory_id", DataType::UInt32, false),
+        Field::new("short_id", DataType::Utf8, false),
+        Field::new("speed_ms", DataType::Float64, false),
+        Field::new("load_kg", DataType::Float64, false),
+        Field::new("load_height_m", DataType::Float64, false),
+        Field::new("friction_coeff", DataType::Float64, false),
+        Field::new("tau_z_nm", DataType::Float64, false),
+        Field::new("tau_friction_max_nm", DataType::Float64, false),
+        Field::new("critical_step_count", DataType::Float64, false),
+        Field::new("gait_distance_to_fall_m", DataType::Float64, false),
+        Field::new("is_zmp_blind", DataType::Boolean, false),
+        Field::new("is_short_walk_fall", DataType::Boolean, false),
+        Field::new("proof_hash", DataType::Utf8, false),
+    ]));
 
-    let mut hashes = Vec::new();
-    let mut runs: Vec<YawAccRun> = Vec::new();
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(UInt32Array::from(rows.iter().map(|r| r.trajectory_id).collect::<Vec<_>>())),
+            Arc::new(StringArray::from(rows.iter().map(|r| r.short_id.as_str()).collect::<Vec<_>>())),
+            Arc::new(Float64Array::from(rows.iter().map(|r| r.speed_ms).collect::<Vec<_>>())),
+            Arc::new(Float64Array::from(rows.iter().map(|r| r.load_kg).collect::<Vec<_>>())),
+            Arc::new(Float64Array::from(rows.iter().map(|r| r.load_height_m).collect::<Vec<_>>())),
+            Arc::new(Float64Array::from(rows.iter().map(|r| r.friction_coeff).collect::<Vec<_>>())),
+            Arc::new(Float64Array::from(rows.iter().map(|r| r.tau_z_nm).collect::<Vec<_>>())),
+            Arc::new(Float64Array::from(rows.iter().map(|r| r.tau_friction_max_nm).collect::<Vec<_>>())),
+            Arc::new(Float64Array::from(rows.iter().map(|r| r.critical_step_count).collect::<Vec<_>>())),
+            Arc::new(Float64Array::from(rows.iter().map(|r| r.gait_distance_to_fall_m).collect::<Vec<_>>())),
+            Arc::new(BooleanArray::from(rows.iter().map(|r| r.is_zmp_blind).collect::<Vec<_>>())),
+            Arc::new(BooleanArray::from(rows.iter().map(|r| r.is_short_walk_fall).collect::<Vec<_>>())),
+            Arc::new(StringArray::from(rows.iter().map(|r| r.proof_hash.as_str()).collect::<Vec<_>>())),
+        ],
+    )
+    .expect("batch");
 
-    for (r, h) in results { hashes.push(h); runs.push(r); }
+    let file = std::fs::File::create(&out).unwrap();
+    let props = output::parquet_receipt_properties(&seal, "G^G humanoid yaw accumulation dual-regime v3.0");
+    let mut w = ArrowWriter::try_new(file, schema, Some(props)).unwrap();
+    w.write(&batch).unwrap();
+    w.close().unwrap();
 
-    // ── ZMP BLINDNESS: critical step count vs speed ───────────────────────────
-    println!("\n--- INVISIBLE FAILURE: N_crit by speed (load=40kg, lh=0.5m, friction=0.4) ---");
-    println!("(N_crit = steps before yaw accumulation exceeds ankle friction authority)");
-    println!("{:>8} {:>10} {:>12} {:>16} {:>14} {:>14}",
-        "Speed", "τ_z(Nm)", "N_crit", "Dist to fall(m)", "ZMP blind?", "φ@100 steps°");
-
-    for &speed in speeds.iter().step_by(3) {
-        let pool: Vec<&YawAccRun> = runs.iter()
-            .filter(|r| (r.speed_ms - speed).abs() < 0.06
-                    && (r.load_kg - 40.0).abs() < 0.1
-                    && (r.load_height_m - 0.3).abs() < 0.1
-                    && (r.friction_coeff - 0.4).abs() < 0.01)
-            .collect();
-        if pool.is_empty() { continue; }
-        let tau_z = pool.iter().map(|r| r.tau_z_nm).sum::<f64>() / pool.len() as f64;
-        let n_crit = pool.iter().map(|r| r.critical_step_count).sum::<f64>() / pool.len() as f64;
-        let dist = pool.iter().map(|r| r.gait_distance_to_fall_m).sum::<f64>() / pool.len() as f64;
-        let blind_pct = pool.iter().filter(|r| r.zmp_sees_nothing).count() as f64 / pool.len() as f64 * 100.0;
-        let phi = pool.iter().map(|r| r.yaw_angle_at_100_steps_deg).sum::<f64>() / pool.len() as f64;
-        let marker = if n_crit < 50.0 { " ← FALLS FAST" } else if n_crit < 200.0 { " ← SHORT WALK" } else { "" };
-        println!("{:>7.1}m/s {:>9.2}  {:>9.0}  {:>14.0}m {:>13.0}% {:>13.2}°{}",
-            speed, tau_z, n_crit, dist, blind_pct, phi, marker);
-    }
-
-    // ── TERRAIN FRICTION CLIFF ────────────────────────────────────────────────
-    println!("\n--- FRICTION CLIFF: N_crit by terrain type (v=2.0 m/s, load=50kg, lh=0.5m) ---");
-    println!("{:>8} {:>12} {:>12} {:>16}", "μ", "Terrain", "N_crit", "Dist to fall(m)");
-
-    let terrain_names = [(0.2f64, "Wet mud"), (0.4, "Wet concrete"),
-                          (0.6, "Dry asphalt"), (0.8, "Rubber mat")];
-    for (fric, name) in &terrain_names {
-        let pool: Vec<&YawAccRun> = runs.iter()
-            .filter(|r| (r.speed_ms - 2.0).abs() < 0.06
-                    && (r.load_kg - 50.0).abs() < 0.1
-                    && (r.load_height_m - 0.3).abs() < 0.1
-                    && (r.friction_coeff - fric).abs() < 0.01)
-            .collect();
-        if pool.is_empty() { continue; }
-        let n_crit = pool.iter().map(|r| r.critical_step_count).sum::<f64>() / pool.len() as f64;
-        let dist = pool.iter().map(|r| r.gait_distance_to_fall_m).sum::<f64>() / pool.len() as f64;
-        println!("{:>8.2} {:>12} {:>12.0} {:>15.0}m", fric, name, n_crit, dist);
-    }
-
-    // ── LOAD HEIGHT AMPLIFICATION ─────────────────────────────────────────────
-    println!("\n--- LOAD HEIGHT AMPLIFICATION (v=1.5 m/s, μ=0.4) ---");
-    println!("{:>8} {:>8} {:>10} {:>12} {:>16}", "Load(kg)", "h(m)", "τ_z(Nm)", "N_crit", "ZMP blind%");
-    for &load in &[20.0f64, 40.0, 60.0] {
-        for &lh in &[0.0f64, 0.3, 0.6] {
-            let pool: Vec<&YawAccRun> = runs.iter()
-                .filter(|r| (r.load_kg - load).abs() < 0.1
-                        && (r.speed_ms - 1.5).abs() < 0.06
-                        && (r.load_height_m - lh).abs() < 0.05
-                        && (r.friction_coeff - 0.4).abs() < 0.01)
-                .collect();
-            if pool.is_empty() { continue; }
-            let tau = pool.iter().map(|r| r.tau_z_nm).sum::<f64>() / pool.len() as f64;
-            let nc = pool.iter().map(|r| r.critical_step_count).sum::<f64>() / pool.len() as f64;
-            let blind = pool.iter().filter(|r| r.zmp_sees_nothing).count() as f64 / pool.len() as f64 * 100.0;
-            println!("{:>8.0} {:>8.1} {:>10.3} {:>12.0} {:>15.0}%", load, lh, tau, nc, blind);
-        }
-    }
-
-    let json = serde_json::to_string_pretty(&runs).unwrap();
-    File::create("humanoid_yaw_accumulation_envelope.json").unwrap().write_all(json.as_bytes()).unwrap();
-
-    let master = seal_run(&hashes);
-    println!("\n=================================================================");
-    println!("Total configurations: {}  |  Elapsed: {:?}", total, start.elapsed());
-    println!("Master Hash: {}", master);
-    println!("=================================================================");
-    println!("The ZMP controller's blind spot: τ_z = Ω_x × L_y accumulates per step.");
-    println!("ZMP diagnostics show green. The robot is counting steps to its fall.");
+    let n_f = n as f64;
+    let blind = rows.iter().filter(|r| r.is_zmp_blind).count();
+    let short_fall = rows.iter().filter(|r| r.is_short_walk_fall).count();
+    println!(
+        "  zmp_blind {blind} ({:.1}%)  short_walk_fall {short_fall} ({:.1}%)",
+        100.0 * blind as f64 / n_f,
+        100.0 * short_fall as f64 / n_f
+    );
+    println!("  seal {seal}");
+    println!("  parquet {out}");
+    println!("  {:?}", t0.elapsed());
 }

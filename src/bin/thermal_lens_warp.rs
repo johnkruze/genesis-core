@@ -1,111 +1,151 @@
-//! 1000Hz GENESIS CORE MODULE: THERMAL_LENS_WARP
-//! TARGET: Generic Commercial/Industrial Autonomous Systems
-//! CLASS: Autonomous Flight Systems / Drones
-//! SUBSYSTEM: Omnidirectional Visual Navigation Array
-//! VULNERABILITY: Drones operating in bright sunlight or near fire-lines (Search & Rescue) soak up intense radiant heat. The plastic/glass composite navigation lenses warp microscopically at 130F+. This warpage alters the focal length and induces radial distortion that breaks the factory camera matrix calibration. The convolutional neural networks hallucinate phantom obstacles and crash the drone.
+//! Thin-lens optothermal defocus vs geometric depth of focus.
+//! Δf = f [α − (dn/dT)/(n−1)] ΔT. Blur when |Δf| > δ = 2λN². Lock lost when |Δf| > 4δ.
+//! Constitutive (no 1000 Hz loop). Organ: lens_optothermal_defocus_m, geometric_depth_of_focus_m.
 
-use rayon::prelude::*;
-use serde_json::json;
-use std::fs::{File, OpenOptions};
-use std::io::{BufWriter, Write};
-use std::sync::{Arc, Mutex};
+use genesis_core::output;
+use genesis_core::physics::thermal::{
+    geometric_depth_of_focus_m, lens_optothermal_defocus_m, VISIBLE_WAVELENGTH_M,
+};
+use genesis_core::proof::{self, ProofChain};
+use genesis_core::rng::Rng;
+use serde::Serialize;
+use std::sync::Arc;
 use std::time::Instant;
-use rand::Rng;
 
-const NUM_TRAJECTORIES: usize = 1_200_000;
-const HZ: f64 = 1000.0;
-const DT: f64 = 1.0 / HZ;
+use arrow::array::{BooleanArray, Float64Array, StringArray, UInt32Array};
+use arrow::datatypes::{DataType, Field, Schema};
+use arrow::record_batch::RecordBatch;
+use parquet::arrow::arrow_writer::ArrowWriter;
 
-// Tactical Electro-Optical Baseline
-const LENS_THERMAL_EXPANSION_COEFFICIENT: f64 = 0.00007; // Typical for injection molded optic plastics 
-const CRITICAL_FOCAL_SHIFT_PERCENT: f64 = 2.5; // If focal length shifts by 2.5%, the projection matrix is irreversibly broken and objects appear closer/farther dynamically
+const DEFAULT_N: usize = 2500;
+const T_CAL_C: f64 = 20.0;
+const N_BK7: f64 = 1.5168;
+
+#[derive(Debug, Serialize)]
+struct Run {
+    id: u32,
+    short_id: String,
+    lens_temp_c: f64,
+    focal_length_mm: f64,
+    defocus_um: f64,
+    depth_of_focus_um: f64,
+    is_focal_blur_detected: bool,
+    is_optical_lock_lost: bool,
+    proof_hash: String,
+}
+
+fn run_one(id: u32, rng: &mut Rng) -> Run {
+    let short_id = output::short_id(rng);
+    let t_c = rng.range(30.0, 95.0);
+    let f_m = rng.range(0.025, 0.180);
+    let n_number = rng.range(1.4, 4.0);
+    let alpha = rng.range(6.8e-6, 8.5e-6);
+    let dn_dt = rng.range(2.5e-6, 4.5e-6);
+
+    let mut proof = ProofChain::new();
+    proof.seed(&id.to_le_bytes());
+    proof.feed_f64(t_c);
+    proof.feed_f64(f_m);
+    proof.feed_f64(n_number);
+
+    let df = lens_optothermal_defocus_m(f_m, alpha, dn_dt, N_BK7, t_c - T_CAL_C).abs();
+    let dof = geometric_depth_of_focus_m(VISIBLE_WAVELENGTH_M, n_number);
+    let blur = df > dof;
+    let lost = df > 4.0 * dof;
+
+    proof.feed_f64(df);
+    proof.feed_f64(dof);
+    proof.feed_str(if lost {
+        "LOCK_LOST"
+    } else if blur {
+        "BLURRED"
+    } else {
+        "NOMINAL"
+    });
+
+    Run {
+        id,
+        short_id,
+        lens_temp_c: (t_c * 10.0).round() / 10.0,
+        focal_length_mm: (f_m * 1e3 * 10.0).round() / 10.0,
+        defocus_um: (df * 1e6 * 100.0).round() / 100.0,
+        depth_of_focus_um: (dof * 1e6 * 100.0).round() / 100.0,
+        is_focal_blur_detected: blur,
+        is_optical_lock_lost: lost,
+        proof_hash: proof.seal(),
+    }
+}
 
 fn main() {
-    let start_time = Instant::now();
-    let export_dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../../data/exports/sovereign");
-    std::fs::create_dir_all(export_dir).unwrap();
-    let file = OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .open(format!("{}/thermal_lens_warp.json", export_dir))
-        .unwrap();
-    let mut writer = BufWriter::new(file);
+    let args: Vec<String> = std::env::args().collect();
+    let n: usize = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(DEFAULT_N);
+    let out = args
+        .iter()
+        .position(|a| a == "--parquet")
+        .and_then(|i| args.get(i + 1))
+        .cloned()
+        .unwrap_or_else(|| {
+            format!(
+                "{}/../../data/exports/sovereign/thermal_lens_warp.parquet",
+                env!("CARGO_MANIFEST_DIR")
+            )
+        });
 
-    println!("=========================================================");
-    println!("G^G SOVEREIGN PHYSICS ENGINE: 1000Hz THERMO-OPTICAL AUDIT");
-    println!("TARGET: GENERIC COMMERCIAL SYSTEMS");
-    println!("MODULE: THERMAL_LENS_WARP");
-    println!("EXECUTING 1,200,000 TRAJECTORIES...");
-    println!("=========================================================\n");
+    println!("====================================================================");
+    println!("  G^G: THIN-LENS OPTOTHERMAL  (Δf vs 2λN²)");
+    println!("  n={n}  BK7  λ=550 nm");
+    println!("====================================================================\n");
 
-    let failed_count = Arc::new(Mutex::new(0usize));
+    let t0 = Instant::now();
+    let mut rng = Rng::new(0x7381_0005);
+    let rows: Vec<Run> = (0..n as u32).map(|i| run_one(i, &mut rng)).collect();
+    let proofs: Vec<String> = rows.iter().map(|r| r.proof_hash.clone()).collect();
+    let seal = proof::seal_run(&proofs);
 
-    let results: Vec<serde_json::Value> = (0..NUM_TRAJECTORIES).into_par_iter().map(|i| {
-        let mut rng = rand::thread_rng();
-        
-        let mut max_focal_shift_percent = 0.0;
-        let mut optical_matrix_failure = false;
-        
-        // Simulating the drone mapping an active wildfire area, or just flying in 110F Arizona summer sun.
-        let ambient_temp_c = rng.gen_range(35.0..60.0); 
-        
-        // Radiant heating from the sun or a nearby heat source is absorbed into the black/dark plastics holding the lenses 
-        let radiant_heat_soak_c = rng.gen_range(10.0..30.0);
-        let lens_temp_c = ambient_temp_c + radiant_heat_soak_c;
-        
-        let calibration_temp_c = 22.0; // The drone was factory-calibrated at a cool 22C holding temp
-        
-        for _tick in 0..(5.0 * HZ) as usize { // 5 seconds of flight in this soaked state
-            
-            let temp_delta = lens_temp_c - calibration_temp_c;
-            
-            // As the lens housing and the optic itself expand, the shape of the curvature changes.
-            // This is a direct physical deformation. 
-            // Focal shift is roughly linear with thermal expansion in small bounds.
-            let physical_lens_strain = temp_delta * LENS_THERMAL_EXPANSION_COEFFICIENT;
-            
-            // Multiply by a factor representing the convex compounding effect of the lens group
-            let focal_shift_percent = physical_lens_strain * 600.0 * rng.gen_range(0.9..1.1); 
-
-            if focal_shift_percent > max_focal_shift_percent {
-                max_focal_shift_percent = focal_shift_percent;
-            }
-
-            // The vision models are highly sensitive. A 2.5% focal shift means a branch that is 5 meters away
-            // might project onto the sensor as if it were 1 meter away, triggering emergency obstacle avoidance
-            // pulling the drone directly into an ACTUAL branch that it misjudged.
-            if focal_shift_percent > CRITICAL_FOCAL_SHIFT_PERCENT {
-                optical_matrix_failure = true;
-                break;
-            }
-        }
-
-        if optical_matrix_failure {
-            let mut fc = failed_count.lock().unwrap();
-            *fc += 1;
-        }
-
-        json!({
-            "trajectory_id": i,
-            "lens_temperature_C": f64::trunc(lens_temp_c * 10.0) / 10.0,
-            "max_focal_shift_percent": f64::trunc(max_focal_shift_percent * 100.0) / 100.0,
-            "survived": !optical_matrix_failure,
-            "failure_mode": if !optical_matrix_failure { "NOMINAL" } else { "VISION_CALIBRATION_THERMAL_WARP_CRASH" },
-            "cryptographic_seal": format!("sha256:thermal_lens_warp_{}", i)
-        })
-    }).collect();
-
-    for res in results {
-        writeln!(writer, "{}", res.to_string()).unwrap();
+    if let Some(p) = std::path::Path::new(&out).parent() {
+        std::fs::create_dir_all(p).ok();
     }
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("trajectory_id", DataType::UInt32, false),
+        Field::new("short_id", DataType::Utf8, false),
+        Field::new("lens_temp_c", DataType::Float64, false),
+        Field::new("focal_length_mm", DataType::Float64, false),
+        Field::new("defocus_um", DataType::Float64, false),
+        Field::new("depth_of_focus_um", DataType::Float64, false),
+        Field::new("is_focal_blur_detected", DataType::Boolean, false),
+        Field::new("is_optical_lock_lost", DataType::Boolean, false),
+        Field::new("proof_hash", DataType::Utf8, false),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(UInt32Array::from(rows.iter().map(|r| r.id).collect::<Vec<_>>())),
+            Arc::new(StringArray::from(rows.iter().map(|r| r.short_id.as_str()).collect::<Vec<_>>())),
+            Arc::new(Float64Array::from(rows.iter().map(|r| r.lens_temp_c).collect::<Vec<_>>())),
+            Arc::new(Float64Array::from(rows.iter().map(|r| r.focal_length_mm).collect::<Vec<_>>())),
+            Arc::new(Float64Array::from(rows.iter().map(|r| r.defocus_um).collect::<Vec<_>>())),
+            Arc::new(Float64Array::from(rows.iter().map(|r| r.depth_of_focus_um).collect::<Vec<_>>())),
+            Arc::new(BooleanArray::from(rows.iter().map(|r| r.is_focal_blur_detected).collect::<Vec<_>>())),
+            Arc::new(BooleanArray::from(rows.iter().map(|r| r.is_optical_lock_lost).collect::<Vec<_>>())),
+            Arc::new(StringArray::from(rows.iter().map(|r| r.proof_hash.as_str()).collect::<Vec<_>>())),
+        ],
+    )
+    .expect("batch");
+    let file = std::fs::File::create(&out).unwrap();
+    let props = output::parquet_receipt_properties(&seal, "G^G thin-lens Δf vs DoF dual-regime v3.0");
+    let mut w = ArrowWriter::try_new(file, schema, Some(props)).unwrap();
+    w.write(&batch).unwrap();
+    w.close().unwrap();
 
-    let fc = *failed_count.lock().unwrap();
-    let failure_rate = (fc as f64 / NUM_TRAJECTORIES as f64) * 100.0;
-    
-    println!("THERMAL_LENS_WARP PHYSICS AUDIT COMPLETE.");
-    println!("TOTAL TRAJECTORIES: {:?}", NUM_TRAJECTORIES);
-    println!("CATASTROPHIC MATRIX DEFORMATION RATE: {} ({:.2}%)", fc, failure_rate);
-    println!("EXECUTION TIME: {:?}", start_time.elapsed());
-    println!("SEALED TO: {}/thermal_lens_warp.json\n", export_dir);
+    let n_f = n as f64;
+    let blur = rows.iter().filter(|r| r.is_focal_blur_detected).count();
+    let lost = rows.iter().filter(|r| r.is_optical_lock_lost).count();
+    println!(
+        "  blur {blur} ({:.1}%)  lock_lost {lost} ({:.1}%)",
+        100.0 * blur as f64 / n_f,
+        100.0 * lost as f64 / n_f
+    );
+    println!("  seal {seal}");
+    println!("  parquet {out}");
+    println!("  {:?}", t0.elapsed());
 }

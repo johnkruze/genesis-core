@@ -1,120 +1,175 @@
-//! 1000Hz GENESIS CORE MODULE: ANKLE_INVERSION_TRIP
-//! TARGET: Generic Commercial/Industrial Autonomous Systems
-//! CLASS: Bipedal Humanoid
-//! SUBSYSTEM: End-to-End Neural Control & Flat-foot Locomotion
-//! VULNERABILITY: E2E locomotion models trained in clean environments hallucinate perfectly flat ground. When the foot strikes a lateral edge (e.g., transition from rug to hardwood, or crossing a door sill), the unmodeled leverage immediately inverts the ankle and throws the Zero Moment Point (ZMP) outside the base of support.
+//! Lateral ankle as inverted pendulum. k_p > m g h (Gemini's k_p=350 was unstabilizable).
+//! Clock: 1 kHz, 400 ms single-support. ZMP = τ / F_n.
+//! Gates: peak |x_zmp| ≥ 30 mm margin-thin vs |θ| ≥ 0.20 rad inversion fall.
+//! Organ: resonance::InvertedPendulum, pd_ankle_torque_nm, zmp_from_ankle_torque_m.
 
-use rayon::prelude::*;
-use serde_json::json;
-use std::fs::{File, OpenOptions};
-use std::io::{BufWriter, Write};
-use std::sync::{Arc, Mutex};
+use genesis_core::output;
+use genesis_core::physics::resonance::{
+    pd_ankle_torque_nm, zmp_from_ankle_torque_m, InvertedPendulum,
+};
+use genesis_core::proof::{self, ProofChain};
+use genesis_core::rng::Rng;
+use serde::Serialize;
+use std::sync::Arc;
 use std::time::Instant;
-use rand::Rng;
 
-const NUM_TRAJECTORIES: usize = 1_200_000;
-const HZ: f64 = 1000.0;
-const DT: f64 = 1.0 / HZ;
+use arrow::array::{BooleanArray, Float64Array, StringArray, UInt32Array};
+use arrow::datatypes::{DataType, Field, Schema};
+use arrow::record_batch::RecordBatch;
+use parquet::arrow::arrow_writer::ArrowWriter;
 
-// HUMANOID ZMP Baseline
-const HUMANOID_MASS_KG: f64 = 30.0; // Marketed as ultra-lightweight
-const FOOT_WIDTH_HALF_M: f64 = 0.045; // 90mm total width
-const ANKLE_ROLL_STIFFNESS: f64 = 15.0; // Soft passive compliance
+const DEFAULT_N: usize = 2500;
+const DT: f64 = 0.001;
+const STANCE_S: f64 = 0.40;
+const FOOT_HALF_M: f64 = 0.045;
+const ZMP_THIN_M: f64 = 0.030;
+const FALL_THETA: f64 = 0.20;
 
-fn main() {
-    let start_time = Instant::now();
-    let export_dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../../data/exports/sovereign");
-    std::fs::create_dir_all(export_dir).unwrap();
-    let file = OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .open(format!("{}/ankle_inversion_trip.json", export_dir))
-        .unwrap();
-    let mut writer = BufWriter::new(file);
+#[derive(Debug, Serialize)]
+struct Run {
+    id: u32,
+    short_id: String,
+    lateral_obstacle_height_mm: f64,
+    peak_lateral_zmp_offset_mm: f64,
+    ankle_roll_angle_deg: f64,
+    is_support_margin_degraded: bool,
+    is_ankle_inversion_fall: bool,
+    proof_hash: String,
+}
 
-    println!("=========================================================");
-    println!("G^G SOVEREIGN PHYSICS ENGINE: 1000Hz ZMP KINEMATIC AUDIT");
-    println!("TARGET: GENERIC COMMERCIAL SYSTEMS");
-    println!("MODULE: ANKLE_INVERSION_TRIP");
-    println!("EXECUTING 1,200,000 TRAJECTORIES...");
-    println!("=========================================================\n");
+fn run_one(id: u32, rng: &mut Rng) -> Run {
+    let short_id = output::short_id(rng);
+    let h_obs_mm = rng.range(2.0, 16.0);
+    let mass = rng.range(58.0, 85.0);
+    let com_h = rng.range(0.80, 0.92);
 
-    let failed_count = Arc::new(Mutex::new(0usize));
+    let mut proof = ProofChain::new();
+    proof.seed(&id.to_le_bytes());
+    proof.feed_f64(h_obs_mm);
+    proof.feed_f64(mass);
+    proof.feed_f64(com_h);
 
-    let results: Vec<serde_json::Value> = (0..NUM_TRAJECTORIES).into_par_iter().map(|i| {
-        let mut rng = rand::thread_rng();
-        
-        let mut max_zmp_deflection_m = 0.0;
-        let mut catastrophic_trip = false;
-        
-        // Simulating single-support phase (all 30kg of weight on one foot)
-        // The foot lands on an uneven transition (e.g. 1cm thick rug edge)
-        let edge_offset_percent = rng.gen_range(0.1..0.9); // How much of the foot is hanging off the edge
-        let lateral_lever_arm_m = FOOT_WIDTH_HALF_M * edge_offset_percent;
+    let theta0 = (h_obs_mm * 1e-3 / (2.0 * FOOT_HALF_M)).asin();
+    let mut plant = InvertedPendulum::new(theta0, com_h, mass);
+    let kp = plant.mgh_nm_per_rad() * rng.range(1.20, 1.90);
+    let kd = 2.0 * (kp * plant.inertia_kg_m2()).sqrt() * rng.range(0.35, 0.80);
+    let tau_max = rng.range(90.0, 140.0);
+    let fnorm = mass * 9.81;
 
-        // Gravity acts straight down. If the foot is on an edge, it creates a roll torque.
-        let gravitational_force_n = HUMANOID_MASS_KG * 9.81;
-        
-        // Dynamic walking adds downward acceleration (impact multiplier)
-        let impact_multiplier = rng.gen_range(1.1..1.6);
-        let vertical_force = gravitational_force_n * impact_multiplier;
-
-        let roll_torque = vertical_force * lateral_lever_arm_m;
-
-        for _tick in 0..(0.5 * HZ) as usize { // 0.5s stance phase
-            
-            // E2E models do not actively compensate for this torque in real-time unless they were
-            // specifically trained on this exact rug transition in VR.
-            // The passive software stiffness must fight it.
-            
-            // The ankle rolls mechanically
-            let ankle_roll_radians = roll_torque / ANKLE_ROLL_STIFFNESS;
-            
-            // This roll shifts the center of gravity laterally
-            // Assume COM is roughly 1.0m off the ground 
-            let com_lateral_shift = ankle_roll_radians.sin() * 1.0; 
-            
-            // Further offset by dynamic momentum
-            let dynamic_zmp_shift = com_lateral_shift * rng.gen_range(1.0..1.2);
-
-            if dynamic_zmp_shift > max_zmp_deflection_m {
-                max_zmp_deflection_m = dynamic_zmp_shift;
-            }
-
-            // If the ZMP exceeds the support polygon of the single foot on the ground, it trips and falls.
-            if dynamic_zmp_shift > FOOT_WIDTH_HALF_M {
-                catastrophic_trip = true;
-                break;
-            }
+    let mut peak_zmp = 0.0;
+    let mut peak_theta = theta0.abs();
+    let steps = (STANCE_S / DT) as usize;
+    for k in 0..steps {
+        let tau = pd_ankle_torque_nm(plant.theta_rad, plant.omega_rad_s, kp, kd, tau_max);
+        let zmp = zmp_from_ankle_torque_m(tau.abs(), fnorm).abs();
+        if zmp > peak_zmp {
+            peak_zmp = zmp;
         }
-
-        if catastrophic_trip {
-            let mut fc = failed_count.lock().unwrap();
-            *fc += 1;
+        plant.step(tau, DT);
+        let th = plant.theta_rad.abs();
+        if th > peak_theta {
+            peak_theta = th;
         }
-
-        json!({
-            "trajectory_id": i,
-            "edge_lateral_lever_m": f64::trunc(lateral_lever_arm_m * 1000.0) / 1000.0,
-            "ankle_roll_torque_Nm": f64::trunc(roll_torque * 100.0) / 100.0,
-            "max_zmp_deflection_m": f64::trunc(max_zmp_deflection_m * 1000.0) / 1000.0,
-            "survived": !catastrophic_trip,
-            "failure_mode": if !catastrophic_trip { "NOMINAL" } else { "E2E_UNMODELED_ANKLE_INVERSION_FALL" },
-            "cryptographic_seal": format!("sha256:humanoid_ankle_inversion_{}", i)
-        })
-    }).collect();
-
-    for res in results {
-        writeln!(writer, "{}", res.to_string()).unwrap();
+        if th >= FALL_THETA {
+            break;
+        }
+        if k % 50 == 0 {
+            proof.feed_f64(plant.theta_rad);
+        }
     }
 
-    let fc = *failed_count.lock().unwrap();
-    let failure_rate = (fc as f64 / NUM_TRAJECTORIES as f64) * 100.0;
-    
-    println!("ANKLE_INVERSION_TRIP PHYSICS AUDIT COMPLETE.");
-    println!("TOTAL TRAJECTORIES: {:?}", NUM_TRAJECTORIES);
-    println!("CATASTROPHIC TIP-OVER RATE: {} ({:.2}%)", fc, failure_rate);
-    println!("EXECUTION TIME: {:?}", start_time.elapsed());
-    println!("SEALED TO: {}/ankle_inversion_trip.json\n", export_dir);
+    let thin = peak_theta >= 0.10;
+    let fall = peak_theta >= FALL_THETA;
+    proof.feed_f64(peak_zmp);
+    proof.feed_f64(plant.theta_rad);
+    proof.feed_str(if fall {
+        "INVERSION_FALL"
+    } else if thin {
+        "THIN_MARGIN"
+    } else {
+        "NOMINAL"
+    });
+
+    Run {
+        id,
+        short_id,
+        lateral_obstacle_height_mm: (h_obs_mm * 10.0).round() / 10.0,
+        peak_lateral_zmp_offset_mm: (peak_zmp * 1e3 * 10.0).round() / 10.0,
+        ankle_roll_angle_deg: (plant.theta_rad.to_degrees() * 10.0).round() / 10.0,
+        is_support_margin_degraded: thin,
+        is_ankle_inversion_fall: fall,
+        proof_hash: proof.seal(),
+    }
+}
+
+fn main() {
+    let args: Vec<String> = std::env::args().collect();
+    let n: usize = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(DEFAULT_N);
+    let out = args
+        .iter()
+        .position(|a| a == "--parquet")
+        .and_then(|i| args.get(i + 1))
+        .cloned()
+        .unwrap_or_else(|| {
+            format!(
+                "{}/../../data/exports/sovereign/ankle_inversion_trip.parquet",
+                env!("CARGO_MANIFEST_DIR")
+            )
+        });
+
+    println!("====================================================================");
+    println!("  G^G: ANKLE LIP  (1 kHz stance, k_p > m g h)");
+    println!("  n={n}  ZMP thin {ZMP_THIN_M} m  fall |θ|≥{FALL_THETA} rad");
+    println!("====================================================================\n");
+
+    let t0 = Instant::now();
+    let mut rng = Rng::new(0x7188_0008);
+    let rows: Vec<Run> = (0..n as u32).map(|i| run_one(i, &mut rng)).collect();
+    let proofs: Vec<String> = rows.iter().map(|r| r.proof_hash.clone()).collect();
+    let seal = proof::seal_run(&proofs);
+
+    if let Some(p) = std::path::Path::new(&out).parent() {
+        std::fs::create_dir_all(p).ok();
+    }
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("trajectory_id", DataType::UInt32, false),
+        Field::new("short_id", DataType::Utf8, false),
+        Field::new("lateral_obstacle_height_mm", DataType::Float64, false),
+        Field::new("peak_lateral_zmp_offset_mm", DataType::Float64, false),
+        Field::new("ankle_roll_angle_deg", DataType::Float64, false),
+        Field::new("is_support_margin_degraded", DataType::Boolean, false),
+        Field::new("is_ankle_inversion_fall", DataType::Boolean, false),
+        Field::new("proof_hash", DataType::Utf8, false),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(UInt32Array::from(rows.iter().map(|r| r.id).collect::<Vec<_>>())),
+            Arc::new(StringArray::from(rows.iter().map(|r| r.short_id.as_str()).collect::<Vec<_>>())),
+            Arc::new(Float64Array::from(rows.iter().map(|r| r.lateral_obstacle_height_mm).collect::<Vec<_>>())),
+            Arc::new(Float64Array::from(rows.iter().map(|r| r.peak_lateral_zmp_offset_mm).collect::<Vec<_>>())),
+            Arc::new(Float64Array::from(rows.iter().map(|r| r.ankle_roll_angle_deg).collect::<Vec<_>>())),
+            Arc::new(BooleanArray::from(rows.iter().map(|r| r.is_support_margin_degraded).collect::<Vec<_>>())),
+            Arc::new(BooleanArray::from(rows.iter().map(|r| r.is_ankle_inversion_fall).collect::<Vec<_>>())),
+            Arc::new(StringArray::from(rows.iter().map(|r| r.proof_hash.as_str()).collect::<Vec<_>>())),
+        ],
+    )
+    .expect("batch");
+    let file = std::fs::File::create(&out).unwrap();
+    let props = output::parquet_receipt_properties(&seal, "G^G ankle LIP dual-regime v3.0");
+    let mut w = ArrowWriter::try_new(file, schema, Some(props)).unwrap();
+    w.write(&batch).unwrap();
+    w.close().unwrap();
+
+    let n_f = n as f64;
+    let d = rows.iter().filter(|r| r.is_support_margin_degraded).count();
+    let f = rows.iter().filter(|r| r.is_ankle_inversion_fall).count();
+    println!(
+        "  zmp_thin {d} ({:.1}%)  fall {f} ({:.1}%)",
+        100.0 * d as f64 / n_f,
+        100.0 * f as f64 / n_f
+    );
+    println!("  seal {seal}");
+    println!("  parquet {out}");
+    println!("  {:?}", t0.elapsed());
 }

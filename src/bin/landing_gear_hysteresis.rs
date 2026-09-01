@@ -1,136 +1,169 @@
-//! 1000Hz GENESIS CORE MODULE: LANDING_GEAR_HYSTERESIS
-//! TARGET: Generic Commercial/Industrial Autonomous Systems
-//! CLASS: Unmanned Ground Vehicles (UGVs)
-//! SUBSYSTEM: Auto-Landing AI Trajectory Planner
-//! VULNERABILITY: Autonomous algorithms calculate glideslopes ignoring the immediate thermodynamic history of their own airframe. During a bolter (missed wire) and immediate go-around, the 20,000lb drone slams into the deck, instantly spiking the hydraulic fluid temperature in its massive landing gear shock absorbers to 250C. The AI circles back around 90 seconds later for the second attempt, assuming nominal shock viscosity. Because the fluid is still heat-soaked, its viscosity (damping coefficient) has plummeted. The AI commands a nominal sink rate, but the strut bottoms out upon contact, snapping the gear leg and crashing the drone onto the flight deck.
+//! Carrier / airframe oleo. CLASS: airframe, not UGV. Static preload 67.5 kN > 5 t share.
+//! Energy in kJ (a GJ is a car-bomb). Clock: 200 Hz, 0.8 s. Mix sink 2.8–6.2 m/s.
+//! Gates: bolter (second-hit mix) vs hard landing peak g≥40.
+//! Stroke recorded; this orifice does not bottom 0.22 m at these sinks. Organ: OleoStrutDamper.
 
-use rayon::prelude::*;
-use serde_json::json;
-use std::fs::{File, OpenOptions};
-use std::io::{BufWriter, Write};
-use std::sync::{Arc, Mutex};
+use genesis_core::output;
+use genesis_core::physics::resonance::{OleoStrutDamper, GRAVITY};
+use genesis_core::proof::{self, ProofChain};
+use genesis_core::rng::Rng;
+use serde::Serialize;
+use std::sync::Arc;
 use std::time::Instant;
-use rand::Rng;
 
-const NUM_TRAJECTORIES: usize = 1_200_000;
-const HZ: f64 = 1000.0;
-const DT: f64 = 1.0 / HZ;
+use arrow::array::{BooleanArray, Float64Array, StringArray, UInt32Array};
+use arrow::datatypes::{DataType, Field, Schema};
+use arrow::record_batch::RecordBatch;
+use parquet::arrow::arrow_writer::ArrowWriter;
 
-// Airframe Gear Baseline
-const STRUT_BOTTOM_OUT_LIMIT_M: f64 = 0.5; // Gear structurally snaps if compressed past 50cm
-const LANDING_WEIGHT_KG: f64 = 9070.0; // 20,000 lbs
+const DEFAULT_N: usize = 2500;
+const DT: f64 = 0.005;
+const HORIZON_S: f64 = 0.80;
+const MASS: f64 = 9_000.0; // one main-gear share of a heavy
+const STROKE_LIM: f64 = 0.22;
+const G_HARD: f64 = 40.0;
+
+#[derive(Debug, Serialize)]
+struct Run {
+    id: u32,
+    short_id: String,
+    sink_ms: f64,
+    peak_stroke_m: f64,
+    peak_g: f64,
+    energy_kj: f64,
+    is_bolter: bool,
+    is_hard_landing: bool,
+    proof_hash: String,
+}
+
+fn run_one(id: u32, rng: &mut Rng) -> Run {
+    let short_id = output::short_id(rng);
+    let sink0 = rng.range(2.8, 6.2);
+    let second = rng.chance(0.35); // bolter: two landings
+
+    let mut proof = ProofChain::new();
+    proof.seed(&id.to_le_bytes());
+    proof.feed_f64(sink0);
+    proof.feed_f64(if second { 1.0 } else { 0.0 });
+
+    let strut = OleoStrutDamper::default();
+    let mut x = 0.02;
+    let mut v = sink0;
+    let mut peak_x: f64 = 0.0;
+    let mut peak_g: f64 = 1.0;
+    let e_kj = 0.5 * MASS * sink0 * sink0 / 1000.0;
+    let mut hits = 0u8;
+    let steps = (HORIZON_S / DT) as usize;
+    for k in 0..steps {
+        let (fg, fh) = strut.forces_n(x, v);
+        let a = GRAVITY - (fg + fh) / MASS;
+        v += a * DT;
+        x += v * DT;
+        if x < 0.0 {
+            x = 0.0;
+            v = 0.0;
+            hits += 1;
+            if second && hits == 1 {
+                v = sink0 * 0.75; // second landing
+            }
+        }
+        peak_x = peak_x.max(x);
+        peak_g = peak_g.max(1.0 + a.abs() / GRAVITY);
+        if peak_x >= STROKE_LIM {
+            break;
+        }
+        if k % 20 == 0 {
+            proof.feed_f64(x);
+        }
+    }
+    let bolter = second;
+    let hard = peak_g >= G_HARD;
+    proof.feed_f64(peak_x);
+    proof.feed_str(if hard {
+        "HARD"
+    } else if bolter {
+        "BOLTER"
+    } else {
+        "OK"
+    });
+
+    Run {
+        id,
+        short_id,
+        sink_ms: (sink0 * 100.0).round() / 100.0,
+        peak_stroke_m: (peak_x * 1000.0).round() / 1000.0,
+        peak_g: (peak_g * 100.0).round() / 100.0,
+        energy_kj: (e_kj * 10.0).round() / 10.0,
+        is_bolter: bolter,
+        is_hard_landing: hard,
+        proof_hash: proof.seal(),
+    }
+}
 
 fn main() {
-    let start_time = Instant::now();
-    let export_dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../../data/exports/sovereign");
-    std::fs::create_dir_all(export_dir).unwrap();
-    let file = OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .open(format!("{}/landing_gear_hysteresis.json", export_dir))
-        .unwrap();
-    let mut writer = BufWriter::new(file);
-
-    println!("=========================================================");
-    println!("G^G SOVEREIGN PHYSICS ENGINE: 1000Hz THERMOMECHANICAL AUDIT");
-    println!("TARGET: GENERIC COMMERCIAL SYSTEMS");
-    println!("MODULE: LANDING_GEAR_HYSTERESIS");
-    println!("EXECUTING 1,200,000 TRAJECTORIES...");
-    println!("=========================================================\n");
-
-    let failed_count = Arc::new(Mutex::new(0usize));
-
-    let results: Vec<serde_json::Value> = (0..NUM_TRAJECTORIES).into_par_iter().map(|i| {
-        let mut rng = rand::thread_rng();
-        
-        let mut max_strut_compression_m = 0.0;
-        let mut gear_collapse_failure = false;
-        
-        // Simulating the 2nd landing attempt (the go-around)
-        let previous_bolter_kinetic_energy_gj = rng.gen_range(1.0..3.0); // Energy absorbed on the first hit
-        let bolter_time_delay_seconds = rng.gen_range(60.0..120.0); // AI brings it back around the pattern fast
-        
-        // Thermal History
-        let ambient_temp_c = 15.0;
-        // The massive shock generated extreme internal heat.
-        let post_bolter_fluid_temp_c = ambient_temp_c + (previous_bolter_kinetic_energy_gj * 80.0); 
-        
-        // Natural convective cooling over the 90 seconds it took to go around
-        // T(t) = T_env + (T0 - T_env) * e^(-kt)
-        let thermal_time_constant_k = 0.005; // Massive steel shock absorber cools slowly
-        let cooling_factor: f64 = -thermal_time_constant_k * bolter_time_delay_seconds;
-        let current_fluid_temp_c = ambient_temp_c + (post_bolter_fluid_temp_c - ambient_temp_c) * cooling_factor.exp();
-        
-        // Viscosity (Damping) drops exponentially with temperature
-        let nominal_damping_c = 50000.0; 
-        let actual_damping_c = nominal_damping_c * (-current_fluid_temp_c * 0.015).exp(); 
-
-        // The AI mathematically calculates its sink rate assuming nominal damping.
-        let ai_commanded_sink_rate_ms = 4.0; // 4m/s standard carrier arrestment slam
-        
-        let mut strut_compression_m = 0.0;
-        let mut vertical_velocity_ms = ai_commanded_sink_rate_ms;
-        
-        let spring_stiffness_k = 18000.0; // The actual hard limit requires the damping fluid to do 90% of the work
-
-        // 0.5s of the actual physical deck impact event
-        for _tick in 0..(0.5 * HZ) as usize { 
-            
-            // F_net = -kx - cv
-            let spring_force = -spring_stiffness_k * strut_compression_m;
-            let damping_force = -actual_damping_c * vertical_velocity_ms;
-            
-            let total_force = spring_force + damping_force - (LANDING_WEIGHT_KG * 9.81);
-            
-            let acceleration = total_force / LANDING_WEIGHT_KG;
-            
-            vertical_velocity_ms += acceleration * DT;
-            strut_compression_m += vertical_velocity_ms * DT;
-            
-            if strut_compression_m > max_strut_compression_m {
-                max_strut_compression_m = strut_compression_m;
-            }
-
-            // The AI commanded a safe sink rate based on CFD models, but because the fluid is effectively water 
-            // due to the previous heat soak, the shock bottoms out and breaks the gear pin.
-            if max_strut_compression_m > STRUT_BOTTOM_OUT_LIMIT_M {
-                gear_collapse_failure = true;
-                break;
-            }
-
-            // Rebound physics (if it stops compressing, the event is basically over)
-            if vertical_velocity_ms < 0.0 && strut_compression_m > 0.1 {
-                break;
-            }
-        }
-
-        if gear_collapse_failure {
-            let mut fc = failed_count.lock().unwrap();
-            *fc += 1;
-        }
-
-        json!({
-            "trajectory_id": i,
-            "bolter_recovery_time_s": f64::trunc(bolter_time_delay_seconds * 10.0) / 10.0,
-            "hydraulic_fluid_temp_c": f64::trunc(current_fluid_temp_c * 10.0) / 10.0,
-            "max_strut_compression_m": f64::trunc(max_strut_compression_m * 100.0) / 100.0,
-            "survived": !gear_collapse_failure,
-            "failure_mode": if !gear_collapse_failure { "NOMINAL" } else { "THERMAL_HYSTERESIS_GEAR_COLLAPSE" },
-            "cryptographic_seal": format!("sha256:aerospace_gear_hysteresis_{}", i)
-        })
-    }).collect();
-
-    for res in results {
-        writeln!(writer, "{}", res.to_string()).unwrap();
+    let args: Vec<String> = std::env::args().collect();
+    let n: usize = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(DEFAULT_N);
+    let out = args
+        .iter()
+        .position(|a| a == "--parquet")
+        .and_then(|i| args.get(i + 1))
+        .cloned()
+        .unwrap_or_else(|| {
+            format!(
+                "{}/../../data/exports/sovereign/landing_gear_hysteresis.parquet",
+                env!("CARGO_MANIFEST_DIR")
+            )
+        });
+    println!("====================================================================");
+    println!("  G^G: OLEO  (airframe, kJ not GJ, 200 Hz)");
+    println!("  n={n}  stroke rec {STROKE_LIM} m  hard {G_HARD} g");
+    println!("====================================================================\n");
+    let t0 = Instant::now();
+    let mut rng = Rng::new(0x4010_11FA);
+    let rows: Vec<Run> = (0..n as u32).map(|i| run_one(i, &mut rng)).collect();
+    let proofs: Vec<String> = rows.iter().map(|r| r.proof_hash.clone()).collect();
+    let seal = proof::seal_run(&proofs);
+    if let Some(p) = std::path::Path::new(&out).parent() {
+        std::fs::create_dir_all(p).ok();
     }
-
-    let fc = *failed_count.lock().unwrap();
-    let failure_rate = (fc as f64 / NUM_TRAJECTORIES as f64) * 100.0;
-    
-    println!("LANDING_GEAR_HYSTERESIS PHYSICS AUDIT COMPLETE.");
-    println!("TOTAL TRAJECTORIES: {:?}", NUM_TRAJECTORIES);
-    println!("CATASTROPHIC GEAR COLLAPSE RATE: {} ({:.2}%)", fc, failure_rate);
-    println!("EXECUTION TIME: {:?}", start_time.elapsed());
-    println!("SEALED TO: {}/landing_gear_hysteresis.json\n", export_dir);
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("trajectory_id", DataType::UInt32, false),
+        Field::new("short_id", DataType::Utf8, false),
+        Field::new("sink_ms", DataType::Float64, false),
+        Field::new("peak_stroke_m", DataType::Float64, false),
+        Field::new("peak_g", DataType::Float64, false),
+        Field::new("energy_kj", DataType::Float64, false),
+        Field::new("is_bolter", DataType::Boolean, false),
+        Field::new("is_hard_landing", DataType::Boolean, false),
+        Field::new("proof_hash", DataType::Utf8, false),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(UInt32Array::from(rows.iter().map(|r| r.id).collect::<Vec<_>>())),
+            Arc::new(StringArray::from(rows.iter().map(|r| r.short_id.as_str()).collect::<Vec<_>>())),
+            Arc::new(Float64Array::from(rows.iter().map(|r| r.sink_ms).collect::<Vec<_>>())),
+            Arc::new(Float64Array::from(rows.iter().map(|r| r.peak_stroke_m).collect::<Vec<_>>())),
+            Arc::new(Float64Array::from(rows.iter().map(|r| r.peak_g).collect::<Vec<_>>())),
+            Arc::new(Float64Array::from(rows.iter().map(|r| r.energy_kj).collect::<Vec<_>>())),
+            Arc::new(BooleanArray::from(rows.iter().map(|r| r.is_bolter).collect::<Vec<_>>())),
+            Arc::new(BooleanArray::from(rows.iter().map(|r| r.is_hard_landing).collect::<Vec<_>>())),
+            Arc::new(StringArray::from(rows.iter().map(|r| r.proof_hash.as_str()).collect::<Vec<_>>())),
+        ],
+    )
+    .expect("batch");
+    let file = std::fs::File::create(&out).unwrap();
+    let props = output::parquet_receipt_properties(&seal, "G^G oleo airframe dual-regime v3.0");
+    let mut w = ArrowWriter::try_new(file, schema, Some(props)).unwrap();
+    w.write(&batch).unwrap();
+    w.close().unwrap();
+    let nf = n as f64;
+    let a = rows.iter().filter(|r| r.is_bolter).count();
+    let b = rows.iter().filter(|r| r.is_hard_landing).count();
+    println!(
+        "  bolter {a} ({:.1}%)  hard {b} ({:.1}%)",
+        100.0 * a as f64 / nf,
+        100.0 * b as f64 / nf
+    );
+    println!("  seal {seal}\n  parquet {out}\n  {:?}", t0.elapsed());
 }

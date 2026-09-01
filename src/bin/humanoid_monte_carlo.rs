@@ -1,16 +1,23 @@
-// G^G Humanoid Monte Carlo — THE TERRAN TRUTH
-// Bipedal stability, slip, and substrate yielding.
+//! G^G Humanoid Monte Carlo — THE TERRAN TRUTH
+//! Bipedal stability, slip, and substrate yielding.
+//! Organ: terran (SoilProfile, RobotContact).
+//! Sovereign Receipt n=2500 Dual-Regime Parquet.
 
-use std::time::Instant;
-use genesis_core::physics::terran::{
-    Locomotion, RobotContact, SoilProfile, SoilType,
-};
-use genesis_core::rng::Rng;
+use arrow::array::{BooleanArray, Float64Array, StringArray, UInt32Array};
+use arrow::datatypes::{DataType, Field, Schema};
+use arrow::record_batch::RecordBatch;
+use genesis_core::output;
+use genesis_core::physics::terran::{Locomotion, RobotContact, SoilProfile, SoilType};
 use genesis_core::proof::{self, ProofChain};
-use genesis_core::output::{self, Dataset, DatasetMetadata, TrajectoryRecord};
+use genesis_core::rng::Rng;
+use parquet::arrow::arrow_writer::ArrowWriter;
+use serde::Serialize;
+use std::sync::Arc;
+use std::time::Instant;
 
-// ─── FAILURE MODES ──────────────────────────────────────────────
-#[derive(Debug, Clone, Copy)]
+const DEFAULT_N: usize = 2500;
+
+#[derive(Debug, Clone, Copy, PartialEq)]
 enum FailureMode {
     FootSlip,
     BalanceLoss,
@@ -18,67 +25,27 @@ enum FailureMode {
     ActuatorFault,
 }
 
-// ─── MISSION PHASES ─────────────────────────────────────────────
-#[derive(Debug, Clone, Copy, PartialEq)]
-enum Phase {
-    Standing,
-    Walking,
-    Running,
-    Recovery,
-    Complete,
-    Failed,
-}
-
-impl Phase {
-    fn as_str(&self) -> &'static str {
-        match self {
-            Phase::Standing => "STANDING",
-            Phase::Walking => "WALKING",
-            Phase::Running => "RUNNING",
-            Phase::Recovery => "RECOVERY",
-            Phase::Complete => "COMPLETE",
-            Phase::Failed => "FAILED",
-        }
-    }
-}
-
-// ─── TRAJECTORY RESULT ──────────────────────────────────────────
-#[derive(Debug)]
-#[allow(dead_code)]
-struct TrajectoryResult {
-    id: u32,
+#[derive(Debug, Serialize)]
+struct Run {
+    trajectory_id: u32,
     short_id: String,
-    persona: &'static str,
-    robot_mass: f64,
-    footprint: f64,
-    locomotion: Locomotion,
-    soil_type: SoilType,
-    moisture: f64,
-    glomalin: f64,
-    surface_pressure: f64,
-    yield_stress: f64,
+    soil_type: String,
+    robot_mass_kg: f64,
+    surface_pressure_pa: f64,
+    yield_stress_pa: f64,
     max_compaction: f64,
-    mission_success: bool,
-    outcome: &'static str,
-    phase: Phase,
-    steps: usize,
+    is_foot_slip: bool,
+    is_balance_loss: bool,
     proof_hash: String,
-    failure: Option<FailureMode>,
-    telemetry: Vec<serde_json::Value>,
 }
 
-fn run_single_trajectory(
-    id: u32,
-    rng: &mut Rng,
-    record_telemetry: bool,
-) -> TrajectoryResult {
+fn run_one(id: u32, rng: &mut Rng) -> Run {
     let short_id = output::short_id(rng);
 
-    // Randomize soil
     let soil_type = match rng.index(4) {
-        0 => SoilType::Sand, // High slip risk
+        0 => SoilType::Sand,
         1 => SoilType::Loam,
-        2 => SoilType::Clay, // Sticky when wet
+        2 => SoilType::Clay,
         _ => SoilType::Andisol,
     };
     let moisture = rng.range(0.05, 0.40);
@@ -91,10 +58,9 @@ fn run_single_trajectory(
         depth_layers: 10,
     };
 
-    let persona = "Humanoid";
     let locomotion = Locomotion::Legged;
-    let robot_mass = rng.range(60.0, 150.0); // Bipedal mass
-    let footprint = rng.range(0.02, 0.05);   // Two feet or one foot depending on stance, avg contact area
+    let robot_mass = rng.range(60.0, 150.0);
+    let footprint = rng.range(0.02, 0.05);
 
     let robot = RobotContact {
         mass_kg: robot_mass,
@@ -102,229 +68,177 @@ fn run_single_trajectory(
         locomotion,
     };
 
-    // Inject failure based on soil type and random chance
-    let mut failure_chance = 0.05;
-    if matches!(soil.soil_type, SoilType::Sand) { failure_chance += 0.08; } // Sand slips
-    if matches!(soil.soil_type, SoilType::Clay) && moisture > 0.3 { failure_chance += 0.10; } // Wet clay slips
-    
-    let failure = if rng.chance(failure_chance) { Some(FailureMode::FootSlip) }
-    else if rng.chance(0.05) { Some(FailureMode::BalanceLoss) }
-    else if rng.chance(0.02) { Some(FailureMode::SoilYield) }
-    else if rng.chance(0.01) { Some(FailureMode::ActuatorFault) }
-    else { None };
+    let mut failure_chance = 0.10;
+    if matches!(soil.soil_type, SoilType::Sand) {
+        failure_chance += 0.15;
+    }
+    if matches!(soil.soil_type, SoilType::Clay) && moisture > 0.3 {
+        failure_chance += 0.15;
+    }
 
-    let surface_pressure = robot.surface_pressure() * 2.0; // Dynamic multiplier for walking impact
+    let failure = if rng.chance(failure_chance) {
+        Some(FailureMode::FootSlip)
+    } else if rng.chance(0.12) {
+        Some(FailureMode::BalanceLoss)
+    } else if rng.chance(0.08) {
+        Some(FailureMode::SoilYield)
+    } else if rng.chance(0.03) {
+        Some(FailureMode::ActuatorFault)
+    } else {
+        None
+    };
+
+    let surface_pressure = robot.surface_pressure() * 2.0;
     let yield_stress = soil.effective_yield_stress();
 
     let dt = 0.01;
-    let max_steps = 5_000;
-    let mut phase = Phase::Standing;
+    let max_steps = 2000;
     let mut step = 0_usize;
-    let mut contact_steps = 0_u32;
     let mut max_compaction = 0.0_f64;
+    let mut foot_slip_occurred = false;
+    let mut balance_loss_occurred = false;
 
     let mut proof = ProofChain::new();
     proof.seed(&id.to_le_bytes());
     proof.feed_f64(robot_mass);
     proof.feed_str(soil_type.as_str());
 
-    let mut telemetry = Vec::new();
-
-    // Telemetry specific
-    let mut zmp_error = 0.0;
-    let mut slip_ratio = 0.0;
-    let mut stability_margin = 1.0;
-
     while step < max_steps {
-        let t = step as f64 * dt;
+        let (compact_inc, _) = soil.evaluate_contact(&robot);
+        soil.compaction = (soil.compaction + compact_inc * dt).min(1.0);
+        max_compaction = max_compaction.max(compact_inc);
 
-        match phase {
-            Phase::Standing => {
-                stability_margin = 0.95;
-                if t > 2.0 { phase = Phase::Walking; }
-            }
-            Phase::Walking => {
-                contact_steps += 1;
-                let (compact_inc, _) = soil.evaluate_contact(&robot);
-                soil.compaction = (soil.compaction + compact_inc * dt).min(1.0);
-                max_compaction = max_compaction.max(compact_inc);
+        let zmp_error = rng.range(-0.02, 0.02);
+        let slip_ratio = if matches!(soil.soil_type, SoilType::Sand) {
+            rng.range(0.05, 0.20)
+        } else {
+            rng.range(0.0, 0.08)
+        };
 
-                zmp_error = rng.range(-0.02, 0.02);
-                slip_ratio = if matches!(soil.soil_type, SoilType::Sand) { rng.range(0.05, 0.15) } else { rng.range(0.0, 0.05) };
-                
-                stability_margin = 1.0 - (slip_ratio * 2.0) - zmp_error.abs() * 10.0;
-
-                // Failure trigger logic
-                if matches!(failure, Some(FailureMode::FootSlip)) && slip_ratio > 0.12 && rng.chance(0.02) {
-                    phase = Phase::Recovery;
-                } else if matches!(failure, Some(FailureMode::BalanceLoss)) && zmp_error.abs() > 0.018 && rng.chance(0.05) {
-                    phase = Phase::Recovery;
-                } else if surface_pressure > yield_stress && matches!(failure, Some(FailureMode::SoilYield)) {
-                    phase = Phase::Recovery;
-                }
-
-                if contact_steps > 1500 && rng.chance(0.001) {
-                    phase = Phase::Running;
-                } else if contact_steps > 3000 {
-                    phase = Phase::Complete;
-                }
-            }
-            Phase::Running => {
-                contact_steps += 1;
-                zmp_error = rng.range(-0.05, 0.05);
-                slip_ratio = rng.range(0.1, 0.25);
-                stability_margin = 1.0 - (slip_ratio * 1.5) - zmp_error.abs() * 8.0;
-
-                if matches!(failure, Some(FailureMode::FootSlip)) && slip_ratio > 0.2 && rng.chance(0.05) {
-                    phase = Phase::Recovery;
-                } else if contact_steps > 4000 {
-                    phase = Phase::Walking;
-                }
-            }
-            Phase::Recovery => {
-                // Attempt to regain balance
-                stability_margin += 0.05;
-                if stability_margin < 0.2 || rng.chance(0.05) {
-                    phase = Phase::Failed; // Fall down
-                } else if stability_margin > 0.8 {
-                    phase = Phase::Standing;
-                }
-            }
-            Phase::Complete | Phase::Failed => break,
+        if matches!(failure, Some(FailureMode::FootSlip)) && slip_ratio > 0.10 {
+            foot_slip_occurred = true;
         }
 
-        if step % 50 == 0 {
-            proof.feed_f64(stability_margin);
-            if record_telemetry {
-                telemetry.push(serde_json::json!({
-                    "t": t,
-                    "phase": phase.as_str(),
-                    "zmp_error_m": (zmp_error * 1000.0).round() / 1000.0,
-                    "slip_ratio": (slip_ratio * 100.0).round() / 100.0,
-                    "stability_margin": (stability_margin * 100.0).round() / 100.0,
-                    "compaction": (soil.compaction * 1000.0).round() / 1000.0,
-                }));
-            }
+        if matches!(failure, Some(FailureMode::BalanceLoss)) && zmp_error.abs() > 0.015 {
+            balance_loss_occurred = true;
         }
+
+        if surface_pressure > yield_stress && matches!(failure, Some(FailureMode::SoilYield)) {
+            balance_loss_occurred = true;
+        }
+
+        if step % 100 == 0 {
+            proof.feed_f64(soil.compaction);
+            proof.feed_f64(slip_ratio);
+        }
+
         step += 1;
     }
 
-    let mission_success = phase == Phase::Complete;
-    let outcome = if phase == Phase::Failed {
-        match failure {
-            Some(FailureMode::FootSlip) => "FALL_SLIP",
-            Some(FailureMode::BalanceLoss) => "FALL_BALANCE",
-            Some(FailureMode::SoilYield) => "FALL_SOIL_YIELD",
-            Some(FailureMode::ActuatorFault) => "ACTUATOR_FAULT",
-            None => "UNKNOWN_FALL",
-        }
+    if matches!(failure, Some(FailureMode::FootSlip)) {
+        foot_slip_occurred = true;
+    }
+    if matches!(failure, Some(FailureMode::BalanceLoss)) || matches!(failure, Some(FailureMode::SoilYield)) {
+        balance_loss_occurred = true;
+    }
+
+    proof.feed_str(if balance_loss_occurred {
+        "BALANCE_LOSS"
+    } else if foot_slip_occurred {
+        "FOOT_SLIP"
     } else {
-        "LOCOMOTION_NOMINAL"
-    };
+        "NOMINAL"
+    });
 
-    proof.feed_str(outcome);
-    let proof_hash = proof.seal();
-
-    TrajectoryResult {
-        id, short_id, persona, robot_mass, footprint, locomotion, soil_type,
-        moisture: soil.moisture, glomalin, surface_pressure, yield_stress,
-        max_compaction, mission_success, outcome, phase, steps: step,
-        proof_hash, failure, telemetry,
+    Run {
+        trajectory_id: id,
+        short_id,
+        soil_type: soil_type.as_str().to_string(),
+        robot_mass_kg: (robot_mass * 100.0).round() / 100.0,
+        surface_pressure_pa: (surface_pressure * 10.0).round() / 10.0,
+        yield_stress_pa: (yield_stress * 10.0).round() / 10.0,
+        max_compaction: (max_compaction * 1000.0).round() / 1000.0,
+        is_foot_slip: foot_slip_occurred,
+        is_balance_loss: balance_loss_occurred,
+        proof_hash: proof.seal(),
     }
 }
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
-    let n_trajectories: u32 = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(10_000);
-    let json_output = args.iter().any(|a| a == "--json");
-    let out_dir = args.iter().position(|a| a == "--out-dir").and_then(|i| args.get(i + 1)).cloned();
+    let n: usize = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(DEFAULT_N);
+    let out = args
+        .iter()
+        .position(|a| a == "--parquet")
+        .and_then(|i| args.get(i + 1))
+        .cloned()
+        .unwrap_or_else(|| {
+            format!(
+                "{}/../../data/exports/sovereign/humanoid_monte_carlo.parquet",
+                env!("CARGO_MANIFEST_DIR")
+            )
+        });
 
-    if !json_output {
-        println!("====================================================================");
-        println!("  G^G HUMANOID MONTE CARLO — BIPEDAL DYNAMICS");
-        println!("====================================================================");
+    println!("====================================================================");
+    println!("  G^G: HUMANOID MONTE CARLO (terran SoilProfile + RobotContact)");
+    println!("  n={n}  out={out}");
+    println!("====================================================================\n");
+
+    let t0 = Instant::now();
+    let mut rng = Rng::new(0xb19e_d00d_baad_f00d);
+    let rows: Vec<Run> = (0..n as u32).map(|i| run_one(i, &mut rng)).collect();
+    let proofs: Vec<String> = rows.iter().map(|r| r.proof_hash.clone()).collect();
+    let seal = proof::seal_run(&proofs);
+
+    if let Some(p) = std::path::Path::new(&out).parent() {
+        std::fs::create_dir_all(p).ok();
     }
 
-    let mut rng = Rng::new(0xB19E_D00D_BAAD_F00D);
-    let start = Instant::now();
-    let record_telemetry = json_output || out_dir.is_some();
-    let mut results = Vec::with_capacity(n_trajectories as usize);
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("trajectory_id", DataType::UInt32, false),
+        Field::new("short_id", DataType::Utf8, false),
+        Field::new("soil_type", DataType::Utf8, false),
+        Field::new("robot_mass_kg", DataType::Float64, false),
+        Field::new("surface_pressure_pa", DataType::Float64, false),
+        Field::new("yield_stress_pa", DataType::Float64, false),
+        Field::new("max_compaction", DataType::Float64, false),
+        Field::new("is_foot_slip", DataType::Boolean, false),
+        Field::new("is_balance_loss", DataType::Boolean, false),
+        Field::new("proof_hash", DataType::Utf8, false),
+    ]));
 
-    for i in 0..n_trajectories {
-        results.push(run_single_trajectory(i, &mut rng, record_telemetry));
-    }
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(UInt32Array::from(rows.iter().map(|r| r.trajectory_id).collect::<Vec<_>>())),
+            Arc::new(StringArray::from(rows.iter().map(|r| r.short_id.as_str()).collect::<Vec<_>>())),
+            Arc::new(StringArray::from(rows.iter().map(|r| r.soil_type.as_str()).collect::<Vec<_>>())),
+            Arc::new(Float64Array::from(rows.iter().map(|r| r.robot_mass_kg).collect::<Vec<_>>())),
+            Arc::new(Float64Array::from(rows.iter().map(|r| r.surface_pressure_pa).collect::<Vec<_>>())),
+            Arc::new(Float64Array::from(rows.iter().map(|r| r.yield_stress_pa).collect::<Vec<_>>())),
+            Arc::new(Float64Array::from(rows.iter().map(|r| r.max_compaction).collect::<Vec<_>>())),
+            Arc::new(BooleanArray::from(rows.iter().map(|r| r.is_foot_slip).collect::<Vec<_>>())),
+            Arc::new(BooleanArray::from(rows.iter().map(|r| r.is_balance_loss).collect::<Vec<_>>())),
+            Arc::new(StringArray::from(rows.iter().map(|r| r.proof_hash.as_str()).collect::<Vec<_>>())),
+        ],
+    )
+    .expect("batch");
 
-    let elapsed = start.elapsed();
+    let file = std::fs::File::create(&out).unwrap();
+    let props = output::parquet_receipt_properties(&seal, "G^G humanoid terran monte carlo dual-regime v3.0");
+    let mut w = ArrowWriter::try_new(file, schema, Some(props)).unwrap();
+    w.write(&batch).unwrap();
+    w.close().unwrap();
 
-    if !json_output {
-        let total = results.len();
-        let success = results.iter().filter(|r| r.mission_success).count();
-        let falls = total - success;
-        println!("  Elapsed: {:.3}s | {} Trajectories", elapsed.as_secs_f64(), total);
-        println!("  | NOMINAL:       {:>6} ({:>5.1}%)  |", success, success as f64 / total as f64 * 100.0);
-        println!("  | FALLS:         {:>6} ({:>5.1}%)  |", falls, falls as f64 / total as f64 * 100.0);
-    }
-
-    if let Some(base_dir) = out_dir {
-        let date_str = &output::now_iso()[0..10]; // YYYY-MM-DD
-        let mut grouped: std::collections::HashMap<String, Vec<&TrajectoryResult>> = std::collections::HashMap::new();
-
-        for r in &results {
-            grouped.entry(r.soil_type.as_str().to_string()).or_default().push(r);
-        }
-
-        let mut hash_list = Vec::new();
-
-        for (soil_str, cond_results) in grouped {
-            let dir_path = format!("{}/{}/{}", base_dir, date_str, soil_str);
-            std::fs::create_dir_all(&dir_path).expect("Failed to create deeply nested data folders");
-
-            let trajectory_records: Vec<_> = cond_results.iter().map(|r| {
-                TrajectoryRecord {
-                    id: format!("humanoid_{}_{}", r.short_id, soil_str),
-                    traj_type: "bipedal_locomotion".to_string(),
-                    scenario: format!("{}_humanoid", soil_str),
-                    steps: r.steps,
-                    score: serde_json::json!({
-                        "success": r.mission_success,
-                        "max_compaction": (r.max_compaction * 1000.0).round() / 1000.0,
-                    }),
-                    proof_hash: r.proof_hash.clone(),
-                    reasoning_context: serde_json::json!({
-                        "anomaly": !r.mission_success,
-                        "outcome": r.outcome,
-                        "mass_kg": r.robot_mass,
-                        "soil": soil_str,
-                    }),
-                    data: r.telemetry.clone(),
-                }
-            }).collect();
-
-            let proof_hashes: Vec<String> = cond_results.iter().map(|r| r.proof_hash.clone()).collect();
-            let run_proof = proof::seal_run(&proof_hashes);
-            hash_list.push(run_proof);
-            
-            let dataset = Dataset {
-                dataset_metadata: DatasetMetadata {
-                    generator: "G^G Humanoid Monte Carlo".to_string(),
-                    domain: "terran_bipedal".to_string(),
-                    scenario: "locomotion_stability".to_string(),
-                    trajectories: cond_results.len(),
-                    physics_engine: "genesis_core::terran".to_string(),
-                    version: "1.0.0".to_string(),
-                    generated_at: output::now_iso(),
-                },
-                trajectories: trajectory_records,
-            };
-            
-            let chunk_id = output::short_id(&mut rng);
-            let file_path = format!("{}/dataset_{}_{}.json", dir_path, soil_str, chunk_id);
-
-            output::write_dataset(&file_path, &dataset).expect("Failed to write dataset");
-        }
-        let master_proof = proof::seal_run(&hash_list);
-        if !json_output {
-            println!("  SHA-256 Run Proof: {}", master_proof);
-        }
-    }
+    let n_f = n as f64;
+    let slip = rows.iter().filter(|r| r.is_foot_slip).count();
+    let balance = rows.iter().filter(|r| r.is_balance_loss).count();
+    println!(
+        "  foot_slip {slip} ({:.1}%)  balance_loss {balance} ({:.1}%)",
+        100.0 * slip as f64 / n_f,
+        100.0 * balance as f64 / n_f
+    );
+    println!("  seal {seal}");
+    println!("  parquet {out}");
+    println!("  {:?}", t0.elapsed());
 }

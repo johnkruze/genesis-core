@@ -222,7 +222,7 @@ pub fn with_redundancy(data_packets: usize, redundancy: f64) -> usize {
     (data_packets as f64 * redundancy).ceil() as usize
 }
 
-/// The Citadel Direct-Link. Calculate SNR and generate the 432Hz internal frequency response.
+/// Direct-link handshake. SNR and coherence at 2.4 GHz ISM.
 pub fn run_atheric_handshake(intent_hash: [u8; 32], strength: f32, distance: f32) -> String {
     let mut sys = AthericSystem::new(8, strength as f64, -120.0, distance as f64);
     sys.hop_seed = intent_hash;

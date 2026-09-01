@@ -1,5 +1,5 @@
 //! Mycelial coupling. Kirchhoff on a living circuit: conductance = health / length.
-//! Dual-regime: fragmented (source-sink split) vs below percolation (health < 0.4).
+//! Exclusive four-way: fragmented · below-percolation · delivered · attenuated.
 //! The question on disk: can a sparse healthy net outperform a dense sick one.
 
 use genesis_core::output;
@@ -46,6 +46,7 @@ struct MycelialRun {
     is_fragmented: bool,
     is_below_percolation: bool,
     is_delivered: bool,
+    is_attenuated: bool,
     proof_hash: String,
 }
 
@@ -114,15 +115,22 @@ fn run_one(id: u32, rng: &mut Rng) -> MycelialRun {
     let connected = mesh.source_sink_connected();
     let fragmented = !connected;
     let below = final_health < PERCOLATION_HEALTH;
-    let delivered = connected && delivery >= DELIVERY_GATE;
+
+    // v1.1 exclusive four-way — same order as the proof string.
+    // Fragmented is terminal. Below-percolation only if the plot still connects.
+    // Delivered only if health ≥ 0.4. Remainder is attenuated (named, not silent).
+    let is_fragmented = fragmented;
+    let is_below_percolation = connected && below;
+    let is_delivered = connected && !below && delivery >= DELIVERY_GATE;
+    let is_attenuated = connected && !below && delivery < DELIVERY_GATE;
 
     proof.feed_f64(delivery);
     proof.feed_f64(final_health);
-    proof.feed_str(if fragmented {
+    proof.feed_str(if is_fragmented {
         "FRAGMENTED"
-    } else if below {
+    } else if is_below_percolation {
         "BELOW_PERCOLATION"
-    } else if delivered {
+    } else if is_delivered {
         "DELIVERED"
     } else {
         "ATTENUATED"
@@ -143,9 +151,10 @@ fn run_one(id: u32, rng: &mut Rng) -> MycelialRun {
         final_health,
         delivery_ratio: delivery,
         components_after: components,
-        is_fragmented: fragmented,
-        is_below_percolation: below,
-        is_delivered: delivered,
+        is_fragmented,
+        is_below_percolation,
+        is_delivered,
+        is_attenuated,
         proof_hash: proof.seal(),
     }
 }
@@ -229,6 +238,7 @@ fn main() {
         Field::new("is_fragmented", DataType::Boolean, false),
         Field::new("is_below_percolation", DataType::Boolean, false),
         Field::new("is_delivered", DataType::Boolean, false),
+        Field::new("is_attenuated", DataType::Boolean, false),
         Field::new("proof_hash", DataType::Utf8, false),
     ]));
     let batch = RecordBatch::try_new(
@@ -250,6 +260,7 @@ fn main() {
             Arc::new(rows.iter().map(|r| Some(r.is_fragmented)).collect::<BooleanArray>()),
             Arc::new(rows.iter().map(|r| Some(r.is_below_percolation)).collect::<BooleanArray>()),
             Arc::new(rows.iter().map(|r| Some(r.is_delivered)).collect::<BooleanArray>()),
+            Arc::new(rows.iter().map(|r| Some(r.is_attenuated)).collect::<BooleanArray>()),
             Arc::new(rows.iter().map(|r| Some(r.proof_hash.clone())).collect::<StringArray>()),
         ],
     )
@@ -261,7 +272,7 @@ fn main() {
             parquet::file::metadata::KeyValue::new("cryptographic_seal".to_string(), run_proof.clone()),
             parquet::file::metadata::KeyValue::new(
                 "generator".to_string(),
-                "G^G mycelial coupling dual-regime v1.0".to_string(),
+                "G^G mycelial coupling dual-regime v1.1".to_string(),
             ),
             parquet::file::metadata::KeyValue::new(
                 "health_delivery_r".to_string(),
@@ -281,10 +292,8 @@ fn main() {
     let frag = rows.iter().filter(|r| r.is_fragmented).count();
     let below = rows.iter().filter(|r| r.is_below_percolation).count();
     let del = rows.iter().filter(|r| r.is_delivered).count();
-    let both = rows
-        .iter()
-        .filter(|r| r.is_fragmented && r.is_below_percolation)
-        .count();
+    let att = rows.iter().filter(|r| r.is_attenuated).count();
+    let four = frag + below + del + att;
 
     let sh: Vec<&MycelialRun> = rows
         .iter()
@@ -303,11 +312,11 @@ fn main() {
     };
 
     println!(
-        "  fragmented {frag} ({:.1}%)  below_percolation {below} ({:.1}%)  both {both} ({:.1}%)  delivered {del} ({:.1}%)",
+        "  exclusive: fragmented {frag} ({:.1}%)  below_percolation {below} ({:.1}%)  delivered {del} ({:.1}%)  attenuated {att} ({:.1}%)  sum {four}",
         100.0 * frag as f64 / n_f,
         100.0 * below as f64 / n_f,
-        100.0 * both as f64 / n_f,
-        100.0 * del as f64 / n_f
+        100.0 * del as f64 / n_f,
+        100.0 * att as f64 / n_f
     );
     println!(
         "  sparse-healthy n={} del={:.3}   dense-sick n={} del={:.3}",

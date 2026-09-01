@@ -1,154 +1,161 @@
-//! 1000Hz GENESIS CORE MODULE: WING_FLUTTER_DIVERGENCE
-//! TARGET: Generic Commercial/Industrial Autonomous Systems
-//! CLASS: Generic Autonomous Platform
-//! SUBSYSTEM: Autonomous Flight Controller (FCS)
-//! VULNERABILITY: Under high dynamic pressure (Mach 0.85 at sea level), composite wings experience severe aeroelastic flutter. The rigidity of the wingman's wing structure matches a specific harmonic frequency. The rigid AI flight controller misinterprets the violent wing twisting as atmospheric turbulence. It furiously attempts to damp the roll axis using the ailerons. The AI's PID processing delay and actuator slew rate unwittingly align its control pulses EXACTLY 180-degrees out of phase with the wing's restorative forces. Instead of damping the flutter, the AI injects massive kinetic energy into the harmonic, physically ripping the composite wing from the fuselage within 4.5 seconds.
+//! Wing SDOF at q = ½ρV². Aero forcing is sin(ωt), not sin(ω).
+//! Delay-line aileron (not a PID sign error). Clock: 200 Hz, 3 s.
+//! Gates: |y|≥20 mm divergent vs |k y|≥80 kN spar shear.
+//! Organ: aero::DelayAeroservoelastic, dynamic_pressure_pa.
 
-use rayon::prelude::*;
-use serde_json::json;
-use std::fs::{File, OpenOptions};
-use std::io::{BufWriter, Write};
-use std::sync::{Arc, Mutex};
+use genesis_core::output;
+use genesis_core::physics::aero::{dynamic_pressure_pa, tas_from_mach, DelayAeroservoelastic, RHO_SL};
+use genesis_core::proof::{self, ProofChain};
+use genesis_core::rng::Rng;
+use serde::Serialize;
+use std::sync::Arc;
 use std::time::Instant;
-use rand::Rng;
 
-const NUM_TRAJECTORIES: usize = 1_200_000;
-const HZ: f64 = 1000.0;
-const DT: f64 = 1.0 / HZ;
+use arrow::array::{BooleanArray, Float64Array, StringArray, UInt32Array};
+use arrow::datatypes::{DataType, Field, Schema};
+use arrow::record_batch::RecordBatch;
+use parquet::arrow::arrow_writer::ArrowWriter;
 
-// Transonic Wingman Baseline
-const CRITICAL_WING_SHEAR_FORCE_N: f64 = 150_000.0; // The composite wing root spars shear at exactly 150 kN of vertical force
+const DEFAULT_N: usize = 2500;
+const DT: f64 = 0.005;
+const HORIZON_S: f64 = 3.0;
+const Y_DIV_M: f64 = 0.020;
+const SHEAR_N: f64 = 80_000.0;
+const K_SPAR: f64 = 2.0e6;
 
-fn main() {
-    let start_time = Instant::now();
-    let export_dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../../data/exports/sovereign");
-    std::fs::create_dir_all(export_dir).unwrap();
-    let file = OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .open(format!("{}/wing_flutter_divergence.json", export_dir))
-        .unwrap();
-    let mut writer = BufWriter::new(file);
+#[derive(Debug, Serialize)]
+struct Run {
+    id: u32,
+    short_id: String,
+    airspeed_mach: f64,
+    max_deflection_m: f64,
+    max_shear_force_n: f64,
+    is_divergent: bool,
+    is_wing_detached: bool,
+    proof_hash: String,
+}
 
-    println!("=========================================================");
-    println!("G^G SOVEREIGN PHYSICS ENGINE: 1000Hz AEROELASTIC AUDIT");
-    println!("TARGET: GENERIC COMMERCIAL SYSTEMS");
-    println!("MODULE: WING_FLUTTER_DIVERGENCE");
-    println!("EXECUTING 1,200,000 TRAJECTORIES...");
-    println!("=========================================================\n");
+fn run_one(id: u32, rng: &mut Rng) -> Run {
+    let short_id = output::short_id(rng);
+    let mach = rng.range(0.50, 1.20);
+    let f_hz = rng.range(11.0, 18.0);
+    let latency_s = rng.range(0.010, 0.045);
 
-    let failed_count = Arc::new(Mutex::new(0usize));
+    let mut proof = ProofChain::new();
+    proof.seed(&id.to_le_bytes());
+    proof.feed_f64(mach);
+    proof.feed_f64(f_hz);
+    proof.feed_f64(latency_s);
 
-    let results: Vec<serde_json::Value> = (0..NUM_TRAJECTORIES).into_par_iter().map(|i| {
-        let mut rng = rand::thread_rng();
-        
-        let mut wing_detached = false;
-        let mut max_wing_shear_n = 0.0;
-        
-        // Flight condition: High dynamic pressure sprint
-        let velocity_ms: f64 = 290.0; // ~Mach 0.85 at sea level
-        let air_density = 1.225;
-        let dynamic_pressure = 0.5 * air_density * velocity_ms.powi(2); // ~51.5 kPa, massive aero forces
-        
-        // Wing Structural Model (Torsional and Bending modes)
-        // Flutter is a dynamic instability where aerodynamic forces feed energy into structural vibration.
-        // The natural bending frequency of the composite wingman wing under load:
-        let flutter_frequency_hz = rng.gen_range(12.0..18.0); 
-        let flutter_omega = flutter_frequency_hz * 2.0 * std::f64::consts::PI;
-        
-        let structural_stiffness_k = 2_000_000.0; // N/m (Vertical bending)
-        let structural_damping_c = 15_000.0; // Composite materials have low internal damping
-        
-        // Starting flutter perturbation (a small gust kicks it off)
-        let mut wing_tip_displacement_m = rng.gen_range(0.01..0.05);
-        let mut wing_tip_velocity_ms = 0.0;
-        
-        let wing_mass_kg = 300.0; 
-        
-        // AI Flight Controller state
-        let mut roll_error_integral = 0.0;
-        let mut last_roll_error = 0.0;
-        
-        let k_p = 50.0; // Aggressive roll rate damping
-        let k_d = 10.0;
+    let q = dynamic_pressure_pa(RHO_SL, tas_from_mach(mach));
+    let q_ref = dynamic_pressure_pa(RHO_SL, tas_from_mach(0.85));
+    let amp = 15.0 * (q / q_ref);
+    let gain = -30.0 * (q / q_ref) * (latency_s / 0.022);
 
-        for tick in 0..(10.0 * HZ) as usize { // 10 seconds to survive
-            
-            // 1. Natural Structural Aerodynamics
-            // Air flowing over the twisting wing tries to push it back, but also feeds energy if phase aligns
-            // Simplified flutter forcing function proportional to displacement & velocity
-            let aero_stiffness_force = (dynamic_pressure * 0.1) * wing_tip_displacement_m;
-            let aero_damping_force = (dynamic_pressure * 0.01) * wing_tip_velocity_ms;
-            
-            let natural_restoring_force = -structural_stiffness_k * wing_tip_displacement_m;
-            let natural_damping_force = -structural_damping_c * wing_tip_velocity_ms;
-
-            // 2. AI Flight Controller Intervention
-            // The AI's IMU picks up the rapid rolling motion caused by the wing fluttering up and down.
-            // It sees this as an uncommanded roll rate and commands the ailerons to fire.
-            let simulated_roll_rate_rad_s = wing_tip_velocity_ms / 5.0; // 5m wing span
-            let target_roll_rate = 0.0;
-            
-            let roll_error = target_roll_rate - simulated_roll_rate_rad_s;
-            roll_error_integral += roll_error * DT;
-            let roll_derivative = (roll_error - last_roll_error) / DT;
-            last_roll_error = roll_error;
-            
-            // The AI fires the active ailerons to fight the "turbulence"
-            // FATAL FLAW: Actuator & Computation Lag
-            // It takes ~40 milliseconds for the AI to process and the sluggish servo to fully deflection the aileron.
-            // At 15 Hz flutter (period = 66ms), a 40ms lag means the AI is pushing UP perfectly as the wing is snapping UP.
-            // It operates in negative damping (positive feedback) mode.
-            
-            // To simulate the 40ms phase lag driving divergence, the aileron force actually aligns with velocity
-            // We mathematically represent the negatively-damped phase shifted aileron energy injection:
-            let lagging_aileron_force = wing_tip_velocity_ms * (k_p * 2000.0) * (dynamic_pressure / 50000.0);
-            
-            let total_force = natural_restoring_force + aero_stiffness_force + natural_damping_force + aero_damping_force + lagging_aileron_force;
-
-            let acceleration = total_force / wing_mass_kg;
-            wing_tip_velocity_ms += acceleration * DT;
-            wing_tip_displacement_m += wing_tip_velocity_ms * DT;
-
-            // The sheer force on the wing root is primarily the structural restoring force trying to hold the wing onto the plane
-            let root_shear_force_n = (natural_restoring_force + aero_stiffness_force).abs();
-            
-            if root_shear_force_n > max_wing_shear_n {
-                max_wing_shear_n = root_shear_force_n;
-            }
-
-            if root_shear_force_n > CRITICAL_WING_SHEAR_FORCE_N {
-                wing_detached = true;
-                break;
-            }
+    let mut wing = DelayAeroservoelastic::new(f_hz, 0.04, latency_s, DT);
+    let mut peak_y: f64 = 0.0;
+    let mut peak_shear: f64 = 0.0;
+    let steps = (HORIZON_S / DT) as usize;
+    for k in 0..steps {
+        let t = k as f64 * DT;
+        let y = wing.step(amp * (wing.omega_rad_s * t).sin(), gain, DT);
+        peak_y = peak_y.max(y.abs());
+        peak_shear = peak_shear.max((K_SPAR * y).abs());
+        if peak_shear >= SHEAR_N {
+            break;
         }
-
-        if wing_detached {
-            let mut fc = failed_count.lock().unwrap();
-            *fc += 1;
-        }
-
-        json!({
-            "trajectory_id": i,
-            "flutter_hz": f64::trunc(flutter_frequency_hz * 10.0) / 10.0,
-            "max_root_shear_n": f64::trunc(max_wing_shear_n * 1.0) / 1.0,
-            "survived": !wing_detached,
-            "failure_mode": if !wing_detached { "NOMINAL" } else { "AI_INDUCED_AEROELASTIC_DIVERGENCE" },
-            "cryptographic_seal": format!("sha256:wingman_flutter_{}", i)
-        })
-    }).collect();
-
-    for res in results {
-        writeln!(writer, "{}", res.to_string()).unwrap();
     }
 
-    let fc = *failed_count.lock().unwrap();
-    let failure_rate = (fc as f64 / NUM_TRAJECTORIES as f64) * 100.0;
-    
-    println!("WING_FLUTTER_DIVERGENCE PHYSICS AUDIT COMPLETE.");
-    println!("TOTAL TRAJECTORIES: {:?}", NUM_TRAJECTORIES);
-    println!("CATASTROPHIC WING SHEAR RATE: {} ({:.2}%)", fc, failure_rate);
-    println!("EXECUTION TIME: {:?}", start_time.elapsed());
-    println!("SEALED TO: {}/wing_flutter_divergence.json\n", export_dir);
+    let div = peak_y >= Y_DIV_M;
+    let det = peak_shear >= SHEAR_N;
+    proof.feed_f64(peak_y);
+    proof.feed_f64(peak_shear);
+    proof.feed_str(if det {
+        "DETACHED"
+    } else if div {
+        "DIVERGENT"
+    } else {
+        "NOMINAL"
+    });
+
+    Run {
+        id,
+        short_id,
+        airspeed_mach: (mach * 100.0).round() / 100.0,
+        max_deflection_m: (peak_y * 1e4).round() / 1e4,
+        max_shear_force_n: peak_shear.round(),
+        is_divergent: div,
+        is_wing_detached: det,
+        proof_hash: proof.seal(),
+    }
+}
+
+fn main() {
+    let args: Vec<String> = std::env::args().collect();
+    let n: usize = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(DEFAULT_N);
+    let out = args
+        .iter()
+        .position(|a| a == "--parquet")
+        .and_then(|i| args.get(i + 1))
+        .cloned()
+        .unwrap_or_else(|| {
+            format!(
+                "{}/../../data/exports/sovereign/wing_flutter_divergence.parquet",
+                env!("CARGO_MANIFEST_DIR")
+            )
+        });
+
+    println!("====================================================================");
+    println!("  G^G: SPAR SDOF  (sin(ωt), delay-line aileron, 200 Hz)");
+    println!("  n={n}  div {Y_DIV_M} m  shear {SHEAR_N} N");
+    println!("====================================================================\n");
+
+    let t0 = Instant::now();
+    let mut rng = Rng::new(0xD1FE_0077);
+    let rows: Vec<Run> = (0..n as u32).map(|i| run_one(i, &mut rng)).collect();
+    let proofs: Vec<String> = rows.iter().map(|r| r.proof_hash.clone()).collect();
+    let seal = proof::seal_run(&proofs);
+    if let Some(p) = std::path::Path::new(&out).parent() {
+        std::fs::create_dir_all(p).ok();
+    }
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("trajectory_id", DataType::UInt32, false),
+        Field::new("short_id", DataType::Utf8, false),
+        Field::new("airspeed_mach", DataType::Float64, false),
+        Field::new("max_deflection_m", DataType::Float64, false),
+        Field::new("max_shear_force_n", DataType::Float64, false),
+        Field::new("is_divergent", DataType::Boolean, false),
+        Field::new("is_wing_detached", DataType::Boolean, false),
+        Field::new("proof_hash", DataType::Utf8, false),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(UInt32Array::from(rows.iter().map(|r| r.id).collect::<Vec<_>>())),
+            Arc::new(StringArray::from(rows.iter().map(|r| r.short_id.as_str()).collect::<Vec<_>>())),
+            Arc::new(Float64Array::from(rows.iter().map(|r| r.airspeed_mach).collect::<Vec<_>>())),
+            Arc::new(Float64Array::from(rows.iter().map(|r| r.max_deflection_m).collect::<Vec<_>>())),
+            Arc::new(Float64Array::from(rows.iter().map(|r| r.max_shear_force_n).collect::<Vec<_>>())),
+            Arc::new(BooleanArray::from(rows.iter().map(|r| r.is_divergent).collect::<Vec<_>>())),
+            Arc::new(BooleanArray::from(rows.iter().map(|r| r.is_wing_detached).collect::<Vec<_>>())),
+            Arc::new(StringArray::from(rows.iter().map(|r| r.proof_hash.as_str()).collect::<Vec<_>>())),
+        ],
+    )
+    .expect("batch");
+    let file = std::fs::File::create(&out).unwrap();
+    let props = output::parquet_receipt_properties(&seal, "G^G spar SDOF dual-regime v3.0");
+    let mut w = ArrowWriter::try_new(file, schema, Some(props)).unwrap();
+    w.write(&batch).unwrap();
+    w.close().unwrap();
+    let n_f = n as f64;
+    let d = rows.iter().filter(|r| r.is_divergent).count();
+    let det = rows.iter().filter(|r| r.is_wing_detached).count();
+    println!(
+        "  divergent {d} ({:.1}%)  detached {det} ({:.1}%)",
+        100.0 * d as f64 / n_f,
+        100.0 * det as f64 / n_f
+    );
+    println!("  seal {seal}");
+    println!("  parquet {out}");
+    println!("  {:?}", t0.elapsed());
 }

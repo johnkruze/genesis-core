@@ -1,117 +1,167 @@
-//! 1000Hz GENESIS CORE MODULE: THERMAL_SENSOR_STARVATION
-//! TARGET: Generic Commercial/Industrial Autonomous Systems
-//! CLASS: Bipedal Humanoid
-//! SUBSYSTEM: LLM Reasoning / Vision Processing
-//! VULNERABILITY: Intense edge-compute requirements for LLM-driven inference draw massive current, pushing the CPU/GPU matrix to thermal throttling limits (105C). When the system throttles down the clock speeds to avoid melting, frame-rate drops from 30Hz to <5Hz. The generative locomotion loop starves for state data, causing catastrophic desync and falling.
+//! CMOS die thermal SNR. Dark current doubles every 7 °C — that is the cliff.
+//! Johnson–Nyquist is ~0.7 dB at 70 °C and is not the product.
+//! Clock: 1 Hz, 180 s soak. Gates: SNR ≤ 15 dB degraded vs SNR ≤ 8 dB starved.
+//! Throttle at 80 °C cuts power (helps dark current) and shortens integration (−3 dB).
 
-use rayon::prelude::*;
-use serde_json::json;
-use std::fs::{File, OpenOptions};
-use std::io::{BufWriter, Write};
-use std::sync::{Arc, Mutex};
+use genesis_core::output;
+use genesis_core::physics::thermal::{cmos_dark_current_snr_db, LumpedThermalNode};
+use genesis_core::proof::{self, ProofChain};
+use genesis_core::rng::Rng;
+use serde::Serialize;
+use std::sync::Arc;
 use std::time::Instant;
-use rand::Rng;
 
-const NUM_TRAJECTORIES: usize = 1_200_000;
-const HZ: f64 = 1000.0;
-const DT: f64 = 1.0 / HZ;
+use arrow::array::{BooleanArray, Float64Array, StringArray, UInt32Array};
+use arrow::datatypes::{DataType, Field, Schema};
+use arrow::record_batch::RecordBatch;
+use parquet::arrow::arrow_writer::ArrowWriter;
 
-// High-Density Compute Node Baseline
-const CRITICAL_CPU_TEMP_C: f64 = 105.0; // Silicon thermal limit before hard throttle
-const NOMINAL_FRAME_TIME_MS: f64 = 33.3; // 30 FPS expected by the locomotion loop
-const CRITICAL_FRAME_TIME_MS: f64 = 150.0; // If frame time exceeds 150ms during dynamic walking, the robot trips over its own feet
+const DEFAULT_N: usize = 2500;
+const DT: f64 = 1.0;
+const HORIZON_S: f64 = 180.0;
+const SNR0: f64 = 38.0;
+const T_REF_C: f64 = 20.0;
+const T_DOUBLE_C: f64 = 7.0;
+const SNR_DEGRADE: f64 = 15.0;
+const SNR_STARVE: f64 = 8.0;
+const T_THROTTLE_C: f64 = 80.0;
 
-fn main() {
-    let start_time = Instant::now();
-    let export_dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../../data/exports/sovereign");
-    std::fs::create_dir_all(export_dir).unwrap();
-    let file = OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .open(format!("{}/thermal_sensor_starvation.json", export_dir))
-        .unwrap();
-    let mut writer = BufWriter::new(file);
+#[derive(Debug, Serialize)]
+struct Run {
+    id: u32,
+    short_id: String,
+    sensor_temp_c: f64,
+    final_snr_db: f64,
+    is_snr_degraded: bool,
+    is_sensor_starved: bool,
+    proof_hash: String,
+}
 
-    println!("=========================================================");
-    println!("G^G SOVEREIGN PHYSICS ENGINE: 1000Hz THERMODYNAMIC AUDIT");
-    println!("TARGET: GENERIC COMMERCIAL SYSTEMS");
-    println!("MODULE: THERMAL_SENSOR_STARVATION");
-    println!("EXECUTING 1,200,000 TRAJECTORIES...");
-    println!("=========================================================\n");
+fn run_one(id: u32, rng: &mut Rng) -> Run {
+    let short_id = output::short_id(rng);
+    let amb = rng.range(20.0, 55.0);
+    let p0 = rng.range(6.0, 22.0);
+    let r_th = rng.range(1.8, 7.0);
 
-    let failed_count = Arc::new(Mutex::new(0usize));
+    let mut proof = ProofChain::new();
+    proof.seed(&id.to_le_bytes());
+    proof.feed_f64(amb);
+    proof.feed_f64(p0);
+    proof.feed_f64(r_th);
 
-    let results: Vec<serde_json::Value> = (0..NUM_TRAJECTORIES).into_par_iter().map(|i| {
-        let mut rng = rand::thread_rng();
-        
-        // Simulating the humanoid performing a continuous 2-hour complex task (e.g. warehouse picking)
-        // High cognitive load pegs the internal AI accelerator to 100% utilization.
-        
-        let ambient_temp_c = rng.gen_range(25.0..40.0); // Hot warehouse environment
-        
-        let mut max_frame_time_experienced_ms = NOMINAL_FRAME_TIME_MS;
-        let mut cpu_temp_c = ambient_temp_c;
-        let mut locomotion_desync_collapse = false;
-        
-        let thermal_mass = 500.0; // Assume relatively light heatsink inside a sealed torso
-        let compute_heat_watts = rng.gen_range(250.0..400.0); // 100% load on an edge GPU/CPU cluster
-        
-        for _tick in 0..(3600 * 10) as usize { // Stepping at 10Hz to simulate 1 full hour
-            let dt = 0.1;
-
-            let cooling_watts = (cpu_temp_c - ambient_temp_c) * 4.0; // Passive/Active fan cooling
-            
-            let temp_delta = (compute_heat_watts - cooling_watts) / thermal_mass * dt;
-            cpu_temp_c += temp_delta;
-            
-            // The OS enforces aggressive thermal throttling as it approaches 105C
-            if cpu_temp_c > 95.0 {
-                // Throttle scales exponentially to prevent hardware melt
-                let throttle_percent = ((cpu_temp_c - 95.0) / 10.0_f64).powi(2).min(0.9); 
-                
-                // If compute drops by X%, frame processing time balloons
-                let throttled_frame_time_ms = NOMINAL_FRAME_TIME_MS / (1.0 - throttle_percent);
-                
-                if throttled_frame_time_ms > max_frame_time_experienced_ms {
-                    max_frame_time_experienced_ms = throttled_frame_time_ms;
-                }
-
-                // If frames drop below the Nyquist threshold of the walking gait (150ms delay), the robot's physical limbs 
-                // deviate from the old command before the new command arrives.
-                if max_frame_time_experienced_ms > CRITICAL_FRAME_TIME_MS {
-                    locomotion_desync_collapse = true;
-                    break;
-                }
-            }
+    let mut node = LumpedThermalNode::new(amb, 15.0, r_th);
+    let mut throttled = false;
+    let mut snr = SNR0;
+    let mut peak = amb;
+    let mut t = 0.0;
+    while t < HORIZON_S {
+        let p = if throttled { p0 * 0.40 } else { p0 };
+        let die = node.step(p, amb, DT);
+        if die > peak {
+            peak = die;
         }
-
-        if locomotion_desync_collapse {
-            let mut fc = failed_count.lock().unwrap();
-            *fc += 1;
+        if die >= T_THROTTLE_C {
+            throttled = true;
         }
-
-        json!({
-            "trajectory_id": i,
-            "ambient_temp_C": f64::trunc(ambient_temp_c * 10.0) / 10.0,
-            "compute_heat_load_W": f64::trunc(compute_heat_watts * 10.0) / 10.0,
-            "max_frame_processing_delay_ms": f64::trunc(max_frame_time_experienced_ms * 10.0) / 10.0,
-            "survived": !locomotion_desync_collapse,
-            "failure_mode": if !locomotion_desync_collapse { "NOMINAL" } else { "LLM_THERMAL_THROTTLE_KINEMATIC_STARVATION" },
-            "cryptographic_seal": format!("sha256:humanoid_thermal_starvation_{}", i)
-        })
-    }).collect();
-
-    for res in results {
-        writeln!(writer, "{}", res.to_string()).unwrap();
+        snr = cmos_dark_current_snr_db(SNR0, die, T_REF_C, T_DOUBLE_C);
+        if throttled {
+            snr -= 3.0; // shorter integration after clock cut
+        }
+        t += DT;
+        if snr <= SNR_STARVE {
+            break;
+        }
     }
 
-    let fc = *failed_count.lock().unwrap();
-    let failure_rate = (fc as f64 / NUM_TRAJECTORIES as f64) * 100.0;
-    
-    println!("THERMAL_SENSOR_STARVATION PHYSICS AUDIT COMPLETE.");
-    println!("TOTAL TRAJECTORIES: {:?}", NUM_TRAJECTORIES);
-    println!("CATASTROPHIC LOCOMOTION DESYNC RATE: {} ({:.2}%)", fc, failure_rate);
-    println!("EXECUTION TIME: {:?}", start_time.elapsed());
-    println!("SEALED TO: {}/thermal_sensor_starvation.json\n", export_dir);
+    let degraded = snr <= SNR_DEGRADE;
+    let starved = snr <= SNR_STARVE;
+    proof.feed_f64(peak);
+    proof.feed_f64(snr);
+    proof.feed_str(if starved {
+        "STARVED"
+    } else if degraded {
+        "DEGRADED"
+    } else {
+        "NOMINAL"
+    });
+
+    Run {
+        id,
+        short_id,
+        sensor_temp_c: (peak * 10.0).round() / 10.0,
+        final_snr_db: (snr * 10.0).round() / 10.0,
+        is_snr_degraded: degraded,
+        is_sensor_starved: starved,
+        proof_hash: proof.seal(),
+    }
+}
+
+fn main() {
+    let args: Vec<String> = std::env::args().collect();
+    let n: usize = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(DEFAULT_N);
+    let out = args
+        .iter()
+        .position(|a| a == "--parquet")
+        .and_then(|i| args.get(i + 1))
+        .cloned()
+        .unwrap_or_else(|| {
+            format!(
+                "{}/../../data/exports/sovereign/thermal_sensor_starvation.parquet",
+                env!("CARGO_MANIFEST_DIR")
+            )
+        });
+
+    println!("====================================================================");
+    println!("  G^G: CMOS DARK-CURRENT SNR  (doubling {T_DOUBLE_C} °C, 1 Hz)");
+    println!("  n={n}  degrade ≤{SNR_DEGRADE} dB  starve ≤{SNR_STARVE} dB");
+    println!("====================================================================\n");
+
+    let t0 = Instant::now();
+    let mut rng = Rng::new(0x8891_0006);
+    let rows: Vec<Run> = (0..n as u32).map(|i| run_one(i, &mut rng)).collect();
+    let proofs: Vec<String> = rows.iter().map(|r| r.proof_hash.clone()).collect();
+    let seal = proof::seal_run(&proofs);
+
+    if let Some(p) = std::path::Path::new(&out).parent() {
+        std::fs::create_dir_all(p).ok();
+    }
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("trajectory_id", DataType::UInt32, false),
+        Field::new("short_id", DataType::Utf8, false),
+        Field::new("sensor_temp_c", DataType::Float64, false),
+        Field::new("final_snr_db", DataType::Float64, false),
+        Field::new("is_snr_degraded", DataType::Boolean, false),
+        Field::new("is_sensor_starved", DataType::Boolean, false),
+        Field::new("proof_hash", DataType::Utf8, false),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(UInt32Array::from(rows.iter().map(|r| r.id).collect::<Vec<_>>())),
+            Arc::new(StringArray::from(rows.iter().map(|r| r.short_id.as_str()).collect::<Vec<_>>())),
+            Arc::new(Float64Array::from(rows.iter().map(|r| r.sensor_temp_c).collect::<Vec<_>>())),
+            Arc::new(Float64Array::from(rows.iter().map(|r| r.final_snr_db).collect::<Vec<_>>())),
+            Arc::new(BooleanArray::from(rows.iter().map(|r| r.is_snr_degraded).collect::<Vec<_>>())),
+            Arc::new(BooleanArray::from(rows.iter().map(|r| r.is_sensor_starved).collect::<Vec<_>>())),
+            Arc::new(StringArray::from(rows.iter().map(|r| r.proof_hash.as_str()).collect::<Vec<_>>())),
+        ],
+    )
+    .expect("batch");
+    let file = std::fs::File::create(&out).unwrap();
+    let props = output::parquet_receipt_properties(&seal, "G^G CMOS dark-current SNR dual-regime v3.0");
+    let mut w = ArrowWriter::try_new(file, schema, Some(props)).unwrap();
+    w.write(&batch).unwrap();
+    w.close().unwrap();
+
+    let n_f = n as f64;
+    let d = rows.iter().filter(|r| r.is_snr_degraded).count();
+    let s = rows.iter().filter(|r| r.is_sensor_starved).count();
+    println!(
+        "  degraded {d} ({:.1}%)  starved {s} ({:.1}%)",
+        100.0 * d as f64 / n_f,
+        100.0 * s as f64 / n_f
+    );
+    println!("  seal {seal}");
+    println!("  parquet {out}");
+    println!("  {:?}", t0.elapsed());
 }

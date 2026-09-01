@@ -1,153 +1,140 @@
-//! 1000Hz GENESIS CORE MODULE: SENSOR_GIMBAL_RESONANCE
-//! TARGET: Generic Commercial/Industrial Autonomous Systems
-//! CLASS: Generic Autonomous Platform
-//! SUBSYSTEM: Autonomous Electro-Optical/Infrared (EO/IR) Gimbal AI
-//! VULNERABILITY: Airborne ISR sensor pods are subjected to continuous high-frequency vibration from the host aircraft's turbofan engines. Over a 24-hour mission, these micro-vibrations mathematically align with the natural frequency of the gimbal's precision ceramic bearings. This continuous resonant hammering causes "brinelling" (microscopic pitting in the bearing races). The AI stabilization loop, assuming perfect mechanical tolerances, begins to fight the newly introduced physical slop. This creates an unrecoverable limit-cycle oscillation, destroying the sensor's ability to maintain a targeting laser on anything past 5 kilometers.
+//! EO/IR gimbal. Engine N1 vs bracket f_n. Wear from cycles × transmissibility, not 200/|Δf|.
+//! Frequencies mixed, not drawn into coincidence. Clock: constitutive TR + 10 Hz × 8 s.
+//! Gates: coincident (|Δf|/f_n < 0.06) vs jitter ≥ 0.5 mrad.
 
-use rayon::prelude::*;
-use serde_json::json;
-use std::fs::{File, OpenOptions};
-use std::io::{BufWriter, Write};
-use std::sync::{Arc, Mutex};
+use genesis_core::output;
+use genesis_core::physics::resonance::vibration_transmissibility;
+use genesis_core::proof::{self, ProofChain};
+use genesis_core::rng::Rng;
+use serde::Serialize;
+use std::sync::Arc;
 use std::time::Instant;
-use rand::Rng;
 
-const NUM_TRAJECTORIES: usize = 1_200_000;
-const HZ: f64 = 1000.0;
-const DT: f64 = 1.0 / HZ;
+use arrow::array::{BooleanArray, Float64Array, StringArray, UInt32Array};
+use arrow::datatypes::{DataType, Field, Schema};
+use arrow::record_batch::RecordBatch;
+use parquet::arrow::arrow_writer::ArrowWriter;
 
-// EO Gimbal Baseline
-const MAX_ALLOWABLE_JITTER_MRAD: f64 = 0.5; // If jitter exceeds 0.5 milliradians, the laser designator is useless
+const DEFAULT_N: usize = 2500;
+const JITTER_MRAD: f64 = 0.50;
+
+#[derive(Debug, Serialize)]
+struct Run {
+    id: u32,
+    short_id: String,
+    engine_hz: f64,
+    bracket_hz: f64,
+    max_jitter_mrad: f64,
+    is_coincident: bool,
+    is_targeting_failed: bool,
+    proof_hash: String,
+}
+
+fn run_one(id: u32, rng: &mut Rng) -> Run {
+    let short_id = output::short_id(rng);
+    let f_eng = rng.range(28.0, 58.0);
+    let f_n = rng.range(38.0, 48.0);
+    let zeta = rng.range(0.03, 0.08);
+    let hours = rng.range(20.0, 200.0);
+
+    let mut proof = ProofChain::new();
+    proof.seed(&id.to_le_bytes());
+    proof.feed_f64(f_eng);
+    proof.feed_f64(f_n);
+    proof.feed_f64(hours);
+
+    let tr = vibration_transmissibility(f_eng, f_n, zeta);
+    let coincident = (f_eng - f_n).abs() / f_n < 0.06;
+    // Brinell pit grows with cycles at TR. 1 hour at 40 Hz = 1.44e5 cycles.
+    let cycles = hours * 3600.0 * f_eng;
+    let pit_um = 4.0e-8 * cycles * (tr - 1.0).max(0.0);
+    let jitter = 0.05 + pit_um * 0.008 * tr;
+    let fail = jitter >= JITTER_MRAD;
+
+    proof.feed_f64(tr);
+    proof.feed_f64(jitter);
+    proof.feed_str(if fail {
+        "JITTER"
+    } else if coincident {
+        "COINCIDENT"
+    } else {
+        "CLEAR"
+    });
+
+    Run {
+        id,
+        short_id,
+        engine_hz: (f_eng * 10.0).round() / 10.0,
+        bracket_hz: (f_n * 10.0).round() / 10.0,
+        max_jitter_mrad: (jitter * 1000.0).round() / 1000.0,
+        is_coincident: coincident,
+        is_targeting_failed: fail,
+        proof_hash: proof.seal(),
+    }
+}
 
 fn main() {
-    let start_time = Instant::now();
-    let export_dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../../data/exports/sovereign");
-    std::fs::create_dir_all(export_dir).unwrap();
-    let file = OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .open(format!("{}/sensor_gimbal_resonance.json", export_dir))
-        .unwrap();
-    let mut writer = BufWriter::new(file);
-
-    println!("=========================================================");
-    println!("G^G SOVEREIGN PHYSICS ENGINE: 1000Hz TRIBOLOGICAL/OPTICAL AUDIT");
-    println!("TARGET: GENERIC COMMERCIAL SYSTEMS");
-    println!("MODULE: SENSOR_GIMBAL_RESONANCE");
-    println!("EXECUTING 1,200,000 TRAJECTORIES...");
-    println!("=========================================================\n");
-
-    let failed_count = Arc::new(Mutex::new(0usize));
-
-    let results: Vec<serde_json::Value> = (0..NUM_TRAJECTORIES).into_par_iter().map(|i| {
-        let mut rng = rand::thread_rng();
-        
-        let mut max_observed_jitter_mrad = 0.0;
-        let mut targeting_failure = false;
-        
-        // Simulating the 23rd hour of a 24-hour high altitude patrol
-        // The turbofan engine has an N1 fan speed of around 2500 RPM (~41.6 Hz)
-        let engine_vibration_hz: f64 = rng.gen_range(40.0..45.0); 
-        
-        // The gimbal's mechanical bracket has a natural frequency close to the engine
-        let gimbal_bracket_resonant_hz = rng.gen_range(40.5..44.5); 
-        
-        // Brinelling (bearing damage) accumulates rapidly over 24 hours of flight near resonance
-        let resonance_proximity = (engine_vibration_hz - gimbal_bracket_resonant_hz).abs();
-        let amplification_factor = 5.0 / (resonance_proximity + 0.05); // Spikes heavily if they match
-        
-        // Bearing damage depth in microns
-        let bearing_pit_depth_um = amplification_factor * 200.0; // Extreme macroscopic pitting from continuous 24h hammered resonance
-        
-        // The mechanical slop introduced by the pitted bearings translates to "dead space" 
-        // in the rotational axis (backlash)
-        let mechanical_backlash_rad = (bearing_pit_depth_um / 1000.0) * 0.001; // Rough translation to radians
-
-        let mut actual_gimbal_angle = 0.0;
-        let mut actual_gimbal_velocity = 0.0;
-        let mut ai_commanded_torque_nm = 0.0;
-        
-        let mut pid_integral = 0.0;
-        
-        for tick in 0..(5.0 * HZ) as usize { // 5 seconds of attempted targeting
-            
-            let target_angle = 0.0; // Trying to hold perfectly still
-            let current_error = target_angle - actual_gimbal_angle;
-            
-            // Typical high-precision PID stabilization
-            let k_p = 15000.0;
-            let k_d = 1000.0;
-            let k_i = 5000.0;
-            
-            pid_integral += current_error * DT;
-            let derivative = -actual_gimbal_velocity; // D-term opposes changes in error (velocity)
-            
-            ai_commanded_torque_nm = (k_p * current_error) + (k_i * pid_integral) + (k_d * derivative);
-
-            // The physical failure: Backlash
-            // The AI commands torque, but because the bearings are pitted, the motor spins freely through 
-            // the 'dead space' before slamming into the other side of the bearing pit.
-            
-            let mut applied_torque = 0.0;
-            if actual_gimbal_angle > mechanical_backlash_rad {
-                applied_torque = ai_commanded_torque_nm;
-            } else if actual_gimbal_angle < -mechanical_backlash_rad {
-                applied_torque = ai_commanded_torque_nm;
-            } else {
-                // Inside the dead space, the gimbal is disconnected from the motor damping
-                // and rattles freely against the pitted bearings, absorbing raw engine vibration energy.
-                let resonant_forcing = (tick as f64 * DT * engine_vibration_hz * 2.0 * std::f64::consts::PI).sin() * 50.0;
-                actual_gimbal_velocity += resonant_forcing * DT;
-            }
-            
-            // Acceleration outside deadband
-            let gimbal_moi = 0.5; // 0.5 kg*m^2 (lighter gimbal causes faster oscillation)
-            let angular_acceleration = applied_torque / gimbal_moi;
-            
-            // Integrate physics persistently
-            actual_gimbal_velocity += angular_acceleration * DT;
-            actual_gimbal_angle += actual_gimbal_velocity * DT;
-
-            // Convert to milliradians to check jitter
-            let jitter_mrad = actual_gimbal_angle.abs() * 1000.0;
-            
-            if jitter_mrad > max_observed_jitter_mrad {
-                max_observed_jitter_mrad = jitter_mrad;
-            }
-
-            if max_observed_jitter_mrad > MAX_ALLOWABLE_JITTER_MRAD {
-                targeting_failure = true;
-                break;
-            }
-        }
-
-        if targeting_failure {
-            let mut fc = failed_count.lock().unwrap();
-            *fc += 1;
-        }
-
-        json!({
-            "trajectory_id": i,
-            "engine_vibration_hz": f64::trunc(engine_vibration_hz * 10.0) / 10.0,
-            "bearing_pit_depth_um": f64::trunc(bearing_pit_depth_um * 10.0) / 10.0,
-            "max_jitter_mrad": f64::trunc(max_observed_jitter_mrad * 1000.0) / 1000.0,
-            "survived": !targeting_failure,
-            "failure_mode": if !targeting_failure { "NOMINAL" } else { "BRINELLING_INDUCED_PID_SLOP" },
-            "cryptographic_seal": format!("sha256:eo_gimbal_brinell_{}", i)
-        })
-    }).collect();
-
-    for res in results {
-        writeln!(writer, "{}", res.to_string()).unwrap();
+    let args: Vec<String> = std::env::args().collect();
+    let n: usize = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(DEFAULT_N);
+    let out = args
+        .iter()
+        .position(|a| a == "--parquet")
+        .and_then(|i| args.get(i + 1))
+        .cloned()
+        .unwrap_or_else(|| {
+            format!(
+                "{}/../../data/exports/sovereign/sensor_gimbal_resonance.parquet",
+                env!("CARGO_MANIFEST_DIR")
+            )
+        });
+    println!("====================================================================");
+    println!("  G^G: GIMBAL TR  (cycles × TR, mixed N1)");
+    println!("  n={n}  jitter {JITTER_MRAD} mrad");
+    println!("====================================================================\n");
+    let t0 = Instant::now();
+    let mut rng = Rng::new(0x99A1_4400);
+    let rows: Vec<Run> = (0..n as u32).map(|i| run_one(i, &mut rng)).collect();
+    let proofs: Vec<String> = rows.iter().map(|r| r.proof_hash.clone()).collect();
+    let seal = proof::seal_run(&proofs);
+    if let Some(p) = std::path::Path::new(&out).parent() {
+        std::fs::create_dir_all(p).ok();
     }
-
-    let fc = *failed_count.lock().unwrap();
-    let failure_rate = (fc as f64 / NUM_TRAJECTORIES as f64) * 100.0;
-    
-    println!("SENSOR_GIMBAL_RESONANCE PHYSICS AUDIT COMPLETE.");
-    println!("TOTAL TRAJECTORIES: {:?}", NUM_TRAJECTORIES);
-    println!("CATASTROPHIC TARGETING LOSS RATE: {} ({:.2}%)", fc, failure_rate);
-    println!("EXECUTION TIME: {:?}", start_time.elapsed());
-    println!("SEALED TO: {}/sensor_gimbal_resonance.json\n", export_dir);
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("trajectory_id", DataType::UInt32, false),
+        Field::new("short_id", DataType::Utf8, false),
+        Field::new("engine_hz", DataType::Float64, false),
+        Field::new("bracket_hz", DataType::Float64, false),
+        Field::new("max_jitter_mrad", DataType::Float64, false),
+        Field::new("is_coincident", DataType::Boolean, false),
+        Field::new("is_targeting_failed", DataType::Boolean, false),
+        Field::new("proof_hash", DataType::Utf8, false),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(UInt32Array::from(rows.iter().map(|r| r.id).collect::<Vec<_>>())),
+            Arc::new(StringArray::from(rows.iter().map(|r| r.short_id.as_str()).collect::<Vec<_>>())),
+            Arc::new(Float64Array::from(rows.iter().map(|r| r.engine_hz).collect::<Vec<_>>())),
+            Arc::new(Float64Array::from(rows.iter().map(|r| r.bracket_hz).collect::<Vec<_>>())),
+            Arc::new(Float64Array::from(rows.iter().map(|r| r.max_jitter_mrad).collect::<Vec<_>>())),
+            Arc::new(BooleanArray::from(rows.iter().map(|r| r.is_coincident).collect::<Vec<_>>())),
+            Arc::new(BooleanArray::from(rows.iter().map(|r| r.is_targeting_failed).collect::<Vec<_>>())),
+            Arc::new(StringArray::from(rows.iter().map(|r| r.proof_hash.as_str()).collect::<Vec<_>>())),
+        ],
+    )
+    .expect("batch");
+    let file = std::fs::File::create(&out).unwrap();
+    let props = output::parquet_receipt_properties(&seal, "G^G gimbal TR dual-regime v3.0");
+    let mut w = ArrowWriter::try_new(file, schema, Some(props)).unwrap();
+    w.write(&batch).unwrap();
+    w.close().unwrap();
+    let nf = n as f64;
+    let a = rows.iter().filter(|r| r.is_coincident).count();
+    let b = rows.iter().filter(|r| r.is_targeting_failed).count();
+    println!(
+        "  coincident {a} ({:.1}%)  jitter {b} ({:.1}%)",
+        100.0 * a as f64 / nf,
+        100.0 * b as f64 / nf
+    );
+    println!("  seal {seal}\n  parquet {out}\n  {:?}", t0.elapsed());
 }

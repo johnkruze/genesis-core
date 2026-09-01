@@ -1,104 +1,142 @@
-//! 1000Hz GENESIS CORE MODULE: THERMAL_OUTGASSING
-//! TARGET: Generic Commercial/Industrial Autonomous Systems
-//! CLASS: Generic Autonomous Platform
-//! SUBSYSTEM: Synthetic Environment Simulation
-//! VULNERABILITY: Synthetic environments cannot deterministically model brake-pad thermal outgassing during a 5-mile mountain descent.
+//! Vacuum outgassing of polymeric adhesives. Arrhenius Ea = 0.5 eV (water/organic).
+//! Lumped soak against a −20 °C radiative sink, then flux ratio vs 20 °C baseline.
+//! Clock: one exact 2 h step. Gates: 5× desorption surge vs 20× optical fogging.
 
-use rayon::prelude::*;
-use serde_json::json;
-use std::fs::{File, OpenOptions};
-use std::io::{BufWriter, Write};
-use std::sync::{Arc, Mutex};
+use genesis_core::output;
+use genesis_core::physics::thermal::{arrhenius_outgassing_rate, LumpedThermalNode};
+use genesis_core::proof::{self, ProofChain};
+use genesis_core::rng::Rng;
+use serde::Serialize;
+use std::sync::Arc;
 use std::time::Instant;
-use rand::Rng;
 
-const NUM_TRAJECTORIES: usize = 1_200_000;
-const HZ: f64 = 1000.0;
-const DT: f64 = 1.0 / HZ;
+use arrow::array::{BooleanArray, Float64Array, StringArray, UInt32Array};
+use arrow::datatypes::{DataType, Field, Schema};
+use arrow::record_batch::RecordBatch;
+use parquet::arrow::arrow_writer::ArrowWriter;
 
-// Class-8 Brake Thermal Baseline
-const TRUCK_MASS_KG: f64 = 36287.0; 
-const CRITICAL_BRAKE_TEMP_C: f64 = 450.0; // Point where resin in brakes outgasses, acting as a lubricant
-const AMBIENT_TEMP_C: f64 = 25.0;
+const DEFAULT_N: usize = 2500;
+const EA_EV: f64 = 0.5;
+const SOAK_S: f64 = 7200.0;
+const SURGE_X: f64 = 5.0;
+const FOG_X: f64 = 20.0;
+
+#[derive(Debug, Serialize)]
+struct Run {
+    id: u32,
+    short_id: String,
+    final_payload_temp_c: f64,
+    outgassing_flux_multiplier: f64,
+    is_desorption_surged: bool,
+    is_optical_fogging_failed: bool,
+    proof_hash: String,
+}
+
+fn run_one(id: u32, rng: &mut Rng) -> Run {
+    let short_id = output::short_id(rng);
+    let t0 = rng.range(10.0, 30.0);
+    let q_w = rng.range(10.0, 90.0); // eclipse through moderate sun-pointing load
+
+    let mut proof = ProofChain::new();
+    proof.seed(&id.to_le_bytes());
+    proof.feed_f64(t0);
+    proof.feed_f64(q_w);
+
+    let mut node = LumpedThermalNode::new(t0, 1200.0, 1.2);
+    let t_final = node.step(q_w, -20.0, SOAK_S);
+    let baseline = arrhenius_outgassing_rate(EA_EV, 20.0, 1.0);
+    let rate = arrhenius_outgassing_rate(EA_EV, t_final, 1.0);
+    let x = rate / baseline.max(1e-30);
+    let surged = x >= SURGE_X;
+    let fogged = x >= FOG_X;
+
+    proof.feed_f64(t_final);
+    proof.feed_f64(x);
+    proof.feed_str(if fogged {
+        "FOGGED"
+    } else if surged {
+        "SURGED"
+    } else {
+        "NOMINAL"
+    });
+
+    Run {
+        id,
+        short_id,
+        final_payload_temp_c: (t_final * 10.0).round() / 10.0,
+        outgassing_flux_multiplier: (x * 100.0).round() / 100.0,
+        is_desorption_surged: surged,
+        is_optical_fogging_failed: fogged,
+        proof_hash: proof.seal(),
+    }
+}
 
 fn main() {
-    let start_time = Instant::now();
-    let export_dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../../data/exports/sovereign");
-    std::fs::create_dir_all(export_dir).unwrap();
-    let file = OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .open(format!("{}/thermal_outgassing.json", export_dir))
-        .unwrap();
-    let mut writer = BufWriter::new(file);
+    let args: Vec<String> = std::env::args().collect();
+    let n: usize = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(DEFAULT_N);
+    let out = args
+        .iter()
+        .position(|a| a == "--parquet")
+        .and_then(|i| args.get(i + 1))
+        .cloned()
+        .unwrap_or_else(|| {
+            format!(
+                "{}/../../data/exports/sovereign/thermal_outgassing.parquet",
+                env!("CARGO_MANIFEST_DIR")
+            )
+        });
 
-    println!("=========================================================");
-    println!("G^G SOVEREIGN PHYSICS ENGINE: 1000Hz THERMODYNAMIC AUDIT");
-    println!("TARGET: GENERIC COMMERCIAL SYSTEMS");
-    println!("MODULE: THERMAL_OUTGASSING");
-    println!("EXECUTING 1,200,000 TRAJECTORIES...");
-    println!("=========================================================\n");
+    println!("====================================================================");
+    println!("  G^G: ARRHENIUS OUTGASSING  (Ea={EA_EV} eV, 2 h soak)");
+    println!("  n={n}  surge {SURGE_X}×  fog {FOG_X}×");
+    println!("====================================================================\n");
 
-    let failed_count = Arc::new(Mutex::new(0usize));
+    let t0 = Instant::now();
+    let mut rng = Rng::new(0x4421_0007);
+    let rows: Vec<Run> = (0..n as u32).map(|i| run_one(i, &mut rng)).collect();
+    let proofs: Vec<String> = rows.iter().map(|r| r.proof_hash.clone()).collect();
+    let seal = proof::seal_run(&proofs);
 
-    let results: Vec<serde_json::Value> = (0..NUM_TRAJECTORIES).into_par_iter().map(|i| {
-        let mut rng = rand::thread_rng();
-        
-        let grade_steepness_percent = rng.gen_range(5.0..8.0); // 5% to 8% downhill grade (e.g. Donner Pass)
-        let descent_duration_seconds = 60.0 * rng.gen_range(3.0..7.0); // 3 to 7 minute descent
-        
-        let mut brake_temperature_c = AMBIENT_TEMP_C;
-        let mut thermal_runaway_crash = false;
-        
-        // Simulating the 80,000lb mass going downhill. 
-        // The highway autonomy stack applies the brakes to maintain a safe 50mph.
-        for tick in 0..(descent_duration_seconds * HZ) as usize { 
-            let _time = tick as f64 * DT;
-            
-            // To hold 80,000lbs at 50mph on a 6% grade requires massive continuous kinetic energy dissipation
-            let kinetic_heat_input_per_tick = (TRUCK_MASS_KG * grade_steepness_percent * 0.001) / HZ;
-            let convective_cooling = (brake_temperature_c - AMBIENT_TEMP_C) * 0.00005; // Airflow cooling
-            
-            brake_temperature_c += kinetic_heat_input_per_tick - convective_cooling;
-
-            // In synthetic simulation, "Brake Force = Commanded Pressure". 
-            // In reality, as temps exceed 450C, pad resins vaporize (outgas), creating a gas cushion between pad and rotor.
-            // Brake friction drops to near zero despite max pressure commanded by the highway autonomy stack.
-            if brake_temperature_c > CRITICAL_BRAKE_TEMP_C {
-                // The AI is commanding 100psi brake pressure, but physical friction mu has dropped to 0.05.
-                // The truck accelerates uncontrollably down the grade.
-                thermal_runaway_crash = true;
-                break;
-            }
-        }
-
-        if thermal_runaway_crash {
-            let mut fc = failed_count.lock().unwrap();
-            *fc += 1;
-        }
-
-        json!({
-            "trajectory_id": i,
-            "descent_grade_percent": f64::trunc(grade_steepness_percent * 100.0) / 100.0,
-            "descent_duration_min": f64::trunc((descent_duration_seconds / 60.0) * 100.0) / 100.0,
-            "max_brake_temp_C": f64::trunc(brake_temperature_c * 10.0) / 10.0,
-            "survived": !thermal_runaway_crash,
-            "failure_mode": if !thermal_runaway_crash { "NOMINAL" } else { "SYNTHETIC_SIM_THERMAL_OUTGASSING_FADE" },
-            "cryptographic_seal": format!("sha256:thermal_outgassing_{}", i)
-        })
-    }).collect();
-
-    for res in results {
-        writeln!(writer, "{}", res.to_string()).unwrap();
+    if let Some(p) = std::path::Path::new(&out).parent() {
+        std::fs::create_dir_all(p).ok();
     }
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("trajectory_id", DataType::UInt32, false),
+        Field::new("short_id", DataType::Utf8, false),
+        Field::new("final_payload_temp_c", DataType::Float64, false),
+        Field::new("outgassing_flux_multiplier", DataType::Float64, false),
+        Field::new("is_desorption_surged", DataType::Boolean, false),
+        Field::new("is_optical_fogging_failed", DataType::Boolean, false),
+        Field::new("proof_hash", DataType::Utf8, false),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(UInt32Array::from(rows.iter().map(|r| r.id).collect::<Vec<_>>())),
+            Arc::new(StringArray::from(rows.iter().map(|r| r.short_id.as_str()).collect::<Vec<_>>())),
+            Arc::new(Float64Array::from(rows.iter().map(|r| r.final_payload_temp_c).collect::<Vec<_>>())),
+            Arc::new(Float64Array::from(rows.iter().map(|r| r.outgassing_flux_multiplier).collect::<Vec<_>>())),
+            Arc::new(BooleanArray::from(rows.iter().map(|r| r.is_desorption_surged).collect::<Vec<_>>())),
+            Arc::new(BooleanArray::from(rows.iter().map(|r| r.is_optical_fogging_failed).collect::<Vec<_>>())),
+            Arc::new(StringArray::from(rows.iter().map(|r| r.proof_hash.as_str()).collect::<Vec<_>>())),
+        ],
+    )
+    .expect("batch");
+    let file = std::fs::File::create(&out).unwrap();
+    let props = output::parquet_receipt_properties(&seal, "G^G Arrhenius 0.5 eV dual-regime v3.0");
+    let mut w = ArrowWriter::try_new(file, schema, Some(props)).unwrap();
+    w.write(&batch).unwrap();
+    w.close().unwrap();
 
-    let fc = *failed_count.lock().unwrap();
-    let failure_rate = (fc as f64 / NUM_TRAJECTORIES as f64) * 100.0;
-    
-    println!("THERMAL_OUTGASSING PHYSICS AUDIT COMPLETE.");
-    println!("TOTAL TRAJECTORIES: {:?}", NUM_TRAJECTORIES);
-    println!("CATASTROPHIC RUNAWAY TRUCK RATE: {} ({:.2}%)", fc, failure_rate);
-    println!("EXECUTION TIME: {:?}", start_time.elapsed());
-    println!("SEALED TO: {}/thermal_outgassing.json\n", export_dir);
+    let n_f = n as f64;
+    let s = rows.iter().filter(|r| r.is_desorption_surged).count();
+    let f = rows.iter().filter(|r| r.is_optical_fogging_failed).count();
+    println!(
+        "  surged {s} ({:.1}%)  fogged {f} ({:.1}%)",
+        100.0 * s as f64 / n_f,
+        100.0 * f as f64 / n_f
+    );
+    println!("  seal {seal}");
+    println!("  parquet {out}");
+    println!("  {:?}", t0.elapsed());
 }

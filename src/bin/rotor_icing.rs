@@ -1,117 +1,164 @@
-//! 1000Hz GENESIS CORE MODULE: ROTOR_ICING
-//! TARGET: Generic Commercial/Industrial Autonomous Systems
-//! CLASS: Autonomous Flight Systems / Drones
-//! SUBSYSTEM: Fly-By-Wire Prop-Pitch Controller
-//! VULNERABILITY: CFD training models assume rigid, perfectly smooth rotor geometries. They do not account for jagged macroscopic structural changes caused by supercooled moisture accumulating as rime ice on the leading edges. Even millimeters of asymmetric ice dramatically drop aerodynamic efficiency (L/D ratio), starving vertical lift before the thermal de-icing matrices can catch up.
+//! Rotor ice accretion ṁ = LWC · V · A · E. De-ice once at t_delay (not RNG/tick).
+//! T/W from iced_thrust_to_weight. Clock: 10 Hz (ice is slow), 40 s cloud.
+//! Gates: iced (mass≥25 g) vs T/W < 1.
 
-use rayon::prelude::*;
-use serde_json::json;
-use std::fs::{File, OpenOptions};
-use std::io::{BufWriter, Write};
-use std::sync::{Arc, Mutex};
+use genesis_core::output;
+use genesis_core::physics::aero::{ice_accretion_kg_s, iced_thrust_to_weight, G};
+use genesis_core::proof::{self, ProofChain};
+use genesis_core::rng::Rng;
+use serde::Serialize;
+use std::sync::Arc;
 use std::time::Instant;
-use rand::Rng;
 
-const NUM_TRAJECTORIES: usize = 1_200_000;
-const HZ: f64 = 1000.0;
-const DT: f64 = 1.0 / HZ;
+use arrow::array::{BooleanArray, Float64Array, StringArray, UInt32Array};
+use arrow::datatypes::{DataType, Field, Schema};
+use arrow::record_batch::RecordBatch;
+use parquet::arrow::arrow_writer::ArrowWriter;
 
-// Multirotor Power Baseline (Approximated)
-const MAX_VERTICAL_THRUST_N: f64 = 40000.0; // 12 Rotors generating ~40kN combined vertical thrust
-const VEHICLE_MASS_KG: f64 = 3175.0; // Max Gross Takeoff Weight (~7000 lbs)
-const ROTOR_LIFT_DEFICIT_FATAL_PERCENT: f64 = 25.0; // Dropping 25% lift puts the aircraft below 1.0 T/W ratio (it falls)
+const DEFAULT_N: usize = 2500;
+const DT: f64 = 0.10;
+const HORIZON_S: f64 = 40.0;
+const MASS: f64 = 18.0;
+const T0: f64 = MASS * G * 1.35; // hover margin
+const AREA: f64 = 0.08;
+const V: f64 = 35.0;
+const ICE_REF_KG: f64 = 0.09;
+const ICE_WARN_KG: f64 = 0.018;
 
-fn main() {
-    let start_time = Instant::now();
-    let export_dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../../data/exports/sovereign");
-    std::fs::create_dir_all(export_dir).unwrap();
-    let file = OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .open(format!("{}/rotor_icing.json", export_dir))
-        .unwrap();
-    let mut writer = BufWriter::new(file);
+#[derive(Debug, Serialize)]
+struct Run {
+    id: u32,
+    short_id: String,
+    lwc_g_m3: f64,
+    ice_kg: f64,
+    thrust_to_weight: f64,
+    is_iced: bool,
+    is_tw_below_one: bool,
+    proof_hash: String,
+}
 
-    println!("=========================================================");
-    println!("G^G SOVEREIGN PHYSICS ENGINE: 1000Hz AERMODYNAMIC AUDIT");
-    println!("TARGET: GENERIC COMMERCIAL SYSTEMS");
-    println!("MODULE: ROTOR_ICING");
-    println!("EXECUTING 1,200,000 TRAJECTORIES...");
-    println!("=========================================================\n");
+fn run_one(id: u32, rng: &mut Rng) -> Run {
+    let short_id = output::short_id(rng);
+    let lwc_g = rng.range(0.08, 1.40);
+    let e_coll = rng.range(0.25, 0.70);
+    let t_deice = rng.range(8.0, 36.0);
 
-    let failed_count = Arc::new(Mutex::new(0usize));
+    let mut proof = ProofChain::new();
+    proof.seed(&id.to_le_bytes());
+    proof.feed_f64(lwc_g);
+    proof.feed_f64(e_coll);
+    proof.feed_f64(t_deice);
 
-    let results: Vec<serde_json::Value> = (0..NUM_TRAJECTORIES).into_par_iter().map(|i| {
-        let mut rng = rand::thread_rng();
-        
-        // Simulating transition flight ascending through a low-level overcast cloud layer
-        // Temp is -2C to 0C (Perfect for Supercooled Large Droplet - SLD icing)
-        let total_flight_duration_cloud_s = 45.0; 
-        
-        let moisture_density_g_m3 = rng.gen_range(0.5..2.5); // High moisture content
-        
-        let mut lift_degradation_percent = 0.0;
-        let mut catastrophic_loss_of_lift = false;
-        
-        // The electrical de-icing mats heat the rotor blades, but they take time to warm up.
-        // It takes up to 20 seconds for conductive heat to shed the ice layer.
-        let deice_mat_delay_s = rng.gen_range(15.0..25.0);
-        
-        for tick in 0..(total_flight_duration_cloud_s * HZ) as usize { 
-            let time = tick as f64 * DT;
-
-            // Ice accretion rate is proportional to moisture density and airspeed.
-            // At 100 knots, it accumulates rapidly.
-            let accretion_rate_per_sec = moisture_density_g_m3 * 0.15; 
-            
-            // Heat mats turn on, but are fighting thermal mass.
-            let shedding_rate_per_sec = if time > deice_mat_delay_s {
-                rng.gen_range(1.0..3.0) // Ice slowly chunks off
-            } else {
-                0.0
-            };
-            
-            lift_degradation_percent += (accretion_rate_per_sec - shedding_rate_per_sec) * DT;
-            if lift_degradation_percent < 0.0 { lift_degradation_percent = 0.0; }
-
-            // The CFD AI predicts vertical lift = RPM * Pitch.
-            // It completely fails to account for the physical boundary layer separation causing massive drag.
-            // As lift drops by 25%, the aircraft enters an unrecoverable descent (falling out of the sky).
-            // The AI tries to increase RPM, but power curves hit max continuous limits.
-            
-            if lift_degradation_percent > ROTOR_LIFT_DEFICIT_FATAL_PERCENT {
-                catastrophic_loss_of_lift = true;
-                break;
-            }
+    let lwc = lwc_g * 1e-3;
+    let mut ice = 0.0;
+    let mut deiced = false;
+    let steps = (HORIZON_S / DT) as usize;
+    for k in 0..steps {
+        let t = k as f64 * DT;
+        ice += ice_accretion_kg_s(lwc, V, AREA, e_coll) * DT;
+        if !deiced && t >= t_deice {
+            ice *= 0.18; // one thermal cycle, not a per-tick rng
+            deiced = true;
         }
-
-        if catastrophic_loss_of_lift {
-            let mut fc = failed_count.lock().unwrap();
-            *fc += 1;
+        if k % 20 == 0 {
+            proof.feed_f64(ice);
         }
-
-        json!({
-            "trajectory_id": i,
-            "moisture_density_g_m3": f64::trunc(moisture_density_g_m3 * 100.0) / 100.0,
-            "deice_response_delay_s": f64::trunc(deice_mat_delay_s * 10.0) / 10.0,
-            "max_lift_degradation_percent": f64::trunc(lift_degradation_percent * 100.0) / 100.0,
-            "survived": !catastrophic_loss_of_lift,
-            "failure_mode": if !catastrophic_loss_of_lift { "NOMINAL" } else { "CFD_UNMODELED_ICE_ACCRETION_STALL" },
-            "cryptographic_seal": format!("sha256:archer_midnight_icing_{}", i)
-        })
-    }).collect();
-
-    for res in results {
-        writeln!(writer, "{}", res.to_string()).unwrap();
     }
 
-    let fc = *failed_count.lock().unwrap();
-    let failure_rate = (fc as f64 / NUM_TRAJECTORIES as f64) * 100.0;
-    
-    println!("ROTOR_ICING PHYSICS AUDIT COMPLETE.");
-    println!("TOTAL TRAJECTORIES: {:?}", NUM_TRAJECTORIES);
-    println!("CATASTROPHIC LIFT LOSS RATE: {} ({:.2}%)", fc, failure_rate);
-    println!("EXECUTION TIME: {:?}", start_time.elapsed());
-    println!("SEALED TO: {}/rotor_icing.json\n", export_dir);
+    let tw = iced_thrust_to_weight(T0, MASS * G, ice, ICE_REF_KG);
+    let iced = ice >= ICE_WARN_KG;
+    let tw_fail = tw < 1.0;
+    proof.feed_f64(ice);
+    proof.feed_f64(tw);
+    proof.feed_str(if tw_fail {
+        "TW_FAIL"
+    } else if iced {
+        "ICED"
+    } else {
+        "CLEAR"
+    });
+
+    Run {
+        id,
+        short_id,
+        lwc_g_m3: (lwc_g * 100.0).round() / 100.0,
+        ice_kg: (ice * 1e4).round() / 1e4,
+        thrust_to_weight: (tw * 1000.0).round() / 1000.0,
+        // Exclusive three-way aligned with proof: ICED / TW_FAIL / CLEAR.
+        is_iced: iced && !tw_fail,
+        is_tw_below_one: tw_fail,
+        proof_hash: proof.seal(),
+    }
+}
+
+fn main() {
+    let args: Vec<String> = std::env::args().collect();
+    let n: usize = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(DEFAULT_N);
+    let out = args
+        .iter()
+        .position(|a| a == "--parquet")
+        .and_then(|i| args.get(i + 1))
+        .cloned()
+        .unwrap_or_else(|| {
+            format!(
+                "{}/../../data/exports/sovereign/rotor_icing.parquet",
+                env!("CARGO_MANIFEST_DIR")
+            )
+        });
+
+    println!("====================================================================");
+    println!("  G^G: ROTOR ICE  (ṁ=LWC·V·A·E, 10 Hz)");
+    println!("  n={n}  iced ≥{ICE_WARN_KG} kg  T/W<1");
+    println!("====================================================================\n");
+
+    let t0 = Instant::now();
+    let mut rng = Rng::new(0x2070_1C1E);
+    let rows: Vec<Run> = (0..n as u32).map(|i| run_one(i, &mut rng)).collect();
+    let proofs: Vec<String> = rows.iter().map(|r| r.proof_hash.clone()).collect();
+    let seal = proof::seal_run(&proofs);
+    if let Some(p) = std::path::Path::new(&out).parent() {
+        std::fs::create_dir_all(p).ok();
+    }
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("trajectory_id", DataType::UInt32, false),
+        Field::new("short_id", DataType::Utf8, false),
+        Field::new("lwc_g_m3", DataType::Float64, false),
+        Field::new("ice_kg", DataType::Float64, false),
+        Field::new("thrust_to_weight", DataType::Float64, false),
+        Field::new("is_iced", DataType::Boolean, false),
+        Field::new("is_tw_below_one", DataType::Boolean, false),
+        Field::new("proof_hash", DataType::Utf8, false),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(UInt32Array::from(rows.iter().map(|r| r.id).collect::<Vec<_>>())),
+            Arc::new(StringArray::from(rows.iter().map(|r| r.short_id.as_str()).collect::<Vec<_>>())),
+            Arc::new(Float64Array::from(rows.iter().map(|r| r.lwc_g_m3).collect::<Vec<_>>())),
+            Arc::new(Float64Array::from(rows.iter().map(|r| r.ice_kg).collect::<Vec<_>>())),
+            Arc::new(Float64Array::from(rows.iter().map(|r| r.thrust_to_weight).collect::<Vec<_>>())),
+            Arc::new(BooleanArray::from(rows.iter().map(|r| r.is_iced).collect::<Vec<_>>())),
+            Arc::new(BooleanArray::from(rows.iter().map(|r| r.is_tw_below_one).collect::<Vec<_>>())),
+            Arc::new(StringArray::from(rows.iter().map(|r| r.proof_hash.as_str()).collect::<Vec<_>>())),
+        ],
+    )
+    .expect("batch");
+    let file = std::fs::File::create(&out).unwrap();
+    let props = output::parquet_receipt_properties(&seal, "G^G rotor ice accretion dual-regime v3.1");
+    let mut w = ArrowWriter::try_new(file, schema, Some(props)).unwrap();
+    w.write(&batch).unwrap();
+    w.close().unwrap();
+    let n_f = n as f64;
+    let iced = rows.iter().filter(|r| r.is_iced).count();
+    let tw = rows.iter().filter(|r| r.is_tw_below_one).count();
+    let clear = n - iced - tw;
+    println!(
+        "  iced-held {iced} ({:.1}%)  tw<1 {tw} ({:.1}%)  clear {clear} ({:.1}%)",
+        100.0 * iced as f64 / n_f,
+        100.0 * tw as f64 / n_f,
+        100.0 * clear as f64 / n_f
+    );
+    println!("  seal {seal}");
+    println!("  parquet {out}");
+    println!("  {:?}", t0.elapsed());
 }

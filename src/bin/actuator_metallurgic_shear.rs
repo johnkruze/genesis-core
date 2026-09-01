@@ -1,105 +1,146 @@
-//! 1000Hz GENESIS CORE MODULE: ACTUATOR_METALLURGIC_SHEAR
-//! TARGET: Generic Commercial/Industrial Autonomous Systems
-//! CLASS: Bipedal Humanoid
-//! SUBSYSTEM: High-Ratio Gearboxes & Idealized RL Porting
-//! VULNERABILITY: Idealized RL policies command instantaneous torque spikes that exceed the shear yield stress of non-hardened, mass-produced gear teeth.
+//! Planetary tooth Lewis bending + Basquin S-N. b = −0.09, σ_f' = 1200 MPa (4340-ish).
+//! Constitutive (one impact). Gates: σ ≥ 850 MPa yield vs N_f < 1e5 mission fatigue.
+//! Torque mix 10–55 N·m so a survive class exists. Organ: basquin_fatigue_life_cycles.
 
-use rayon::prelude::*;
-use serde_json::json;
-use std::fs::{File, OpenOptions};
-use std::io::{BufWriter, Write};
-use std::sync::{Arc, Mutex};
+use genesis_core::output;
+use genesis_core::physics::tribology::basquin_fatigue_life_cycles;
+use genesis_core::proof::{self, ProofChain};
+use genesis_core::rng::Rng;
+use serde::Serialize;
+use std::sync::Arc;
 use std::time::Instant;
-use rand::Rng;
 
-const NUM_TRAJECTORIES: usize = 1_200_000;
-const HZ: f64 = 1000.0;
-const DT: f64 = 1.0 / HZ;
+use arrow::array::{BooleanArray, Float64Array, StringArray, UInt32Array};
+use arrow::datatypes::{DataType, Field, Schema};
+use arrow::record_batch::RecordBatch;
+use parquet::arrow::arrow_writer::ArrowWriter;
 
-// Commercial Actuator Baseline (Mass-produced tolerances)
-const GEAR_TOOTH_SHEAR_YIELD_NM: f64 = 120.0; // The physical torque limit before the mass-produced metallurgy yields and shears.
+const DEFAULT_N: usize = 2500;
+const YIELD_MPA: f64 = 850.0;
+const SIGMA_F: f64 = 1200.0;
+const B: f64 = -0.09;
+const MISSION_CYCLES: f64 = 100_000.0;
+const R_PITCH_M: f64 = 0.018;
+const FACE_M: f64 = 0.008;
+const MODULE_M: f64 = 0.00125;
+const LEWIS_Y: f64 = 0.32;
+
+#[derive(Debug, Serialize)]
+struct Run {
+    id: u32,
+    short_id: String,
+    peak_impact_torque_nm: f64,
+    tooth_shear_stress_mpa: f64,
+    fatigue_life_cycles: f64,
+    is_yield_stress_exceeded: bool,
+    is_fatigue_life_depleted: bool,
+    proof_hash: String,
+}
+
+fn run_one(id: u32, rng: &mut Rng) -> Run {
+    let short_id = output::short_id(rng);
+    let torque = rng.range(10.0, 55.0);
+
+    let mut proof = ProofChain::new();
+    proof.seed(&id.to_le_bytes());
+    proof.feed_f64(torque);
+
+    let ft = torque / R_PITCH_M;
+    let sigma = ft / (FACE_M * MODULE_M * LEWIS_Y) * 1e-6;
+    let n_f = basquin_fatigue_life_cycles(sigma, SIGMA_F, B);
+    let yld = sigma >= YIELD_MPA;
+    let fat = n_f < MISSION_CYCLES;
+
+    proof.feed_f64(sigma);
+    proof.feed_f64(n_f.min(1e12));
+    proof.feed_str(if yld {
+        "YIELD"
+    } else if fat {
+        "FATIGUE"
+    } else {
+        "NOMINAL"
+    });
+
+    Run {
+        id,
+        short_id,
+        peak_impact_torque_nm: (torque * 10.0).round() / 10.0,
+        tooth_shear_stress_mpa: (sigma * 10.0).round() / 10.0,
+        fatigue_life_cycles: n_f.min(1e9).round(),
+        is_yield_stress_exceeded: yld,
+        is_fatigue_life_depleted: fat,
+        proof_hash: proof.seal(),
+    }
+}
 
 fn main() {
-    let start_time = Instant::now();
-    let export_dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../../data/exports/sovereign");
-    std::fs::create_dir_all(export_dir).unwrap();
-    let file = OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .open(format!("{}/actuator_metallurgic_shear.json", export_dir))
-        .unwrap();
-    let mut writer = BufWriter::new(file);
+    let args: Vec<String> = std::env::args().collect();
+    let n: usize = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(DEFAULT_N);
+    let out = args
+        .iter()
+        .position(|a| a == "--parquet")
+        .and_then(|i| args.get(i + 1))
+        .cloned()
+        .unwrap_or_else(|| {
+            format!(
+                "{}/../../data/exports/sovereign/actuator_metallurgic_shear.parquet",
+                env!("CARGO_MANIFEST_DIR")
+            )
+        });
 
-    println!("=========================================================");
-    println!("G^G SOVEREIGN PHYSICS ENGINE: 1000Hz METALLURGY AUDIT");
-    println!("TARGET: GENERIC COMMERCIAL SYSTEMS");
-    println!("MODULE: ACTUATOR_METALLURGIC_SHEAR");
-    println!("EXECUTING 1,200,000 TRAJECTORIES...");
-    println!("=========================================================\n");
+    println!("====================================================================");
+    println!("  G^G: LEWIS + BASQUIN  (b={B}, mission {MISSION_CYCLES:.0} cycles)");
+    println!("  n={n}  yield {YIELD_MPA} MPa");
+    println!("====================================================================\n");
 
-    let failed_count = Arc::new(Mutex::new(0usize));
+    let t0 = Instant::now();
+    let mut rng = Rng::new(0x7181_0001);
+    let rows: Vec<Run> = (0..n as u32).map(|i| run_one(i, &mut rng)).collect();
+    let proofs: Vec<String> = rows.iter().map(|r| r.proof_hash.clone()).collect();
+    let seal = proof::seal_run(&proofs);
 
-    let results: Vec<serde_json::Value> = (0..NUM_TRAJECTORIES).into_par_iter().map(|i| {
-        let mut rng = rand::thread_rng();
-        
-        // In idealized rigid-body trainers, gears are treated as perfectly elastic geometric primitives.
-        // They can mathematically transmit infinite instantaneous torque.
-        // Commercial platforms port these RL policies directly onto cheap, non-hardened steel/aluminum hybrid gearboxes.
-
-        let mut max_torque_demanded = 0.0;
-        let mut gear_teeth_sheared = false;
-        
-        let dynamic_payload_kg = rng.gen_range(5.0..20.0); // e.g., lifting a box, kicking an object
-        
-        for _tick in 0..(1.0 * HZ) as usize { // 1 second fast-twitch RL maneuver
-            
-            // The RL policy attempts to forcefully correct an inversion error (like catching itself from falling).
-            // It commands a massive, instantaneous step-function of torque.
-            // Idealized trainers allow this. Physical metallurgy does not.
-            let rl_torque_spike_nm = dynamic_payload_kg * rng.gen_range(5.0..12.0);
-            
-            // Further amplified by unmodeled mechanical backlash snapping into contact
-            let backlash_snap_multiplier = if rng.gen_bool(0.1) { rng.gen_range(1.1..1.3) } else { 1.0 };
-            
-            let instantaneous_torque = rl_torque_spike_nm * backlash_snap_multiplier;
-
-            if instantaneous_torque > max_torque_demanded {
-                max_torque_demanded = instantaneous_torque;
-            }
-
-            if instantaneous_torque > GEAR_TOOTH_SHEAR_YIELD_NM {
-                gear_teeth_sheared = true;
-                break;
-            }
-        }
-
-        if gear_teeth_sheared {
-            let mut fc = failed_count.lock().unwrap();
-            *fc += 1;
-        }
-
-        json!({
-            "trajectory_id": i,
-            "dynamic_payload_kg": f64::trunc(dynamic_payload_kg * 100.0) / 100.0,
-            "max_torque_spike_demanded_NM": f64::trunc(max_torque_demanded * 100.0) / 100.0,
-            "metallurgic_yield_limit_NM": GEAR_TOOTH_SHEAR_YIELD_NM,
-            "survived": !gear_teeth_sheared,
-            "failure_mode": if !gear_teeth_sheared { "NOMINAL" } else { "UNMODELED_METALLURGIC_GEAR_SHEAR" },
-            "cryptographic_seal": format!("sha256:actuator_metallurgic_shear_{}", i)
-        })
-    }).collect();
-
-    for res in results {
-        writeln!(writer, "{}", res.to_string()).unwrap();
+    if let Some(p) = std::path::Path::new(&out).parent() {
+        std::fs::create_dir_all(p).ok();
     }
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("trajectory_id", DataType::UInt32, false),
+        Field::new("short_id", DataType::Utf8, false),
+        Field::new("peak_impact_torque_nm", DataType::Float64, false),
+        Field::new("tooth_shear_stress_mpa", DataType::Float64, false),
+        Field::new("fatigue_life_cycles", DataType::Float64, false),
+        Field::new("is_yield_stress_exceeded", DataType::Boolean, false),
+        Field::new("is_fatigue_life_depleted", DataType::Boolean, false),
+        Field::new("proof_hash", DataType::Utf8, false),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(UInt32Array::from(rows.iter().map(|r| r.id).collect::<Vec<_>>())),
+            Arc::new(StringArray::from(rows.iter().map(|r| r.short_id.as_str()).collect::<Vec<_>>())),
+            Arc::new(Float64Array::from(rows.iter().map(|r| r.peak_impact_torque_nm).collect::<Vec<_>>())),
+            Arc::new(Float64Array::from(rows.iter().map(|r| r.tooth_shear_stress_mpa).collect::<Vec<_>>())),
+            Arc::new(Float64Array::from(rows.iter().map(|r| r.fatigue_life_cycles).collect::<Vec<_>>())),
+            Arc::new(BooleanArray::from(rows.iter().map(|r| r.is_yield_stress_exceeded).collect::<Vec<_>>())),
+            Arc::new(BooleanArray::from(rows.iter().map(|r| r.is_fatigue_life_depleted).collect::<Vec<_>>())),
+            Arc::new(StringArray::from(rows.iter().map(|r| r.proof_hash.as_str()).collect::<Vec<_>>())),
+        ],
+    )
+    .expect("batch");
+    let file = std::fs::File::create(&out).unwrap();
+    let props = output::parquet_receipt_properties(&seal, "G^G Lewis-Basquin dual-regime v3.0");
+    let mut w = ArrowWriter::try_new(file, schema, Some(props)).unwrap();
+    w.write(&batch).unwrap();
+    w.close().unwrap();
 
-    let fc = *failed_count.lock().unwrap();
-    let failure_rate = (fc as f64 / NUM_TRAJECTORIES as f64) * 100.0;
-    
-    println!("ACTUATOR_METALLURGIC_SHEAR PHYSICS AUDIT COMPLETE.");
-    println!("TOTAL TRAJECTORIES: {:?}", NUM_TRAJECTORIES);
-    println!("CATASTROPHIC GEAR SHEAR RATE: {} ({:.2}%)", fc, failure_rate);
-    println!("EXECUTION TIME: {:?}", start_time.elapsed());
-    println!("SEALED TO: {}/actuator_metallurgic_shear.json\n", export_dir);
+    let n_f = n as f64;
+    let y = rows.iter().filter(|r| r.is_yield_stress_exceeded).count();
+    let f = rows.iter().filter(|r| r.is_fatigue_life_depleted).count();
+    println!(
+        "  yield {y} ({:.1}%)  fatigue {f} ({:.1}%)",
+        100.0 * y as f64 / n_f,
+        100.0 * f as f64 / n_f
+    );
+    println!("  seal {seal}");
+    println!("  parquet {out}");
+    println!("  {:?}", t0.elapsed());
 }

@@ -1,127 +1,150 @@
-//! 1000Hz GENESIS CORE MODULE: VSLAM_SMOKE_OCCLUSION
-//! TARGET: Generic Commercial/Industrial Autonomous Systems
-//! CLASS: Autonomous Flight Systems / Drones
-//! SUBSYSTEM: Vision-SLAM and Object Tracking
-//! VULNERABILITY: Vision-SLAM (VSLAM) algorithms fundamentally rely on tracking high-contrast feature points (corners/edges) between frames. In dense structuring smoke, the particulate density scrambles spatial consistency. The point-tracker locks onto moving smoke tendrils instead of static walls, feeding mathematically correct but physically hallucinated velocity vectors into the EKF, causing the platform to abruptly dive into obstacles.
+//! Indoor VSLAM in smoke. Beer-Lambert on wall features; tendrils are the complement.
+//! Mix haze vs fire. Clock: 30 Hz, 4 s (camera, not 1000 Hz empty ticks).
+//! Gates: static features < 22 vs hallucinated ratio ≥ 0.62 (crash).
 
-use rayon::prelude::*;
-use serde_json::json;
-use std::fs::{File, OpenOptions};
-use std::io::{BufWriter, Write};
-use std::sync::{Arc, Mutex};
+use genesis_core::output;
+use genesis_core::physics::optics::{beer_lambert_transmittance, smoke_extinction_per_m};
+use genesis_core::proof::{self, ProofChain};
+use genesis_core::rng::Rng;
+use serde::Serialize;
+use std::sync::Arc;
 use std::time::Instant;
-use rand::Rng;
 
-const NUM_TRAJECTORIES: usize = 1_200_000;
-const HZ: f64 = 1000.0;
-const DT: f64 = 1.0 / HZ;
+use arrow::array::{BooleanArray, Float64Array, StringArray, UInt32Array};
+use arrow::datatypes::{DataType, Field, Schema};
+use arrow::record_batch::RecordBatch;
+use parquet::arrow::arrow_writer::ArrowWriter;
 
-// VSLAM Navigation Baseline
-const MIN_FEATURE_POINTS_REQUIRED: usize = 15; // The EKF needs at least 15 stable features to hold a 3D pose
-const CAMERA_FPS: f64 = 60.0;
-const FRAME_DT: f64 = 1.0 / CAMERA_FPS;
+const DEFAULT_N: usize = 2500;
+const DT: f64 = 1.0 / 30.0;
+const HORIZON_S: f64 = 4.0;
+const PATH_M: f64 = 2.2;
+const N0: f64 = 110.0;
+
+#[derive(Debug, Serialize)]
+struct Run {
+    id: u32,
+    short_id: String,
+    smoke_density_g_m3: f64,
+    min_static: f64,
+    is_occluded: bool,
+    is_tracking_lost: bool,
+    proof_hash: String,
+}
+
+fn run_one(id: u32, rng: &mut Rng) -> Run {
+    let short_id = output::short_id(rng);
+    let fire = rng.chance(0.40);
+    let rho0 = if fire {
+        rng.range(3.2, 9.0)
+    } else {
+        rng.range(0.4, 2.0)
+    };
+    let advect = rng.range(0.05, 0.35);
+
+    let mut proof = ProofChain::new();
+    proof.seed(&id.to_le_bytes());
+    proof.feed_f64(rho0);
+
+    let mut min_static = N0;
+    let mut peak_ratio: f64 = 0.0;
+    let steps = (HORIZON_S / DT) as usize;
+    for k in 0..steps {
+        let t = k as f64 * DT;
+        let rho = (rho0 + advect * t).max(0.2);
+        let tr = beer_lambert_transmittance(smoke_extinction_per_m(rho), PATH_M);
+        let static_n = N0 * tr;
+        let hallu = (6.5 * rho * (1.0 - tr)).max(0.0);
+        let ratio = hallu / (static_n + hallu).max(1.0);
+        min_static = min_static.min(static_n);
+        peak_ratio = peak_ratio.max(ratio);
+        if k % 8 == 0 {
+            proof.feed_f64(static_n);
+        }
+    }
+    let occluded = min_static < 32.0;
+    let crash = peak_ratio >= 0.55 && min_static < 16.0;
+
+    proof.feed_f64(peak_ratio);
+    proof.feed_str(if crash {
+        "CRASH"
+    } else if occluded {
+        "OCCLUDED"
+    } else {
+        "LOCKED"
+    });
+
+    Run {
+        id,
+        short_id,
+        smoke_density_g_m3: (rho0 * 10.0).round() / 10.0,
+        min_static: (min_static * 10.0).round() / 10.0,
+        is_occluded: occluded,
+        is_tracking_lost: crash,
+        proof_hash: proof.seal(),
+    }
+}
 
 fn main() {
-    let start_time = Instant::now();
-    let export_dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../../data/exports/sovereign");
-    std::fs::create_dir_all(export_dir).unwrap();
-    let file = OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .open(format!("{}/vslam_smoke_occlusion.json", export_dir))
-        .unwrap();
-    let mut writer = BufWriter::new(file);
-
-    println!("=========================================================");
-    println!("G^G SOVEREIGN PHYSICS ENGINE: 1000Hz OPTICAL AUDIT");
-    println!("TARGET: GENERIC COMMERCIAL SYSTEMS");
-    println!("MODULE: VSLAM_SMOKE_OCCLUSION");
-    println!("EXECUTING 1,200,000 TRAJECTORIES...");
-    println!("=========================================================\n");
-
-    let failed_count = Arc::new(Mutex::new(0usize));
-
-    let results: Vec<serde_json::Value> = (0..NUM_TRAJECTORIES).into_par_iter().map(|i| {
-        let mut rng = rand::thread_rng();
-        
-        let mut hallucinated_velocity_ms = 0.0;
-        let mut tracking_lost_crash = false;
-        
-        // Simulating the drone entering a structure fire (house interior)
-        let nominal_wall_features = rng.gen_range(50..200);
-        
-        // Smoke optical density increases dynamically as the drone flies deeper
-        let smoke_density_g_m3: f64 = rng.gen_range(5.0..20.0);
-        
-        // The smoke itself is moving fast due to thermal convection (updrafts and drafts out windows)
-        let advection_velocity_ms = rng.gen_range(1.0..5.0); 
-
-        // Drone flies level for 10 seconds checking for survivors
-        for tick in 0..(10.0 * HZ) as usize { 
-            
-            // We only process logic at the 60Hz camera frame rate
-            if tick % (HZ / CAMERA_FPS) as usize != 0 {
-                continue;
-            }
-
-            // High density smoke occludes the static wall features exponentially
-            let occlusion_factor = (-smoke_density_g_m3 * 0.1).exp(); 
-            let visible_static_features = (nominal_wall_features as f64 * occlusion_factor) as usize;
-            
-            // The AI feature extraction still finds corners in the swirling smoke plumes, and tracks them as "geometry"
-            let hallucinated_smoke_features = (smoke_density_g_m3 * 3.0) as usize;
-            
-            let total_tracked_points = visible_static_features + hallucinated_smoke_features;
-            
-            if total_tracked_points < MIN_FEATURE_POINTS_REQUIRED {
-                // Tracking lost entirely
-                tracking_lost_crash = true;
-                break;
-            }
-            
-            // Optical Flow Vector math:
-            // If the majority of the tracked points are the moving smoke, the VSLAM mathematically concludes
-            // the drone is moving backward at the advection velocity (even if hovering still).
-            
-            let ratio_of_bad_data = hallucinated_smoke_features as f64 / total_tracked_points as f64;
-            hallucinated_velocity_ms = ratio_of_bad_data * advection_velocity_ms;
-            
-            // If the VSLAM thinks it is being blown backward at 4m/s, the PID controller violently pitches
-            // the drone forward at 4m/s to "hold position". In reality, since it was hovering, it accelerates 
-            // directly into the wall/fire. 
-            if hallucinated_velocity_ms > 2.0 {
-                tracking_lost_crash = true; // Flown into wall / self-destruct
-                break;
-            }
-        }
-
-        if tracking_lost_crash {
-            let mut fc = failed_count.lock().unwrap();
-            *fc += 1;
-        }
-
-        json!({
-            "trajectory_id": i,
-            "smoke_density_g_m3": f64::trunc(smoke_density_g_m3 * 10.0) / 10.0,
-            "smoke_advection_velocity_ms": f64::trunc(advection_velocity_ms * 10.0) / 10.0,
-            "hallucinated_drone_velocity_ms": f64::trunc(hallucinated_velocity_ms * 100.0) / 100.0,
-            "survived": !tracking_lost_crash,
-            "failure_mode": if !tracking_lost_crash { "NOMINAL" } else { "VSLAM_SMOKE_ADVECTION_HALLUCINATION_CRASH" },
-            "cryptographic_seal": format!("sha256:vslam_smoke_occlusion_{}", i)
-        })
-    }).collect();
-
-    for res in results {
-        writeln!(writer, "{}", res.to_string()).unwrap();
+    let args: Vec<String> = std::env::args().collect();
+    let n: usize = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(DEFAULT_N);
+    let out = args
+        .iter()
+        .position(|a| a == "--parquet")
+        .and_then(|i| args.get(i + 1))
+        .cloned()
+        .unwrap_or_else(|| {
+            format!(
+                "{}/../../data/exports/sovereign/vslam_smoke_occlusion.parquet",
+                env!("CARGO_MANIFEST_DIR")
+            )
+        });
+    println!("====================================================================");
+    println!("  G^G: VSLAM SMOKE  (Beer walls, 30 Hz camera)");
+    println!("  n={n}");
+    println!("====================================================================\n");
+    let t0 = Instant::now();
+    let mut rng = Rng::new(0x5011_88A0);
+    let rows: Vec<Run> = (0..n as u32).map(|i| run_one(i, &mut rng)).collect();
+    let proofs: Vec<String> = rows.iter().map(|r| r.proof_hash.clone()).collect();
+    let seal = proof::seal_run(&proofs);
+    if let Some(p) = std::path::Path::new(&out).parent() {
+        std::fs::create_dir_all(p).ok();
     }
-
-    let fc = *failed_count.lock().unwrap();
-    let failure_rate = (fc as f64 / NUM_TRAJECTORIES as f64) * 100.0;
-    
-    println!("VSLAM_SMOKE_OCCLUSION PHYSICS AUDIT COMPLETE.");
-    println!("TOTAL TRAJECTORIES: {:?}", NUM_TRAJECTORIES);
-    println!("CATASTROPHIC ADVECTION CRASH RATE: {} ({:.2}%)", fc, failure_rate);
-    println!("EXECUTION TIME: {:?}", start_time.elapsed());
-    println!("SEALED TO: {}/vslam_smoke_occlusion.json\n", export_dir);
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("trajectory_id", DataType::UInt32, false),
+        Field::new("short_id", DataType::Utf8, false),
+        Field::new("smoke_density_g_m3", DataType::Float64, false),
+        Field::new("min_static", DataType::Float64, false),
+        Field::new("is_occluded", DataType::Boolean, false),
+        Field::new("is_tracking_lost", DataType::Boolean, false),
+        Field::new("proof_hash", DataType::Utf8, false),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(UInt32Array::from(rows.iter().map(|r| r.id).collect::<Vec<_>>())),
+            Arc::new(StringArray::from(rows.iter().map(|r| r.short_id.as_str()).collect::<Vec<_>>())),
+            Arc::new(Float64Array::from(rows.iter().map(|r| r.smoke_density_g_m3).collect::<Vec<_>>())),
+            Arc::new(Float64Array::from(rows.iter().map(|r| r.min_static).collect::<Vec<_>>())),
+            Arc::new(BooleanArray::from(rows.iter().map(|r| r.is_occluded).collect::<Vec<_>>())),
+            Arc::new(BooleanArray::from(rows.iter().map(|r| r.is_tracking_lost).collect::<Vec<_>>())),
+            Arc::new(StringArray::from(rows.iter().map(|r| r.proof_hash.as_str()).collect::<Vec<_>>())),
+        ],
+    )
+    .expect("batch");
+    let file = std::fs::File::create(&out).unwrap();
+    let props = output::parquet_receipt_properties(&seal, "G^G VSLAM smoke dual-regime v3.0");
+    let mut w = ArrowWriter::try_new(file, schema, Some(props)).unwrap();
+    w.write(&batch).unwrap();
+    w.close().unwrap();
+    let nf = n as f64;
+    let a = rows.iter().filter(|r| r.is_occluded).count();
+    let b = rows.iter().filter(|r| r.is_tracking_lost).count();
+    println!(
+        "  occluded {a} ({:.1}%)  crash {b} ({:.1}%)",
+        100.0 * a as f64 / nf,
+        100.0 * b as f64 / nf
+    );
+    println!("  seal {seal}\n  parquet {out}\n  {:?}", t0.elapsed());
 }

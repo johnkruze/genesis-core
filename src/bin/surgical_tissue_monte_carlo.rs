@@ -1,4 +1,6 @@
 //! Tissue-limited clamp: overstress · viscoelastic rupture · cable slip · held.
+//! Dual-regime exclusive: rupture is terminal (tissue destroyed). Cable only if
+//! tissue lives. Overstress only if the jaw is still on living tissue.
 //! Policy numbers (1.2 / 2.5 / 40 N) are named gates, not constitutive tissue models.
 
 use genesis_core::output;
@@ -124,15 +126,19 @@ fn run_one(id: u32, rng: &mut Rng) -> SurgicalRun {
         }
     }
 
-    let held = !over && !rupture && !cable;
-    proof.feed_str(if held {
-        "SAMPLE_HELD"
-    } else if cable {
-        "CABLE_SLIP"
-    } else if rupture {
+    // Rupture is the terminal event. Cable / overstress only seal if tissue lives.
+    let rupture_flag = rupture;
+    let cable_flag = cable && !rupture;
+    let over_flag = over && !rupture && !cable;
+    let held = !over_flag && !rupture_flag && !cable_flag;
+    proof.feed_str(if rupture_flag {
         "VISCOELASTIC_RUPTURE"
-    } else {
+    } else if cable_flag {
+        "CABLE_SLIP"
+    } else if over_flag {
         "TISSUE_OVERSTRESS"
+    } else {
+        "SAMPLE_HELD"
     });
 
     SurgicalRun {
@@ -146,9 +152,9 @@ fn run_one(id: u32, rng: &mut Rng) -> SurgicalRun {
         final_force_n: force as f64,
         clamped_force_n: clamped as f64,
         final_displacement_m: disp as f64,
-        tissue_overstress: over,
-        viscoelastic_rupture: rupture,
-        cable_slip_fault: cable,
+        tissue_overstress: over_flag,
+        viscoelastic_rupture: rupture_flag,
+        cable_slip_fault: cable_flag,
         sample_held: held,
         proof_hash: proof.seal(),
     }
@@ -224,7 +230,7 @@ fn main() {
             parquet::file::metadata::KeyValue::new("cryptographic_seal".to_string(), run_proof.clone()),
             parquet::file::metadata::KeyValue::new(
                 "generator".to_string(),
-                "G^G surgical tissue clamp v1.0".to_string(),
+                "G^G surgical tissue clamp dual-regime v1.1".to_string(),
             ),
         ]))
         .build();
@@ -236,7 +242,15 @@ fn main() {
     let over = rows.iter().filter(|r| r.tissue_overstress).count();
     let rup = rows.iter().filter(|r| r.viscoelastic_rupture).count();
     let cab = rows.iter().filter(|r| r.cable_slip_fault).count();
-    println!("  held {held} ({:.1}%)  overstress {over}  rupture {rup}  cable {cab}", 100.0 * held as f64 / n as f64);
+    assert_eq!(held + over + rup + cab, n as usize);
+    let n_f = n as f64;
+    println!(
+        "  held {held} ({:.1}%)  overstress {over} ({:.1}%)  rupture {rup} ({:.1}%)  cable {cab} ({:.1}%)  exclusive",
+        100.0 * held as f64 / n_f,
+        100.0 * over as f64 / n_f,
+        100.0 * rup as f64 / n_f,
+        100.0 * cab as f64 / n_f
+    );
     println!("  seal {run_proof}");
     println!("  parquet {out}");
     println!("  {:?}", t0.elapsed());

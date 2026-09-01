@@ -1,134 +1,166 @@
-//! 1000Hz GENESIS CORE MODULE: AUTONOMOUS_WINGMAN_FLUTTER
-//! TARGET: Generic Commercial/Industrial Autonomous Systems
-//! CLASS: Generic Autonomous Platform
-//! SUBSYSTEM: Aeroservoelastic Flight Control AI
-//! VULNERABILITY: Low-cost attritable drones utilize cheaper composite manufacturing. The neural flight controller is trained on static CFD models that assume infinite wing rigidity. In reality, diving at transonic speeds (Mach 0.95) generates intense aeroelastic flutter (structural resonance). The AI PID loops attempt to dampen the vibration but are slightly out of phase due to inference latency, constructively amplifying the flutter until the wing physically delaminates and snap-rolls the aircraft.
+//! Transonic wingman. q = ½ρV². Delay-line aileron. Ongoing sin(ωt) at flutter freq.
+//! Clock: 200 Hz, 3 s. Gates: |y|≥15 mm flutter vs |y|≥50 mm delamination.
+//! Organ: aero::DelayAeroservoelastic, dynamic_pressure_pa. Not LBM.
 
-use rayon::prelude::*;
-use serde_json::json;
-use std::fs::{File, OpenOptions};
-use std::io::{BufWriter, Write};
-use std::sync::{Arc, Mutex};
+use genesis_core::output;
+use genesis_core::physics::aero::{
+    dynamic_pressure_pa, isa_density_kg_m3, tas_from_mach, DelayAeroservoelastic,
+};
+use genesis_core::proof::{self, ProofChain};
+use genesis_core::rng::Rng;
+use serde::Serialize;
+use std::sync::Arc;
 use std::time::Instant;
-use rand::Rng;
 
-const NUM_TRAJECTORIES: usize = 1_200_000;
-const HZ: f64 = 1000.0;
-const DT: f64 = 1.0 / HZ;
+use arrow::array::{BooleanArray, Float64Array, StringArray, UInt32Array};
+use arrow::datatypes::{DataType, Field, Schema};
+use arrow::record_batch::RecordBatch;
+use parquet::arrow::arrow_writer::ArrowWriter;
 
-// Transonic Composite Wing Baseline
-const WING_STRUCTURAL_YIELD_AMPLITUDE_M: f64 = 0.45; // 45cm of vertical wing flex before the carbon fiber matrix shatters
-const TRANSONIC_FLUTTER_FREQ_HZ: f64 = 28.5; // Natural frequency of the long composite wing
+const DEFAULT_N: usize = 2500;
+const DT: f64 = 0.005;
+const HORIZON_S: f64 = 3.0;
+const Y_FLUTTER_M: f64 = 0.015;
+const Y_DELAM_M: f64 = 0.050;
 
-fn main() {
-    let start_time = Instant::now();
-    let export_dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../../data/exports/sovereign");
-    std::fs::create_dir_all(export_dir).unwrap();
-    let file = OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .open(format!("{}/autonomous_wingman_flutter.json", export_dir))
-        .unwrap();
-    let mut writer = BufWriter::new(file);
+#[derive(Debug, Serialize)]
+struct Run {
+    id: u32,
+    short_id: String,
+    airspeed_mach: f64,
+    latency_ms: f64,
+    max_wing_deflection_m: f64,
+    is_flutter: bool,
+    is_structural_failure: bool,
+    proof_hash: String,
+}
 
-    println!("=========================================================");
-    println!("G^G SOVEREIGN PHYSICS ENGINE: 1000Hz AEROELASTIC AUDIT");
-    println!("TARGET: GENERIC COMMERCIAL SYSTEMS");
-    println!("MODULE: AUTONOMOUS_WINGMAN_FLUTTER");
-    println!("EXECUTING 1,200,000 TRAJECTORIES...");
-    println!("=========================================================\n");
+fn run_one(id: u32, rng: &mut Rng) -> Run {
+    let short_id = output::short_id(rng);
+    let mach = rng.range(0.55, 1.15);
+    let latency_s = rng.range(0.008, 0.040);
+    let alt_m = rng.range(0.0, 8_000.0);
+    let f_hz = rng.range(10.0, 22.0);
 
-    let failed_count = Arc::new(Mutex::new(0usize));
+    let mut proof = ProofChain::new();
+    proof.seed(&id.to_le_bytes());
+    proof.feed_f64(mach);
+    proof.feed_f64(latency_s);
+    proof.feed_f64(alt_m);
+    proof.feed_f64(f_hz);
 
-    let results: Vec<serde_json::Value> = (0..NUM_TRAJECTORIES).into_par_iter().map(|i| {
-        let mut rng = rand::thread_rng();
-        
-        let mut max_wing_deflection_m = 0.0;
-        let mut structural_delamination_failure = false;
-        
-        // Simulating the autonomous wingman accelerating to keep up with a B-21 or F-35 in a combat dive
-        let airspeed_mach = rng.gen_range(0.85..1.05); // Transonic boundary
-        let dynamic_pressure_q = airspeed_mach * airspeed_mach * rng.gen_range(400.0..600.0); // Simplified aero force
-        
-        let mut instantaneous_wing_deflection = 0.0;
-        let mut instantaneous_wing_velocity = 0.0;
-        
-        // The neural net takes 20ms to process inertial data and command the aileron
-        let nn_inference_latency_ms = rng.gen_range(15.0..30.0);
-        let frames_delay = (nn_inference_latency_ms * HZ / 1000.0) as usize;
-        
-        let mut deflection_history = vec![0.0; frames_delay + 1];
+    let rho = isa_density_kg_m3(alt_m);
+    let v = tas_from_mach(mach);
+    let q = dynamic_pressure_pa(rho, v);
+    let q_sl = dynamic_pressure_pa(1.225, tas_from_mach(0.85));
+    let aero_amp = 12.0 * (q / q_sl);
+    // Delayed aileron: negative gain at small delay damps; 180° of a 12 Hz cycle is ~42 ms.
+    let aileron_gain = -25.0 * (q / q_sl) * (latency_s / 0.020);
 
-        for tick in 0..(5.0 * HZ) as usize { // 5 seconds of transonic dive
-            
-            // External aero forcing function kicks off the flutter (e.g. hitting a thermal or shockwave)
-            let aerodynamic_excitation = if tick < 100 { 
-                (tick as f64 * DT * TRANSONIC_FLUTTER_FREQ_HZ * std::f64::consts::PI * 2.0).sin() * (dynamic_pressure_q / 50000.0)
-            } else {
-                0.0
-            };
-            
-            // AI "Anti-Flutter" active damping
-            let delayed_index = (tick + deflection_history.len() - frames_delay) % deflection_history.len();
-            let delayed_deflection_state = deflection_history[delayed_index];
-            
-            // If the delay is perfectly out of phase (e.g. 1/2 of the natural frequency period), the AI's 
-            // attempt to dampen it actually pushes it HARDER in the wrong direction
-            // K_p (proportional gain) of the neural flight controller is quite high for transonic agility
-            let ai_aileron_damping_force = delayed_deflection_state * 18000.0; 
-            
-            // Second Order Harmonic Oscillator (Mass-Spring-Damper for the physical wing)
-            let stiffness_k = 1500.0; 
-            let wing_mass = 200.0;
-            let physical_damping_c = 5.0; // Carbon composite has very low internal damping
-            
-            // F = ma -> a = F/m
-            let total_force = aerodynamic_excitation + ai_aileron_damping_force - (stiffness_k * instantaneous_wing_deflection) - (physical_damping_c * instantaneous_wing_velocity);
-            
-            let acceleration = total_force / wing_mass;
-            instantaneous_wing_velocity += acceleration * DT;
-            instantaneous_wing_deflection += instantaneous_wing_velocity * DT;
-            
-            let history_len = deflection_history.len();
-            deflection_history[tick % history_len] = instantaneous_wing_deflection;
-
-            if instantaneous_wing_deflection.abs() > max_wing_deflection_m {
-                max_wing_deflection_m = instantaneous_wing_deflection.abs();
-            }
-
-            if max_wing_deflection_m > WING_STRUCTURAL_YIELD_AMPLITUDE_M {
-                structural_delamination_failure = true;
-                break;
-            }
+    let mut wing = DelayAeroservoelastic::new(f_hz, 0.035, latency_s, DT);
+    let mut peak: f64 = 0.0;
+    let steps = (HORIZON_S / DT) as usize;
+    for k in 0..steps {
+        let t = k as f64 * DT;
+        let y = wing.step(aero_amp * (wing.omega_rad_s * t).sin(), aileron_gain, DT);
+        peak = peak.max(y.abs());
+        if peak >= Y_DELAM_M {
+            break;
         }
-
-        if structural_delamination_failure {
-            let mut fc = failed_count.lock().unwrap();
-            *fc += 1;
+        if k % 40 == 0 {
+            proof.feed_f64(y);
         }
-
-        json!({
-            "trajectory_id": i,
-            "mach_speed": f64::trunc(airspeed_mach * 100.0) / 100.0,
-            "ai_inference_latency_ms": f64::trunc(nn_inference_latency_ms * 10.0) / 10.0,
-            "max_wing_deflection_m": f64::trunc(max_wing_deflection_m * 100.0) / 100.0,
-            "survived": !structural_delamination_failure,
-            "failure_mode": if !structural_delamination_failure { "NOMINAL" } else { "TRANSONIC_AEROELASTIC_DELAMINATION" },
-            "cryptographic_seal": format!("sha256:stealth_composite_flutter_{}", i)
-        })
-    }).collect();
-
-    for res in results {
-        writeln!(writer, "{}", res.to_string()).unwrap();
     }
 
-    let fc = *failed_count.lock().unwrap();
-    let failure_rate = (fc as f64 / NUM_TRAJECTORIES as f64) * 100.0;
-    
-    println!("AUTONOMOUS_WINGMAN_FLUTTER PHYSICS AUDIT COMPLETE.");
-    println!("TOTAL TRAJECTORIES: {:?}", NUM_TRAJECTORIES);
-    println!("CATASTROPHIC WING DELAMINATION RATE: {} ({:.2}%)", fc, failure_rate);
-    println!("EXECUTION TIME: {:?}", start_time.elapsed());
-    println!("SEALED TO: {}/autonomous_wingman_flutter.json\n", export_dir);
+    let flutter = peak >= Y_FLUTTER_M;
+    let delam = peak >= Y_DELAM_M;
+    proof.feed_f64(peak);
+    proof.feed_str(if delam {
+        "DELAMINATED"
+    } else if flutter {
+        "FLUTTER"
+    } else {
+        "NOMINAL"
+    });
+
+    Run {
+        id,
+        short_id,
+        airspeed_mach: (mach * 100.0).round() / 100.0,
+        latency_ms: (latency_s * 1e3 * 10.0).round() / 10.0,
+        max_wing_deflection_m: (peak * 1e4).round() / 1e4,
+        is_flutter: flutter,
+        is_structural_failure: delam,
+        proof_hash: proof.seal(),
+    }
+}
+
+fn main() {
+    let args: Vec<String> = std::env::args().collect();
+    let n: usize = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(DEFAULT_N);
+    let out = args
+        .iter()
+        .position(|a| a == "--parquet")
+        .and_then(|i| args.get(i + 1))
+        .cloned()
+        .unwrap_or_else(|| {
+            format!(
+                "{}/../../data/exports/sovereign/autonomous_wingman_flutter.parquet",
+                env!("CARGO_MANIFEST_DIR")
+            )
+        });
+
+    println!("====================================================================");
+    println!("  G^G: WINGMAN DELAY-LOOP  (q=½ρV², 200 Hz, sin(ωt))");
+    println!("  n={n}  flutter {Y_FLUTTER_M} m  delam {Y_DELAM_M} m");
+    println!("====================================================================\n");
+
+    let t0 = Instant::now();
+    let mut rng = Rng::new(0xF107_7E80);
+    let rows: Vec<Run> = (0..n as u32).map(|i| run_one(i, &mut rng)).collect();
+    let proofs: Vec<String> = rows.iter().map(|r| r.proof_hash.clone()).collect();
+    let seal = proof::seal_run(&proofs);
+    if let Some(p) = std::path::Path::new(&out).parent() {
+        std::fs::create_dir_all(p).ok();
+    }
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("trajectory_id", DataType::UInt32, false),
+        Field::new("short_id", DataType::Utf8, false),
+        Field::new("airspeed_mach", DataType::Float64, false),
+        Field::new("latency_ms", DataType::Float64, false),
+        Field::new("max_wing_deflection_m", DataType::Float64, false),
+        Field::new("is_flutter", DataType::Boolean, false),
+        Field::new("is_structural_failure", DataType::Boolean, false),
+        Field::new("proof_hash", DataType::Utf8, false),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(UInt32Array::from(rows.iter().map(|r| r.id).collect::<Vec<_>>())),
+            Arc::new(StringArray::from(rows.iter().map(|r| r.short_id.as_str()).collect::<Vec<_>>())),
+            Arc::new(Float64Array::from(rows.iter().map(|r| r.airspeed_mach).collect::<Vec<_>>())),
+            Arc::new(Float64Array::from(rows.iter().map(|r| r.latency_ms).collect::<Vec<_>>())),
+            Arc::new(Float64Array::from(rows.iter().map(|r| r.max_wing_deflection_m).collect::<Vec<_>>())),
+            Arc::new(BooleanArray::from(rows.iter().map(|r| r.is_flutter).collect::<Vec<_>>())),
+            Arc::new(BooleanArray::from(rows.iter().map(|r| r.is_structural_failure).collect::<Vec<_>>())),
+            Arc::new(StringArray::from(rows.iter().map(|r| r.proof_hash.as_str()).collect::<Vec<_>>())),
+        ],
+    )
+    .expect("batch");
+    let file = std::fs::File::create(&out).unwrap();
+    let props = output::parquet_receipt_properties(&seal, "G^G wingman delay-loop dual-regime v3.0");
+    let mut w = ArrowWriter::try_new(file, schema, Some(props)).unwrap();
+    w.write(&batch).unwrap();
+    w.close().unwrap();
+    let n_f = n as f64;
+    let f = rows.iter().filter(|r| r.is_flutter).count();
+    let d = rows.iter().filter(|r| r.is_structural_failure).count();
+    println!(
+        "  flutter {f} ({:.1}%)  delam {d} ({:.1}%)",
+        100.0 * f as f64 / n_f,
+        100.0 * d as f64 / n_f
+    );
+    println!("  seal {seal}");
+    println!("  parquet {out}");
+    println!("  {:?}", t0.elapsed());
 }

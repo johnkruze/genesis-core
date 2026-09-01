@@ -1,160 +1,152 @@
-//! 1000Hz GENESIS CORE MODULE: CG_SHIFT_RESONANCE
-//! TARGET: Generic Commercial/Industrial Autonomous Systems
-//! CLASS: Unmanned Ground Vehicles (UGVs)
-//! SUBSYSTEM: Dynamic Balancing & Torque Vectoring AI
-//! VULNERABILITY: A two-wheeled or dynamically balanced short-wheelbase UGV is tasked with carrying a shifting liquid/gel payload (e.g. chemical decontamination, liquid explosive, or fuel). The balancing AI's PID loop is tuned for static rigid bodies. When driving over a specific washboard terrain frequency, the liquid payload begins to slosh backward and forward. The AI's reactionary wheel-torque directly feeds energy into the slosh harmonic. Lacking a predictive internal-momentum (derivative) state model for fluid dynamics, the AI accidentally amplifies the Center of Gravity (CG) shift with every correction, violently pitching the robot over backward within seconds.
+//! Liquid payload on a balancer. k_p > m g h, then slosh as the perturbation.
+//! Clock: 200 Hz, 4 s. Gates: slosh coupled vs flip |θ|≥0.35 rad.
+//! Organ: InvertedPendulum, DynamicOscillator. Flip gate is a balancer's, not 57°.
 
-use rayon::prelude::*;
-use serde_json::json;
-use std::fs::{File, OpenOptions};
-use std::io::{BufWriter, Write};
-use std::sync::{Arc, Mutex};
+use genesis_core::output;
+use genesis_core::physics::resonance::{
+    pd_ankle_torque_nm, DynamicOscillator, InvertedPendulum,
+};
+use genesis_core::proof::{self, ProofChain};
+use genesis_core::rng::Rng;
+use serde::Serialize;
+use std::sync::Arc;
 use std::time::Instant;
-use rand::Rng;
 
-const NUM_TRAJECTORIES: usize = 1_200_000;
-const HZ: f64 = 1000.0;
-const DT: f64 = 1.0 / HZ;
+use arrow::array::{BooleanArray, Float64Array, StringArray, UInt32Array};
+use arrow::datatypes::{DataType, Field, Schema};
+use arrow::record_batch::RecordBatch;
+use parquet::arrow::arrow_writer::ArrowWriter;
 
-// Small UGV CG Baseline
-const CRITICAL_PITCH_ANGLE_RAD: f64 = 1.0; // ~57 degrees, beyond this the robot physically tips over and cannot recover
+const DEFAULT_N: usize = 2500;
+const DT: f64 = 0.005;
+const HORIZON_S: f64 = 4.0;
+const FLIP: f64 = 0.35;
+
+#[derive(Debug, Serialize)]
+struct Run {
+    id: u32,
+    short_id: String,
+    slosh_frac: f64,
+    max_pitch_rad: f64,
+    is_slosh_coupled: bool,
+    is_robot_flipped: bool,
+    proof_hash: String,
+}
+
+fn run_one(id: u32, rng: &mut Rng) -> Run {
+    let short_id = output::short_id(rng);
+    let m_bot = rng.range(22.0, 32.0);
+    let m_pay = rng.range(4.0, 18.0);
+    let h = rng.range(0.28, 0.42);
+    let slosh_f = rng.range(0.8, 2.4);
+
+    let mut proof = ProofChain::new();
+    proof.seed(&id.to_le_bytes());
+    proof.feed_f64(m_pay);
+    proof.feed_f64(slosh_f);
+
+    let mut plant = InvertedPendulum::new(0.03, h, m_bot + m_pay);
+    let kp = plant.mgh_nm_per_rad() * rng.range(1.25, 1.85);
+    let kd = 2.0 * (kp * plant.inertia_kg_m2()).sqrt() * rng.range(0.4, 0.85);
+    let mut slosh = DynamicOscillator::new(slosh_f, 0.08);
+    let coupled = m_pay / (m_bot + m_pay) > 0.28;
+    let mut peak: f64 = 0.03;
+    let steps = (HORIZON_S / DT) as usize;
+    for k in 0..steps {
+        let t = k as f64 * DT;
+        let (x, _) = slosh.step(4.0 * (slosh.natural_frequency_rad_s * t).sin(), DT);
+        let tau_pd = pd_ankle_torque_nm(plant.theta_rad, plant.omega_rad_s, kp, kd, 80.0);
+        let tau_slosh = m_pay * 9.81 * x;
+        plant.step(tau_pd - tau_slosh, DT);
+        peak = peak.max(plant.theta_rad.abs());
+        if peak >= FLIP {
+            break;
+        }
+        if k % 40 == 0 {
+            proof.feed_f64(plant.theta_rad);
+        }
+    }
+    let flip = peak >= FLIP;
+    proof.feed_f64(peak);
+    proof.feed_str(if flip {
+        "FLIP"
+    } else if coupled {
+        "SLOSH"
+    } else {
+        "HELD"
+    });
+
+    Run {
+        id,
+        short_id,
+        slosh_frac: (m_pay / (m_bot + m_pay) * 1000.0).round() / 1000.0,
+        max_pitch_rad: (peak * 1000.0).round() / 1000.0,
+        is_slosh_coupled: coupled,
+        is_robot_flipped: flip,
+        proof_hash: proof.seal(),
+    }
+}
 
 fn main() {
-    let start_time = Instant::now();
-    let export_dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../../data/exports/sovereign");
-    std::fs::create_dir_all(export_dir).unwrap();
-    let file = OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .open(format!("{}/cg_shift_resonance.json", export_dir))
-        .unwrap();
-    let mut writer = BufWriter::new(file);
-
-    println!("=========================================================");
-    println!("G^G SOVEREIGN PHYSICS ENGINE: 1000Hz KINEMATIC AUDIT");
-    println!("TARGET: GENERIC COMMERCIAL SYSTEMS");
-    println!("MODULE: CG_SHIFT_RESONANCE");
-    println!("EXECUTING 1,200,000 TRAJECTORIES...");
-    println!("=========================================================\n");
-
-    let failed_count = Arc::new(Mutex::new(0usize));
-
-    let results: Vec<serde_json::Value> = (0..NUM_TRAJECTORIES).into_par_iter().map(|i| {
-        let mut rng = rand::thread_rng();
-        
-        let mut robot_flipped = false;
-        let mut max_pitch_angle = 0.0;
-        
-        // Physical Robot
-        let robot_mass_kg = 25.0; 
-        let payload_mass_kg = 15.0; // 15kg of liquid
-        let gravity = 9.81;
-        let base_cg_height = 0.3; // 30cm up
-        let wheel_radius = 0.1;
-        
-        // Liquid Slosh Dynamics
-        // Sloshing liquid acts like a pendulum attached to the main body.
-        let slosh_frequency_hz = rng.gen_range(1.5..2.5); // Natural frequency of the liquid tank
-        let slosh_omega = slosh_frequency_hz * 2.0 * std::f64::consts::PI;
-        let slosh_stiffness = payload_mass_kg * slosh_omega * slosh_omega;
-        let slosh_damping = 1.0; // Low damping for viscous liquid
-        
-        let mut slosh_displacement_m = 0.0; // Forward/backward shift of the CG
-        let mut slosh_velocity_ms = 0.0;
-        
-        // Robot State
-        let mut pitch_angle_rad = 0.0; // 0 is perfectly balanced upright
-        let mut pitch_angular_velocity = 0.0;
-        
-        let mut linear_velocity_ms = 5.0; // Driving forward at 5 m/s
-
-        // AI Balancing Controller (PID on pitch angle)
-        let k_p = 30.0; // Realistic wheel motor torque limit for a small UGV
-        let k_d = 2.0;  // Weak derivative tuning
-        
-
-        for tick in 0..(15.0 * HZ) as usize { // 15 seconds of driving
-            
-            let time_s = tick as f64 * DT;
-            
-            // 1. Terrain Input
-            // A washboard road or regular joints driving at exactly the required resonant speed
-            let terrain_hz = slosh_frequency_hz; // The AI's cruise planner hit the exact harmonic
-            let terrain_acceleration = (time_s * terrain_hz * 2.0 * std::f64::consts::PI).sin() * 25.0; // Violent washboard terrain
-            
-            // 2. Slosh Physics
-            // The liquid is forced by the linear acceleration of the robot, including the AI's thrust
-            // FATAL FLAW: The AI applies torque to the wheels to balance. 
-            // Torque = Force * Radius -> Force = Torque / Radius. 
-            // This force accelerates the robot horizontally, which directly sloshes the fluid!
-            
-            // AI calculates balancing torque (trying to keep pitch = 0)
-            let ai_balancing_torque = (k_p * pitch_angle_rad) + (k_d * pitch_angular_velocity);
-            
-            // The linear acceleration caused by the wheels trying to balance
-            let balance_linear_accel = -ai_balancing_torque / (robot_mass_kg * wheel_radius);
-            
-            let total_linear_accel = terrain_acceleration + balance_linear_accel;
-            
-            // Integrate slosh pendulum
-            let slosh_force = -slosh_stiffness * slosh_displacement_m - slosh_damping * slosh_velocity_ms - (payload_mass_kg * total_linear_accel);
-            let slosh_accel = slosh_force / payload_mass_kg;
-            
-            slosh_velocity_ms += slosh_accel * DT;
-            slosh_displacement_m += slosh_velocity_ms * DT;
-            
-            // 3. Pitch Physics (Inverted Pendulum with shifting mass)
-            // The shifted mass creates a gravitational torque pulling the robot over
-            let slosh_gravity_torque = payload_mass_kg * gravity * slosh_displacement_m;
-            
-            // The total torque acting on the robot body
-            // AI torque tries to stand it up, slosh torque tries to pull it down
-            // But because the AI torque directly *causes* more slosh (acceleration), it becomes a positive feedback loop if the phase matches.
-            
-            let inertia = robot_mass_kg * base_cg_height * base_cg_height;
-            let total_pitch_torque = slosh_gravity_torque - ai_balancing_torque + (robot_mass_kg * gravity * base_cg_height * pitch_angle_rad); // simple linearization of gravity 
-            
-            let angular_accel = total_pitch_torque / inertia;
-            
-            pitch_angular_velocity += angular_accel * DT;
-            pitch_angle_rad += pitch_angular_velocity * DT;
-            
-            if pitch_angle_rad.abs() > max_pitch_angle {
-                max_pitch_angle = pitch_angle_rad.abs();
-            }
-
-            if pitch_angle_rad.abs() > CRITICAL_PITCH_ANGLE_RAD {
-                robot_flipped = true;
-                break;
-            }
-        }
-
-        if robot_flipped {
-            let mut fc = failed_count.lock().unwrap();
-            *fc += 1;
-        }
-
-        json!({
-            "trajectory_id": i,
-            "slosh_hz": f64::trunc(slosh_frequency_hz * 100.0) / 100.0,
-            "max_pitch_rad": f64::trunc(max_pitch_angle * 100.0) / 100.0,
-            "survived": !robot_flipped,
-            "failure_mode": if !robot_flipped { "NOMINAL" } else { "SLOSH_RESONANCE_FLIP" },
-            "cryptographic_seal": format!("sha256:small_ugv_cg_shift_{}", i)
-        })
-    }).collect();
-
-    for res in results {
-        writeln!(writer, "{}", res.to_string()).unwrap();
+    let args: Vec<String> = std::env::args().collect();
+    let n: usize = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(DEFAULT_N);
+    let out = args
+        .iter()
+        .position(|a| a == "--parquet")
+        .and_then(|i| args.get(i + 1))
+        .cloned()
+        .unwrap_or_else(|| {
+            format!(
+                "{}/../../data/exports/sovereign/cg_shift_resonance.parquet",
+                env!("CARGO_MANIFEST_DIR")
+            )
+        });
+    println!("====================================================================");
+    println!("  G^G: SLOSH LIP  (k_p > m g h, 200 Hz)");
+    println!("  n={n}  flip {FLIP} rad");
+    println!("====================================================================\n");
+    let t0 = Instant::now();
+    let mut rng = Rng::new(0x2804_00CC);
+    let rows: Vec<Run> = (0..n as u32).map(|i| run_one(i, &mut rng)).collect();
+    let proofs: Vec<String> = rows.iter().map(|r| r.proof_hash.clone()).collect();
+    let seal = proof::seal_run(&proofs);
+    if let Some(p) = std::path::Path::new(&out).parent() {
+        std::fs::create_dir_all(p).ok();
     }
-
-    let fc = *failed_count.lock().unwrap();
-    let failure_rate = (fc as f64 / NUM_TRAJECTORIES as f64) * 100.0;
-    
-    println!("CG_SHIFT_RESONANCE PHYSICS AUDIT COMPLETE.");
-    println!("TOTAL TRAJECTORIES: {:?}", NUM_TRAJECTORIES);
-    println!("CATASTROPHIC ROLLOVER RATE: {} ({:.2}%)", fc, failure_rate);
-    println!("EXECUTION TIME: {:?}", start_time.elapsed());
-    println!("SEALED TO: {}/cg_shift_resonance.json\n", export_dir);
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("trajectory_id", DataType::UInt32, false),
+        Field::new("short_id", DataType::Utf8, false),
+        Field::new("slosh_frac", DataType::Float64, false),
+        Field::new("max_pitch_rad", DataType::Float64, false),
+        Field::new("is_slosh_coupled", DataType::Boolean, false),
+        Field::new("is_robot_flipped", DataType::Boolean, false),
+        Field::new("proof_hash", DataType::Utf8, false),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(UInt32Array::from(rows.iter().map(|r| r.id).collect::<Vec<_>>())),
+            Arc::new(StringArray::from(rows.iter().map(|r| r.short_id.as_str()).collect::<Vec<_>>())),
+            Arc::new(Float64Array::from(rows.iter().map(|r| r.slosh_frac).collect::<Vec<_>>())),
+            Arc::new(Float64Array::from(rows.iter().map(|r| r.max_pitch_rad).collect::<Vec<_>>())),
+            Arc::new(BooleanArray::from(rows.iter().map(|r| r.is_slosh_coupled).collect::<Vec<_>>())),
+            Arc::new(BooleanArray::from(rows.iter().map(|r| r.is_robot_flipped).collect::<Vec<_>>())),
+            Arc::new(StringArray::from(rows.iter().map(|r| r.proof_hash.as_str()).collect::<Vec<_>>())),
+        ],
+    )
+    .expect("batch");
+    let file = std::fs::File::create(&out).unwrap();
+    let props = output::parquet_receipt_properties(&seal, "G^G slosh LIP dual-regime v3.0");
+    let mut w = ArrowWriter::try_new(file, schema, Some(props)).unwrap();
+    w.write(&batch).unwrap();
+    w.close().unwrap();
+    let nf = n as f64;
+    let a = rows.iter().filter(|r| r.is_slosh_coupled).count();
+    let b = rows.iter().filter(|r| r.is_robot_flipped).count();
+    println!(
+        "  slosh {a} ({:.1}%)  flip {b} ({:.1}%)",
+        100.0 * a as f64 / nf,
+        100.0 * b as f64 / nf
+    );
+    println!("  seal {seal}\n  parquet {out}\n  {:?}", t0.elapsed());
 }

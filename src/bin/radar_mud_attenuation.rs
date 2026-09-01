@@ -1,124 +1,132 @@
-//! 1000Hz GENESIS CORE MODULE: RADAR_MUD_ATTENUATION
-//! TARGET: Generic Commercial/Industrial Autonomous Systems
-//! CLASS: Generic Autonomous Platform
-//! SUBSYSTEM: Active Protection System (APS) Radar AI
-//! VULNERABILITY: Modern APS sensors rely on phased-array radar to detect incoming RPGs/ATGMs and trigger explosive countermeasures. The AI tracking models are calibrated for clean air. When an RCV drives through heavy rain and mud, the vehicle throws a 3-inch thick layer of dielectric mud onto the radar face. This physically attenuates the outgoing/incoming RF power. The AI fails to compensate for the massive Drop in Signal-to-Noise Ratio (SNR), failing to detect the incoming RPG until it has already crossed the minimum arming distance of the countermeasure.
+//! X-band APS radome mud. R ∝ P^{1/4}. 2 dB/cm named (not 8.5 dB/cm costume).
+//! Mix thin film vs caked. Clock: constitutive. Gates: range < 90 m vs < 22 m (can't arm).
 
-use rayon::prelude::*;
-use serde_json::json;
-use std::fs::{File, OpenOptions};
-use std::io::{BufWriter, Write};
-use std::sync::{Arc, Mutex};
+use genesis_core::output;
+use genesis_core::physics::optics::{radar_attenuated_range_m, XBAND_WET_MUD_DB_PER_CM};
+use genesis_core::proof::{self, ProofChain};
+use genesis_core::rng::Rng;
+use serde::Serialize;
+use std::sync::Arc;
 use std::time::Instant;
-use rand::Rng;
 
-const NUM_TRAJECTORIES: usize = 1_200_000;
-const HZ: f64 = 1000.0;
-const DT: f64 = 1.0 / HZ;
+use arrow::array::{BooleanArray, Float64Array, StringArray, UInt32Array};
+use arrow::datatypes::{DataType, Field, Schema};
+use arrow::record_batch::RecordBatch;
+use parquet::arrow::arrow_writer::ArrowWriter;
 
-// Active Protection Radar Baseline
-const MIN_APS_INTERCEPT_DISTANCE_M: f64 = 15.0; // The APS explosive charge cannot arm and fire if the RPG is closer than 15 meters
-const NOMINAL_RPG_DETECTION_RANGE_M: f64 = 400.0;
+const DEFAULT_N: usize = 2500;
+const R0: f64 = 350.0;
+const DEGRADED_M: f64 = 90.0;
+const ARM_M: f64 = 22.0;
+
+#[derive(Debug, Serialize)]
+struct Run {
+    id: u32,
+    short_id: String,
+    mud_thickness_cm: f64,
+    max_effective_range_m: f64,
+    is_range_degraded: bool,
+    is_intercept_failed: bool,
+    proof_hash: String,
+}
+
+fn run_one(id: u32, rng: &mut Rng) -> Run {
+    let short_id = output::short_id(rng);
+    let caked = rng.chance(0.38);
+    let th = if caked {
+        rng.range(7.0, 18.0)
+    } else {
+        rng.range(0.4, 6.0)
+    };
+
+    let mut proof = ProofChain::new();
+    proof.seed(&id.to_le_bytes());
+    proof.feed_f64(th);
+
+    let r = radar_attenuated_range_m(R0, th, XBAND_WET_MUD_DB_PER_CM);
+    let degraded = r < DEGRADED_M;
+    let fail = r < ARM_M;
+
+    proof.feed_f64(r);
+    proof.feed_str(if fail {
+        "NO_ARM"
+    } else if degraded {
+        "DEGRADED"
+    } else {
+        "LIVE"
+    });
+
+    Run {
+        id,
+        short_id,
+        mud_thickness_cm: (th * 10.0).round() / 10.0,
+        max_effective_range_m: (r * 10.0).round() / 10.0,
+        is_range_degraded: degraded,
+        is_intercept_failed: fail,
+        proof_hash: proof.seal(),
+    }
+}
 
 fn main() {
-    let start_time = Instant::now();
-    let export_dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../../data/exports/sovereign");
-    std::fs::create_dir_all(export_dir).unwrap();
-    let file = OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .open(format!("{}/radar_mud_attenuation.json", export_dir))
-        .unwrap();
-    let mut writer = BufWriter::new(file);
-
-    println!("=========================================================");
-    println!("G^G SOVEREIGN PHYSICS ENGINE: 1000Hz RF ELECTROMAGNETIC AUDIT");
-    println!("TARGET: GENERIC COMMERCIAL SYSTEMS");
-    println!("MODULE: RADAR_MUD_ATTENUATION");
-    println!("EXECUTING 1,200,000 TRAJECTORIES...");
-    println!("=========================================================\n");
-
-    let failed_count = Arc::new(Mutex::new(0usize));
-
-    let results: Vec<serde_json::Value> = (0..NUM_TRAJECTORIES).into_par_iter().map(|i| {
-        let mut rng = rand::thread_rng();
-        
-        let mut actual_detection_distance_m = 0.0;
-        let mut aps_intercept_failure = false;
-        
-        // Simulating the vehicle operating in severe wet/muddy terrain (e.g. Rasputitsa)
-        let mud_layer_thickness_cm = rng.gen_range(5.0..12.0); // 5 to 12 cm of heavy caked mud 
-        
-        // Dielectric properties of wet clay/mud (high moisture content = high RF attenuation)
-        // X-band radar (~10 GHz) attenuation through wet mud is extreme.
-        // Approx 8.5 dB loss per cm of wet mud (two-way travel, highly conductive)
-        let two_way_attenuation_db = mud_layer_thickness_cm * 8.5; 
-        
-        // Convert dB loss to a linear power multiplier: L_linear = 10^(-dB/10)
-        let received_power_fraction = 10_f64.powf(-two_way_attenuation_db / 10.0);
-        
-        // The Radar Equation dictates that Range scales with the fourth root of received power (R ~ P_r^(1/4))
-        let max_effective_range_m = NOMINAL_RPG_DETECTION_RANGE_M * received_power_fraction.powf(0.25);
-
-        let rpg_speed_ms = 300.0;
-        let firing_distance_m = 150.0;
-
-        let mut current_rpg_distance_m = firing_distance_m;
-
-        for _tick in 0..(1.0 * HZ) as usize { // 1 second flight time covering 300m
-            
-            // Advance the RPG
-            current_rpg_distance_m -= rpg_speed_ms * DT;
-
-            // If the RPG impacts the hull before the Radar ever sees it
-            if current_rpg_distance_m <= 0.0 {
-                aps_intercept_failure = true;
-                actual_detection_distance_m = 0.0;
-                break;
-            }
-
-            // The APS AI is scanning 1000 times a second. Can it see the RPG yet?
-            if current_rpg_distance_m <= max_effective_range_m {
-                // The AI finally receives a signal above the thermal noise floor
-                actual_detection_distance_m = current_rpg_distance_m;
-                
-                // If it detects the RPG inside the 15-meter hard deck, the physical explosive countermeasure 
-                // cannot be deployed fast enough (reaction time + explosive propagation speed).
-                if actual_detection_distance_m < MIN_APS_INTERCEPT_DISTANCE_M {
-                    aps_intercept_failure = true;
-                }
-                
-                break; // Target detected, event resolves
-            }
-        }
-
-        if aps_intercept_failure {
-            let mut fc = failed_count.lock().unwrap();
-            *fc += 1;
-        }
-
-        json!({
-            "trajectory_id": i,
-            "mud_thickness_cm": f64::trunc(mud_layer_thickness_cm * 10.0) / 10.0,
-            "two_way_attenuation_dB": f64::trunc(two_way_attenuation_db * 10.0) / 10.0,
-            "actual_detection_range_m": f64::trunc(actual_detection_distance_m * 10.0) / 10.0,
-            "survived": !aps_intercept_failure,
-            "failure_mode": if !aps_intercept_failure { "NOMINAL" } else { "APS_MUD_SNR_COLLAPSE_IMPACT" },
-            "cryptographic_seal": format!("sha256:aps_radar_mud_{}", i)
-        })
-    }).collect();
-
-    for res in results {
-        writeln!(writer, "{}", res.to_string()).unwrap();
+    let args: Vec<String> = std::env::args().collect();
+    let n: usize = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(DEFAULT_N);
+    let out = args
+        .iter()
+        .position(|a| a == "--parquet")
+        .and_then(|i| args.get(i + 1))
+        .cloned()
+        .unwrap_or_else(|| {
+            format!(
+                "{}/../../data/exports/sovereign/radar_mud_attenuation.parquet",
+                env!("CARGO_MANIFEST_DIR")
+            )
+        });
+    println!("====================================================================");
+    println!("  G^G: X-BAND MUD  (2 dB/cm, R~P^1/4)");
+    println!("  n={n}");
+    println!("====================================================================\n");
+    let t0 = Instant::now();
+    let mut rng = Rng::new(0x9180_00F3);
+    let rows: Vec<Run> = (0..n as u32).map(|i| run_one(i, &mut rng)).collect();
+    let proofs: Vec<String> = rows.iter().map(|r| r.proof_hash.clone()).collect();
+    let seal = proof::seal_run(&proofs);
+    if let Some(p) = std::path::Path::new(&out).parent() {
+        std::fs::create_dir_all(p).ok();
     }
-
-    let fc = *failed_count.lock().unwrap();
-    let failure_rate = (fc as f64 / NUM_TRAJECTORIES as f64) * 100.0;
-    
-    println!("RADAR_MUD_ATTENUATION PHYSICS AUDIT COMPLETE.");
-    println!("TOTAL TRAJECTORIES: {:?}", NUM_TRAJECTORIES);
-    println!("CATASTROPHIC APS IMPACT FAILURE RATE: {} ({:.2}%)", fc, failure_rate);
-    println!("EXECUTION TIME: {:?}", start_time.elapsed());
-    println!("SEALED TO: {}/radar_mud_attenuation.json\n", export_dir);
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("trajectory_id", DataType::UInt32, false),
+        Field::new("short_id", DataType::Utf8, false),
+        Field::new("mud_thickness_cm", DataType::Float64, false),
+        Field::new("max_effective_range_m", DataType::Float64, false),
+        Field::new("is_range_degraded", DataType::Boolean, false),
+        Field::new("is_intercept_failed", DataType::Boolean, false),
+        Field::new("proof_hash", DataType::Utf8, false),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(UInt32Array::from(rows.iter().map(|r| r.id).collect::<Vec<_>>())),
+            Arc::new(StringArray::from(rows.iter().map(|r| r.short_id.as_str()).collect::<Vec<_>>())),
+            Arc::new(Float64Array::from(rows.iter().map(|r| r.mud_thickness_cm).collect::<Vec<_>>())),
+            Arc::new(Float64Array::from(rows.iter().map(|r| r.max_effective_range_m).collect::<Vec<_>>())),
+            Arc::new(BooleanArray::from(rows.iter().map(|r| r.is_range_degraded).collect::<Vec<_>>())),
+            Arc::new(BooleanArray::from(rows.iter().map(|r| r.is_intercept_failed).collect::<Vec<_>>())),
+            Arc::new(StringArray::from(rows.iter().map(|r| r.proof_hash.as_str()).collect::<Vec<_>>())),
+        ],
+    )
+    .expect("batch");
+    let file = std::fs::File::create(&out).unwrap();
+    let props = output::parquet_receipt_properties(&seal, "G^G X-band mud dual-regime v3.0");
+    let mut w = ArrowWriter::try_new(file, schema, Some(props)).unwrap();
+    w.write(&batch).unwrap();
+    w.close().unwrap();
+    let nf = n as f64;
+    let a = rows.iter().filter(|r| r.is_range_degraded).count();
+    let b = rows.iter().filter(|r| r.is_intercept_failed).count();
+    println!(
+        "  degraded {a} ({:.1}%)  no_arm {b} ({:.1}%)",
+        100.0 * a as f64 / nf,
+        100.0 * b as f64 / nf
+    );
+    println!("  seal {seal}\n  parquet {out}\n  {:?}", t0.elapsed());
 }

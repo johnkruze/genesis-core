@@ -1,11 +1,16 @@
+use std::sync::Arc;
 use std::time::Instant;
 use genesis_core::physics::mars_edl::{MarsPhysics, EdlVehicle};
 use genesis_core::rng::Rng;
 use genesis_core::proof::{self, ProofChain};
-use genesis_core::output::{self, DatasetMetadata, TrajectoryRecord, Dataset, DatasetStreamer};
+use genesis_core::output::{self, DatasetMetadata, TrajectoryRecord, DatasetStreamer};
 use rayon::prelude::*;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc;
+use arrow::array::{BooleanArray, Float64Array, StringArray, UInt32Array};
+use arrow::datatypes::{DataType, Field, Schema};
+use arrow::record_batch::RecordBatch;
+use parquet::arrow::arrow_writer::ArrowWriter;
 
 #[derive(Debug)]
 #[allow(dead_code)]
@@ -28,6 +33,10 @@ struct TrajectoryResult {
     velocity_at_retro: f64,
     altitude_at_retro: f64,
     chute_deployed: bool,
+    is_chute: bool,
+    is_retro: bool,
+    is_dust: bool,
+    is_clear: bool,
     telemetry: Vec<serde_json::Value>,
 }
 
@@ -222,10 +231,30 @@ fn run_single_trajectory(
         "UNKNOWN_FAILURE"
     };
 
-    // Seal the proof
+    // Exclusive partition: injected chute / retro / dust. Remainder is clear-atmosphere EDL.
+    // mission_success is a covariate, not the partition.
+    let (is_chute, is_retro, is_dust, is_clear) = if chute_failure {
+        (true, false, false, false)
+    } else if retro_failure {
+        (false, true, false, false)
+    } else if dust_storm {
+        (false, false, true, false)
+    } else {
+        (false, false, false, true)
+    };
+    let class = if is_chute {
+        "CHUTE"
+    } else if is_retro {
+        "RETRO"
+    } else if is_dust {
+        "DUST"
+    } else {
+        "CLEAR"
+    };
+
     proof.feed_f64(final_speed);
     proof.feed_str(phase);
-    proof.feed_str(if success { "SUCCESS" } else { "FAILURE" });
+    proof.feed_str(class);
     let proof_hash = proof.seal();
 
     TrajectoryResult {
@@ -247,6 +276,10 @@ fn run_single_trajectory(
         velocity_at_retro,
         altitude_at_retro,
         chute_deployed,
+        is_chute,
+        is_retro,
+        is_dust,
+        is_clear,
         telemetry,
     }
 }
@@ -255,11 +288,20 @@ fn main() {
     let args: Vec<String> = std::env::args().collect();
     let n_trajectories: u32 = args.get(1)
         .and_then(|s| s.parse().ok())
-        .unwrap_or(10_000);
+        .unwrap_or(2_500);
     let json_output = args.iter().any(|a| a == "--json");
     let json_path = args.iter().position(|a| a == "--out")
         .and_then(|i| args.get(i + 1))
         .cloned();
+    let parquet_path = args.iter().position(|a| a == "--parquet")
+        .and_then(|i| args.get(i + 1))
+        .cloned()
+        .unwrap_or_else(|| {
+            format!(
+                "{}/../../data/exports/sovereign/mars_edl.parquet",
+                env!("CARGO_MANIFEST_DIR")
+            )
+        });
 
     if !json_output {
         println!("═══════════════════════════════════════════════════════════");
@@ -381,6 +423,7 @@ fn main() {
 
     // === JSON STREAM EXITED HERE ===
     let elapsed = start.elapsed();
+    write_mars_parquet(&results, &run_proof, &parquet_path);
     
     if json_output || json_path.is_some() {
         if let Some(path) = &json_path {
@@ -492,4 +535,71 @@ fn main() {
     println!("  G^G MARS EDL MONTE CARLO — SEALED");
     println!("  {} trajectories × 1000Hz × SHA-256 = SOVEREIGN", total);
     println!("═══════════════════════════════════════════════════════════");
+}
+
+fn write_mars_parquet(results: &[TrajectoryResult], seal: &str, out: &str) {
+    if let Some(p) = std::path::Path::new(out).parent() {
+        std::fs::create_dir_all(p).ok();
+    }
+    let n = results.len();
+    let unique: std::collections::HashSet<&str> = results.iter().map(|r| r.proof_hash.as_str()).collect();
+    assert_eq!(unique.len(), n, "proof_hash must be unique");
+    let both = results.iter().filter(|r| {
+        (r.is_chute as u8) + (r.is_retro as u8) + (r.is_dust as u8) + (r.is_clear as u8) != 1
+    }).count();
+    assert_eq!(both, 0, "exclusive partition");
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("trajectory_id", DataType::UInt32, false),
+        Field::new("short_id", DataType::Utf8, false),
+        Field::new("initial_altitude_m", DataType::Float64, false),
+        Field::new("initial_velocity_ms", DataType::Float64, false),
+        Field::new("entry_angle_deg", DataType::Float64, false),
+        Field::new("final_velocity_ms", DataType::Float64, false),
+        Field::new("flight_time_s", DataType::Float64, false),
+        Field::new("max_deceleration_g", DataType::Float64, false),
+        Field::new("mission_success", DataType::Boolean, false),
+        Field::new("is_chute", DataType::Boolean, false),
+        Field::new("is_retro", DataType::Boolean, false),
+        Field::new("is_dust", DataType::Boolean, false),
+        Field::new("is_clear", DataType::Boolean, false),
+        Field::new("proof_hash", DataType::Utf8, false),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(UInt32Array::from(results.iter().map(|r| r.id).collect::<Vec<_>>())),
+            Arc::new(StringArray::from(results.iter().map(|r| r.short_id.as_str()).collect::<Vec<_>>())),
+            Arc::new(Float64Array::from(results.iter().map(|r| r.initial_altitude).collect::<Vec<_>>())),
+            Arc::new(Float64Array::from(results.iter().map(|r| r.initial_velocity).collect::<Vec<_>>())),
+            Arc::new(Float64Array::from(results.iter().map(|r| r.entry_angle_deg).collect::<Vec<_>>())),
+            Arc::new(Float64Array::from(results.iter().map(|r| r.final_velocity).collect::<Vec<_>>())),
+            Arc::new(Float64Array::from(results.iter().map(|r| r.flight_time).collect::<Vec<_>>())),
+            Arc::new(Float64Array::from(results.iter().map(|r| r.max_deceleration_g).collect::<Vec<_>>())),
+            Arc::new(BooleanArray::from(results.iter().map(|r| r.mission_success).collect::<Vec<_>>())),
+            Arc::new(BooleanArray::from(results.iter().map(|r| r.is_chute).collect::<Vec<_>>())),
+            Arc::new(BooleanArray::from(results.iter().map(|r| r.is_retro).collect::<Vec<_>>())),
+            Arc::new(BooleanArray::from(results.iter().map(|r| r.is_dust).collect::<Vec<_>>())),
+            Arc::new(BooleanArray::from(results.iter().map(|r| r.is_clear).collect::<Vec<_>>())),
+            Arc::new(StringArray::from(results.iter().map(|r| r.proof_hash.as_str()).collect::<Vec<_>>())),
+        ],
+    )
+    .expect("batch");
+    let file = std::fs::File::create(out).unwrap();
+    let props = output::parquet_receipt_properties(seal, "G^G mars EDL dual-regime v1.0");
+    let mut w = ArrowWriter::try_new(file, schema, Some(props)).unwrap();
+    w.write(&batch).unwrap();
+    w.close().unwrap();
+    let nf = n as f64;
+    let chute = results.iter().filter(|r| r.is_chute).count();
+    let retro = results.iter().filter(|r| r.is_retro).count();
+    let dust = results.iter().filter(|r| r.is_dust).count();
+    let clear = results.iter().filter(|r| r.is_clear).count();
+    eprintln!(
+        "  exclusive chute {chute} ({:.1}%)  retro {retro} ({:.1}%)  dust {dust} ({:.1}%)  clear {clear} ({:.1}%)",
+        100.0 * chute as f64 / nf,
+        100.0 * retro as f64 / nf,
+        100.0 * dust as f64 / nf,
+        100.0 * clear as f64 / nf
+    );
+    eprintln!("  unique proofs {n}  seal {seal}\n  parquet {out}");
 }

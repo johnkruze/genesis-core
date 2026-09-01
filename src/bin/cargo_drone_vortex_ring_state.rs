@@ -1,167 +1,182 @@
-//! 1000Hz GENESIS CORE MODULE: CARGO_DRONE_VORTEX_RING_STATE
-//! TARGET: Generic Commercial/Industrial Autonomous Systems
-//! CLASS: Generic Autonomous Platform
-//! SUBSYSTEM: Autopilot Battery Optimization AI 
-//! VULNERABILITY: To maximize range, the delivery AI attempts to spend as little energy as possible hovering. During a vertical resupply drop, the AI commands a rapid descent directly down its own vertical axis. Because the descent velocity exceeds the induced downwash velocity of the rotors, the drone physically enters a "Vortex Ring State" (settling with power). The rotors recycle their own turbulent air, causing a total collapse of aerodynamic lift. Unaware of the complex fluid dynamics, the AI simply commands maximum throttle to stop the fall, which actually *worsens* the vortex. The 500lb drone mathematically accelerates straight into the ground.
+//! Cargo-drone VRS. v_i = √(T/(2ρA)). Mix 0.2 v_i (outside) and 1.0 v_i (inside).
+//! Derate is a sampled policy (diesel twin). Clock: 50 Hz, 20 s from 80 m.
+//! Gates: in vortex ring vs ground impact. Organ: aero momentum theory. Not LBM.
 
-use rayon::prelude::*;
-use serde_json::json;
-use std::fs::{File, OpenOptions};
-use std::io::{BufWriter, Write};
-use std::sync::{Arc, Mutex};
+use genesis_core::output;
+use genesis_core::physics::aero::{
+    hover_induced_velocity_ms, in_vortex_ring, vrs_descent_ratio, vrs_efficiency, G, RHO_SL,
+};
+use genesis_core::proof::{self, ProofChain};
+use genesis_core::rng::Rng;
+use serde::Serialize;
+use std::sync::Arc;
 use std::time::Instant;
-use rand::Rng;
 
-const NUM_TRAJECTORIES: usize = 1_200_000;
-const HZ: f64 = 1000.0;
-const DT: f64 = 1.0 / HZ;
+use arrow::array::{BooleanArray, Float64Array, StringArray, UInt32Array};
+use arrow::datatypes::{DataType, Field, Schema};
+use arrow::record_batch::RecordBatch;
+use parquet::arrow::arrow_writer::ArrowWriter;
 
-// Heavy-Lift Cargo Drone Baseline
-const VRS_INDUCED_VELOCITY_RATIO_THRESHOLD: f64 = 0.5; // If descent rate > 50% of hover induced velocity, VRS begins
-const VRS_FULL_COLLAPSE_RATIO: f64 = 1.25; // If descent rate > 1.25x induced velocity, total lift collapse (<0.1x efficiency)
+const DEFAULT_N: usize = 2500;
+const DT: f64 = 0.02;
+const HORIZON_S: f64 = 20.0;
+const MASS: f64 = 225.0;
+const AREA: f64 = 4.0;
 
-fn main() {
-    let start_time = Instant::now();
-    let export_dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../../data/exports/sovereign");
-    std::fs::create_dir_all(export_dir).unwrap();
-    let file = OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .open(format!("{}/cargo_drone_vortex_ring_state.json", export_dir))
-        .unwrap();
-    let mut writer = BufWriter::new(file);
+#[derive(Debug, Serialize)]
+struct Run {
+    id: u32,
+    short_id: String,
+    target_descent_ratio: f64,
+    max_descent_ratio: f64,
+    vrs_efficiency: f64,
+    is_vrs: bool,
+    is_ground_impact: bool,
+    proof_hash: String,
+}
 
-    println!("=========================================================");
-    println!("G^G SOVEREIGN PHYSICS ENGINE: 1000Hz AERODYNAMIC AUDIT");
-    println!("TARGET: GENERIC COMMERCIAL SYSTEMS");
-    println!("MODULE: CARGO_DRONE_VORTEX_RING_STATE");
-    println!("EXECUTING 1,200,000 TRAJECTORIES...");
-    println!("=========================================================\n");
+fn run_one(id: u32, rng: &mut Rng) -> Run {
+    let short_id = output::short_id(rng);
+    // Mix: 55% outside the ring, 45% inside.
+    let ratio_cmd = if rng.chance(0.55) {
+        rng.range(0.12, 0.42)
+    } else {
+        rng.range(0.70, 1.25)
+    };
+    let derate = rng.range(0.0, 1.0);
 
-    let failed_count = Arc::new(Mutex::new(0usize));
+    let mut proof = ProofChain::new();
+    proof.seed(&id.to_le_bytes());
+    proof.feed_f64(ratio_cmd);
+    proof.feed_f64(derate);
 
-    let results: Vec<serde_json::Value> = (0..NUM_TRAJECTORIES).into_par_iter().map(|i| {
-        let mut rng = rand::thread_rng();
-        
-        let mut drone_destroyed = false;
-        let mut max_descent_rate_ms = 0.0;
-        
-        // Drone physical parameters
-        let drone_mass_kg: f64 = 225.0; // ~500 lbs
-        let rotor_area_m2 = 4.0; // Total swept area of 4 large props
-        let air_density = 1.225; // Sea level
-        let gravity = 9.81;
-        
-        // Hover Physics: Induced velocity (vi) = sqrt( Thrust / (2 * rho * A) )
-        // At strict hover, Thrust = Weight
-        let hover_thrust_n = drone_mass_kg * gravity;
-        let hover_induced_velocity_ms = (hover_thrust_n / (2.0 * air_density * rotor_area_m2)).sqrt();
-        
-        let mut drone_altitude_m = 100.0; // Starting 100m directly above the drop zone
-        let mut drone_velocity_ms = 0.0; // Positive is UP, negative is DOWN
-        
-        // The AI is trained to land AS FAST AS POSSIBLE to save battery.
-        // The AI targets a very aggressive descent trajectory to save battery.
-        let ai_target_descent_velocity = -12.0 - rng.gen_range(0.0..6.0); // -12 to -18 m/s descent
-        
-        let mut pid_integral = 0.0;
-        let mut vrs_severity = 1.0; // 1.0 = Normal Lift, 0.1 = Total Lift Loss
-
-        for _tick in 0..(25.0 * HZ) as usize { // Up to 25 seconds
-            
-            // 1. Vortex Ring State (VRS) Fluid Dynamics
-            // The drone is descending into its own prop wash.
-            // Descent velocity (Vd) is positive mathematically if we look at the magnitude here.
-            let descent_rate = -drone_velocity_ms; 
-            
-            if descent_rate > max_descent_rate_ms {
-                max_descent_rate_ms = descent_rate;
-            }
-            
-            let velocity_ratio = descent_rate / hover_induced_velocity_ms;
-            
-            // Simplified Glauert empirical curve for VRS lift collapse
-            if velocity_ratio > VRS_INDUCED_VELOCITY_RATIO_THRESHOLD && velocity_ratio < VRS_FULL_COLLAPSE_RATIO {
-                // Inside the ring state, lift drops off dramatically
-                // The prop blades are just churning dirty air in a donut shape
-                let vrs_penetration = (velocity_ratio - VRS_INDUCED_VELOCITY_RATIO_THRESHOLD) / (VRS_FULL_COLLAPSE_RATIO - VRS_INDUCED_VELOCITY_RATIO_THRESHOLD);
-                vrs_severity = 1.0 - (vrs_penetration * 0.9); // Drops from 1.0 to 0.1 efficiency
-            } else if velocity_ratio >= VRS_FULL_COLLAPSE_RATIO {
-                vrs_severity = 0.1; // Deep stall, basically zero aerodynamic lift
-            } else {
-                vrs_severity = 1.0;
-            }
-            
-            // 2. AI Autopilot PID Loop
-            // The AI wants to hold `ai_target_descent_velocity` until 10 meters, then flare.
-            let current_target_vel = if drone_altitude_m > 15.0 {
-                ai_target_descent_velocity
-            } else {
-                -1.0 // Slow down to 1 m/s for soft touchdown
-            };
-            
-            let velocity_error = current_target_vel - drone_velocity_ms; 
-            pid_integral += velocity_error * DT;
-            
-            let k_p = 300.0;
-            let k_i = 50.0;
-            
-            // AI commands throttle (thrust in Newtons)
-            // Base hover thrust + adjustments
-            let mut commanded_thrust_n = hover_thrust_n + (k_p * velocity_error) + (k_i * pid_integral);
-            
-            // Motors have physical limits (e.g. 2x thrust to weight ratio max)
-            if commanded_thrust_n > hover_thrust_n * 2.0 { commanded_thrust_n = hover_thrust_n * 2.0; }
-            if commanded_thrust_n < 0.0 { commanded_thrust_n = 0.0; }
-            
-            // FATAL FLAW: The AI thinks commanding 2x Thrust will save it.
-            // BUT, because we are in VRS, the actual physical lift generated is multiplied by `vrs_severity`.
-            // More throttle literally just spins the vortex faster without creating upward force.
-            let actual_lift_generated_n = commanded_thrust_n * vrs_severity;
-            
-            // 3. Kinematics
-            let net_force_n = actual_lift_generated_n - hover_thrust_n; // hover_thrust_n is weight
-            let acceleration_ms2 = net_force_n / drone_mass_kg;
-            
-            drone_velocity_ms += acceleration_ms2 * DT;
-            drone_altitude_m += drone_velocity_ms * DT;
-            
-            if drone_altitude_m <= 0.0 {
-                // Impact. Determine if crash.
-                // A safe landing is max -2.0 m/s
-                if drone_velocity_ms < -3.0 {
-                    drone_destroyed = true;
-                }
-                break;
-            }
+    let hover_t = MASS * G;
+    let vi = hover_induced_velocity_ms(hover_t, RHO_SL, AREA);
+    let mut v_cmd = ratio_cmd * vi; // positive descent
+    let mut z = 80.0;
+    let mut vz = 0.0; // positive down
+    let mut peak_ratio: f64 = 0.0;
+    let mut min_eff: f64 = 1.0;
+    let mut saw_vrs = false;
+    let mut impact = false;
+    let mut integ = 0.0;
+    let steps = (HORIZON_S / DT) as usize;
+    for k in 0..steps {
+        let ratio = vrs_descent_ratio(vz, vi);
+        peak_ratio = peak_ratio.max(ratio);
+        if in_vortex_ring(ratio) {
+            saw_vrs = true;
+            // Derate: cut commanded descent once in the ring (sampled policy).
+            v_cmd = ratio_cmd * vi * (0.25 + 0.75 * (1.0 - derate));
         }
-
-        if drone_destroyed {
-            let mut fc = failed_count.lock().unwrap();
-            *fc += 1;
+        let eff = vrs_efficiency(ratio);
+        min_eff = min_eff.min(eff);
+        let err = v_cmd - vz; // want more descent → less thrust
+        integ += err * DT;
+        let t_cmd = (hover_t - err * 90.0 - integ * 14.0).clamp(0.15 * hover_t, hover_t * 1.6);
+        let t_act = t_cmd * eff;
+        let acc = G - t_act / MASS; // positive down
+        vz += acc * DT;
+        z -= vz * DT;
+        if z <= 0.0 {
+            impact = vz > 8.0; // crater, not a 3 m/s arrival
+            break;
         }
-
-        json!({
-            "trajectory_id": i,
-            "target_descent_ms": f64::trunc(ai_target_descent_velocity.abs() * 10.0) / 10.0,
-            "impact_velocity_ms": f64::trunc(drone_velocity_ms.abs() * 10.0) / 10.0,
-            "survived": !drone_destroyed,
-            "failure_mode": if !drone_destroyed { "NOMINAL" } else { "VORTEX_RING_STATE_DYNAMIC_STALL_CRASH" },
-            "cryptographic_seal": format!("sha256:cargo_drone_vrs_{}", i)
-        })
-    }).collect();
-
-    for res in results {
-        writeln!(writer, "{}", res.to_string()).unwrap();
+        if k % 25 == 0 {
+            proof.feed_f64(ratio);
+        }
     }
 
-    let fc = *failed_count.lock().unwrap();
-    let failure_rate = (fc as f64 / NUM_TRAJECTORIES as f64) * 100.0;
-    
-    println!("CARGO_DRONE_VORTEX_RING_STATE PHYSICS AUDIT COMPLETE.");
-    println!("TOTAL TRAJECTORIES: {:?}", NUM_TRAJECTORIES);
-    println!("CATASTROPHIC STALL CRASH RATE: {} ({:.2}%)", fc, failure_rate);
-    println!("EXECUTION TIME: {:?}", start_time.elapsed());
-    println!("SEALED TO: {}/cargo_drone_vortex_ring_state.json\n", export_dir);
+    proof.feed_f64(peak_ratio);
+    proof.feed_str(if impact {
+        "IMPACT"
+    } else if saw_vrs {
+        "VRS_HELD"
+    } else {
+        "OUTSIDE"
+    });
+
+    Run {
+        id,
+        short_id,
+        target_descent_ratio: (ratio_cmd * 100.0).round() / 100.0,
+        max_descent_ratio: (peak_ratio * 100.0).round() / 100.0,
+        vrs_efficiency: (min_eff * 1000.0).round() / 1000.0,
+        // Exclusive three-way aligned with proof: VRS_HELD / IMPACT / OUTSIDE.
+        is_vrs: saw_vrs && !impact,
+        is_ground_impact: impact,
+        proof_hash: proof.seal(),
+    }
+}
+
+fn main() {
+    let args: Vec<String> = std::env::args().collect();
+    let n: usize = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(DEFAULT_N);
+    let out = args
+        .iter()
+        .position(|a| a == "--parquet")
+        .and_then(|i| args.get(i + 1))
+        .cloned()
+        .unwrap_or_else(|| {
+            format!(
+                "{}/../../data/exports/sovereign/cargo_drone_vortex_ring_state.parquet",
+                env!("CARGO_MANIFEST_DIR")
+            )
+        });
+
+    println!("====================================================================");
+    println!("  G^G: VRS  (v_i=√(T/2ρA), mix 0.2 v_i / 1.0 v_i, 50 Hz)");
+    println!("  n={n}  ring ratio>0.5  impact z=0");
+    println!("====================================================================\n");
+
+    let t0 = Instant::now();
+    let mut rng = Rng::new(0x5E77_1100);
+    let rows: Vec<Run> = (0..n as u32).map(|i| run_one(i, &mut rng)).collect();
+    let proofs: Vec<String> = rows.iter().map(|r| r.proof_hash.clone()).collect();
+    let seal = proof::seal_run(&proofs);
+    if let Some(p) = std::path::Path::new(&out).parent() {
+        std::fs::create_dir_all(p).ok();
+    }
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("trajectory_id", DataType::UInt32, false),
+        Field::new("short_id", DataType::Utf8, false),
+        Field::new("target_descent_ratio", DataType::Float64, false),
+        Field::new("max_descent_ratio", DataType::Float64, false),
+        Field::new("vrs_efficiency", DataType::Float64, false),
+        Field::new("is_vrs", DataType::Boolean, false),
+        Field::new("is_ground_impact", DataType::Boolean, false),
+        Field::new("proof_hash", DataType::Utf8, false),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(UInt32Array::from(rows.iter().map(|r| r.id).collect::<Vec<_>>())),
+            Arc::new(StringArray::from(rows.iter().map(|r| r.short_id.as_str()).collect::<Vec<_>>())),
+            Arc::new(Float64Array::from(rows.iter().map(|r| r.target_descent_ratio).collect::<Vec<_>>())),
+            Arc::new(Float64Array::from(rows.iter().map(|r| r.max_descent_ratio).collect::<Vec<_>>())),
+            Arc::new(Float64Array::from(rows.iter().map(|r| r.vrs_efficiency).collect::<Vec<_>>())),
+            Arc::new(BooleanArray::from(rows.iter().map(|r| r.is_vrs).collect::<Vec<_>>())),
+            Arc::new(BooleanArray::from(rows.iter().map(|r| r.is_ground_impact).collect::<Vec<_>>())),
+            Arc::new(StringArray::from(rows.iter().map(|r| r.proof_hash.as_str()).collect::<Vec<_>>())),
+        ],
+    )
+    .expect("batch");
+    let file = std::fs::File::create(&out).unwrap();
+    let props = output::parquet_receipt_properties(&seal, "G^G VRS momentum dual-regime v3.1");
+    let mut w = ArrowWriter::try_new(file, schema, Some(props)).unwrap();
+    w.write(&batch).unwrap();
+    w.close().unwrap();
+    let n_f = n as f64;
+    let v = rows.iter().filter(|r| r.is_vrs).count();
+    let i = rows.iter().filter(|r| r.is_ground_impact).count();
+    let outside = n - v - i;
+    println!(
+        "  vrs-held {v} ({:.1}%)  crater {i} ({:.1}%)  outside {outside} ({:.1}%)",
+        100.0 * v as f64 / n_f,
+        100.0 * i as f64 / n_f,
+        100.0 * outside as f64 / n_f
+    );
+    println!("  seal {seal}");
+    println!("  parquet {out}");
+    println!("  {:?}", t0.elapsed());
 }

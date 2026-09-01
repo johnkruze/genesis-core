@@ -1,137 +1,164 @@
-//! 1000Hz GENESIS CORE MODULE: TRACK_PIN_GALLING
-//! TARGET: Generic Commercial/Industrial Autonomous Systems
-//! CLASS: Generic Autonomous Platform
-//! SUBSYSTEM: LLM/Transformer-based Pathfinding
-//! VULNERABILITY: Deep learning pathfinding models often exhibit "micro-stutters"—high frequency oscillating torque commands sent to the drive sprockets as the model equivocates between two similar paths. For a 30-ton tracked vehicle, commanding 10Hz alternating micro-torques is catastrophic. The oscillation physically shears the hydrodynamic lubrication film off the steel track pins. Without lubrication, the immense mass of the tank causes immediate metal-on-metal galling, seizing the track and immobilizing the vehicle.
+//! Track pin / bushing. Point-contact Hamrock as reduced-order for one Hertz patch.
+//! Sharing: F_hertz = T / 20. Clock: 200 h march. Gates: Λ<1 breakdown vs wear seizure.
+//! Comment 400–1200 MPa was a lie — projected-area pressure is ~5–20 MPa.
 
-use rayon::prelude::*;
-use serde_json::json;
-use std::fs::{File, OpenOptions};
-use std::io::{BufWriter, Write};
-use std::sync::{Arc, Mutex};
+use genesis_core::output;
+use genesis_core::physics::tribology::{
+    ehl_minimum_film_thickness_um, lambda_lubrication_ratio, lambda_wear_multiplier,
+    TribologyAgingParams, TribologySurfaceState,
+};
+use genesis_core::proof::{self, ProofChain};
+use genesis_core::rng::Rng;
+use serde::Serialize;
+use std::sync::Arc;
 use std::time::Instant;
-use rand::Rng;
 
-const NUM_TRAJECTORIES: usize = 1_200_000;
-const HZ: f64 = 1000.0;
-const DT: f64 = 1.0 / HZ;
+use arrow::array::{BooleanArray, Float64Array, StringArray, UInt32Array};
+use arrow::datatypes::{DataType, Field, Schema};
+use arrow::record_batch::RecordBatch;
+use parquet::arrow::arrow_writer::ArrowWriter;
 
-// Tracked Vehicle Pin Baseline
-const PIN_SEIZURE_TEMPERATURE_C: f64 = 350.0; // Point where cold welding / severe galling seizes the steel track pin
+const DEFAULT_N: usize = 2500;
+const SIGMA_UM: f64 = 0.25;
+const SHARE: f64 = 20.0;
 
-fn main() {
-    let start_time = Instant::now();
-    let export_dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../../data/exports/sovereign");
-    std::fs::create_dir_all(export_dir).unwrap();
-    let file = OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .open(format!("{}/track_pin_galling.json", export_dir))
-        .unwrap();
-    let mut writer = BufWriter::new(file);
+#[derive(Debug, Serialize)]
+struct Run {
+    id: u32,
+    short_id: String,
+    track_tension_kn: f64,
+    lambda_ratio: f64,
+    cumulative_wear_um: f64,
+    is_lubrication_breakdown: bool,
+    is_pin_seizure_failed: bool,
+    proof_hash: String,
+}
 
-    println!("=========================================================");
-    println!("G^G SOVEREIGN PHYSICS ENGINE: 1000Hz TRIBOLOGICAL AUDIT");
-    println!("TARGET: GENERIC COMMERCIAL SYSTEMS");
-    println!("MODULE: TRACK_PIN_GALLING");
-    println!("EXECUTING 1,200,000 TRAJECTORIES...");
-    println!("=========================================================\n");
+fn run_one(id: u32, rng: &mut Rng) -> Run {
+    let short_id = output::short_id(rng);
+    let t_kn = rng.range(30.0, 160.0);
+    let v_track = rng.range(1.5, 8.0);
+    let eta = rng.range(0.08, 0.40);
 
-    let failed_count = Arc::new(Mutex::new(0usize));
+    let mut proof = ProofChain::new();
+    proof.seed(&id.to_le_bytes());
+    proof.feed_f64(t_kn);
+    proof.feed_f64(v_track);
+    proof.feed_f64(eta);
 
-    let results: Vec<serde_json::Value> = (0..NUM_TRAJECTORIES).into_par_iter().map(|i| {
-        let mut rng = rand::thread_rng();
-        
-        let mut track_seized = false;
-        
-        // Simulating the autonomous tank driving through a dense forest where pathing is highly ambiguous
-        let driving_speed_ms = rng.gen_range(5.0..10.0);
-        let ai_stutter_frequency_hz = rng.gen_range(5.0..25.0); // The rate at which the transformer model changes its mind
-        
-        let mut pin_temperature_c = 40.0; // Normal operating temp
-        let pin_thermal_mass = 0.05; // The microscopic contact point where asperities collide taking all the heat
-        
-        // Fluid film properties
-        let mut lubrication_film_thickness_um = 15.0; // 15 microns of oil/grease separating the metal
-        
-        for tick in 0..(60.0 * HZ) as usize { // 60 seconds of driving
-            
-            // The transformer model constantly commands micro-left and micro-right adjustments
-            let ai_steering_stutter = (tick as f64 * DT * ai_stutter_frequency_hz * std::f64::consts::PI * 2.0).sin();
-            
-            // Physical impact of the stutter
-            // Rapidly reversing torque directions destroys the hydrodynamic wedge that keeps the oil in place
-            let film_shear_rate_s_1 = (ai_steering_stutter.abs() * 5000.0) + (driving_speed_ms * 10.0);
-            
-            // If the shear rate exceeds the film's stability threshold, the oil is squeezed out of the pin joint
-            if film_shear_rate_s_1 > 500.0 {
-                lubrication_film_thickness_um -= 0.1 * DT;
-                if lubrication_film_thickness_um < 0.0 {
-                    lubrication_film_thickness_um = 0.0;
-                }
-            }
+    let f_hertz = (t_kn * 1e3) / SHARE;
+    let u = (v_track / 0.35) * 0.0225;
+    let h = ehl_minimum_film_thickness_um(eta, u, 0.0225, f_hertz, 210.0, 25.0);
+    let lambda = lambda_lubrication_ratio(h, SIGMA_UM);
+    let breakdown = lambda < 1.0;
+    let scale = lambda_wear_multiplier(lambda);
+    // Hertz patch pressure, not projected-area 5–20 MPa (that never seizes).
+    let p_mpa = (f_hertz / 12.0).clamp(60.0, 400.0);
 
-            // Frictional Heating
-            // F_f = mu * N
-            let normal_force_n = 300_000.0 / 80.0; // Roughly the weight of the tank distributed across the ground-contact pins
-            
-            let coefficient_of_friction = if lubrication_film_thickness_um > 1.0 {
-                // Hydrodynamic/Mixed lubrication (Smooth)
-                0.05
-            } else {
-                // Boundary lubrication / Metal-on-Metal (Violent heat generation)
-                1.2 // Track pins without grease essentially tear themselves apart instantly
-            };
-            
-            let frictional_force_n = coefficient_of_friction * normal_force_n;
-            
-            // Power = Force * Velocity
-            // During micro-stutters, the local slip velocity on the pin face is very high
-            let pin_sliding_velocity_ms = (ai_steering_stutter.abs() * 2.0) + (driving_speed_ms * 0.1); 
-            let heating_power_watts = frictional_force_n * pin_sliding_velocity_ms;
-
-            // Thermal integration
-            let convective_cooling_watts = (pin_temperature_c - 20.0) * 0.1; // Surrounded by steel/mud, cooling is terrible
-            
-            // Artificial multiplier to account for the catastrophic heat of steel scraping steel at 30 tons
-            let catastrophic_heat_multiplier = if lubrication_film_thickness_um < 1.0 { 50.0 } else { 1.0 };
-            
-            pin_temperature_c += (((heating_power_watts * catastrophic_heat_multiplier) - convective_cooling_watts) / pin_thermal_mass) * DT;
-
-            // If the physical pins get hot enough while in metal-on-metal contact, they undergo cold-welding (galling)
-            if pin_temperature_c > PIN_SEIZURE_TEMPERATURE_C {
-                track_seized = true;
-                break;
-            }
+    let mut state = TribologySurfaceState::new(p_mpa, u, 313.15);
+    let params = TribologyAgingParams::default();
+    for _ in 0..100 {
+        let before = state.cumulative_galling_wear_um;
+        state.step(&params, 2.0);
+        let dw = state.cumulative_galling_wear_um - before;
+        state.cumulative_galling_wear_um = before + dw * scale;
+        if state.cumulative_galling_wear_um > 45.0 {
+            state.is_galling_seizure_failed = true;
+            break;
         }
-
-        if track_seized {
-            let mut fc = failed_count.lock().unwrap();
-            *fc += 1;
-        }
-
-        json!({
-            "trajectory_id": i,
-            "ai_stutter_frequency_hz": f64::trunc(ai_stutter_frequency_hz * 10.0) / 10.0,
-            "lubrication_film_remaining_um": f64::trunc(lubrication_film_thickness_um * 10.0) / 10.0,
-            "max_pin_temperature_c": f64::trunc(pin_temperature_c * 10.0) / 10.0,
-            "survived": !track_seized,
-            "failure_mode": if !track_seized { "NOMINAL" } else { "AI_STUTTER_INDUCED_GALLING" },
-            "cryptographic_seal": format!("sha256:track_pin_galling_{}", i)
-        })
-    }).collect();
-
-    for res in results {
-        writeln!(writer, "{}", res.to_string()).unwrap();
+        state.is_galling_seizure_failed = false;
     }
 
-    let fc = *failed_count.lock().unwrap();
-    let failure_rate = (fc as f64 / NUM_TRAJECTORIES as f64) * 100.0;
-    
-    println!("TRACK_PIN_GALLING PHYSICS AUDIT COMPLETE.");
-    println!("TOTAL TRAJECTORIES: {:?}", NUM_TRAJECTORIES);
-    println!("CATASTROPHIC TRACK SEIZURE RATE: {} ({:.2}%)", fc, failure_rate);
-    println!("EXECUTION TIME: {:?}", start_time.elapsed());
-    println!("SEALED TO: {}/track_pin_galling.json\n", export_dir);
+    proof.feed_f64(lambda);
+    proof.feed_f64(state.cumulative_galling_wear_um);
+    proof.feed_str(if state.is_galling_seizure_failed {
+        "SEIZURE"
+    } else if breakdown {
+        "BREAKDOWN"
+    } else {
+        "EHL"
+    });
+
+    Run {
+        id,
+        short_id,
+        track_tension_kn: (t_kn * 10.0).round() / 10.0,
+        lambda_ratio: (lambda * 100.0).round() / 100.0,
+        cumulative_wear_um: (state.cumulative_galling_wear_um * 100.0).round() / 100.0,
+        is_lubrication_breakdown: breakdown,
+        is_pin_seizure_failed: state.is_galling_seizure_failed,
+        proof_hash: proof.seal(),
+    }
+}
+
+fn main() {
+    let args: Vec<String> = std::env::args().collect();
+    let n: usize = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(DEFAULT_N);
+    let out = args
+        .iter()
+        .position(|a| a == "--parquet")
+        .and_then(|i| args.get(i + 1))
+        .cloned()
+        .unwrap_or_else(|| {
+            format!(
+                "{}/../../data/exports/sovereign/track_pin_galling.parquet",
+                env!("CARGO_MANIFEST_DIR")
+            )
+        });
+
+    println!("====================================================================");
+    println!("  G^G: TRACK PIN EHL  (F_hertz = T/20, 200 h)");
+    println!("  n={n}  breakdown Λ<1  seize wear≥45 µm");
+    println!("====================================================================\n");
+
+    let t0 = Instant::now();
+    let mut rng = Rng::new(0x7184_0004);
+    let rows: Vec<Run> = (0..n as u32).map(|i| run_one(i, &mut rng)).collect();
+    let proofs: Vec<String> = rows.iter().map(|r| r.proof_hash.clone()).collect();
+    let seal = proof::seal_run(&proofs);
+
+    if let Some(p) = std::path::Path::new(&out).parent() {
+        std::fs::create_dir_all(p).ok();
+    }
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("trajectory_id", DataType::UInt32, false),
+        Field::new("short_id", DataType::Utf8, false),
+        Field::new("track_tension_kn", DataType::Float64, false),
+        Field::new("lambda_ratio", DataType::Float64, false),
+        Field::new("cumulative_wear_um", DataType::Float64, false),
+        Field::new("is_lubrication_breakdown", DataType::Boolean, false),
+        Field::new("is_pin_seizure_failed", DataType::Boolean, false),
+        Field::new("proof_hash", DataType::Utf8, false),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(UInt32Array::from(rows.iter().map(|r| r.id).collect::<Vec<_>>())),
+            Arc::new(StringArray::from(rows.iter().map(|r| r.short_id.as_str()).collect::<Vec<_>>())),
+            Arc::new(Float64Array::from(rows.iter().map(|r| r.track_tension_kn).collect::<Vec<_>>())),
+            Arc::new(Float64Array::from(rows.iter().map(|r| r.lambda_ratio).collect::<Vec<_>>())),
+            Arc::new(Float64Array::from(rows.iter().map(|r| r.cumulative_wear_um).collect::<Vec<_>>())),
+            Arc::new(BooleanArray::from(rows.iter().map(|r| r.is_lubrication_breakdown).collect::<Vec<_>>())),
+            Arc::new(BooleanArray::from(rows.iter().map(|r| r.is_pin_seizure_failed).collect::<Vec<_>>())),
+            Arc::new(StringArray::from(rows.iter().map(|r| r.proof_hash.as_str()).collect::<Vec<_>>())),
+        ],
+    )
+    .expect("batch");
+    let file = std::fs::File::create(&out).unwrap();
+    let props = output::parquet_receipt_properties(&seal, "G^G track-pin EHL dual-regime v3.0");
+    let mut w = ArrowWriter::try_new(file, schema, Some(props)).unwrap();
+    w.write(&batch).unwrap();
+    w.close().unwrap();
+
+    let n_f = n as f64;
+    let b = rows.iter().filter(|r| r.is_lubrication_breakdown).count();
+    let s = rows.iter().filter(|r| r.is_pin_seizure_failed).count();
+    println!(
+        "  breakdown {b} ({:.1}%)  seizure {s} ({:.1}%)",
+        100.0 * b as f64 / n_f,
+        100.0 * s as f64 / n_f
+    );
+    println!("  seal {seal}");
+    println!("  parquet {out}");
+    println!("  {:?}", t0.elapsed());
 }

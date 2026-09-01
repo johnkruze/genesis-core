@@ -1,118 +1,134 @@
-//! 1000Hz GENESIS CORE MODULE: THERMAL_SEAL_FRICTION
-//! TARGET: Generic Commercial/Industrial Autonomous Systems
-//! CLASS: Quadrupedal Robotics
-//! SUBSYSTEM: Hazardous Environment Deep RL 
-//! VULNERABILITY: RL policies trained in perfect simulators do not model the extreme tribological friction changes inside pneumatic/electric actuator seals when temperatures fluctuate by 40 degrees on a North Sea oil rig.
+//! Nitrile shaft-seal friction vs temperature. Constitutive (Tg = −25 °C).
+//! Sub-Tg stiffening, above-Tg bore expansion. Organ: elastomeric_seal_friction_surge.
+//! Gates: μ ≥ 0.18 surge (1.5×) vs μ ≥ 0.30 stall (2.5×). Envelope −50 °C to 95 °C.
 
-use rayon::prelude::*;
-use serde_json::json;
-use std::fs::{File, OpenOptions};
-use std::io::{BufWriter, Write};
-use std::sync::{Arc, Mutex};
+use genesis_core::output;
+use genesis_core::physics::thermal::elastomeric_seal_friction_surge;
+use genesis_core::proof::{self, ProofChain};
+use genesis_core::rng::Rng;
+use serde::Serialize;
+use std::sync::Arc;
 use std::time::Instant;
-use rand::Rng;
 
-const NUM_TRAJECTORIES: usize = 1_200_000;
-const HZ: f64 = 1000.0;
-const DT: f64 = 1.0 / HZ;
+use arrow::array::{BooleanArray, Float64Array, StringArray, UInt32Array};
+use arrow::datatypes::{DataType, Field, Schema};
+use arrow::record_batch::RecordBatch;
+use parquet::arrow::arrow_writer::ArrowWriter;
 
-// Quadruped Actuator Baseline
-const NOMINAL_SEAL_FRICTION: f64 = 0.05; // Base friction coefficient inside the actuator at 20C
-const FATAL_PHASE_LAG_MS: f64 = 15.0; // The RL policy expects movement. If the leg is stuck for >15ms holding a dynamic pose, the robot tips over.
+const DEFAULT_N: usize = 2500;
+const MU0: f64 = 0.12;
+const TG_C: f64 = -25.0;
+const SURGE: f64 = 0.18;
+const STALL: f64 = 0.30;
+
+#[derive(Debug, Serialize)]
+struct Run {
+    id: u32,
+    short_id: String,
+    operating_temp_c: f64,
+    effective_friction_mu: f64,
+    is_friction_surge: bool,
+    is_actuator_stalled: bool,
+    proof_hash: String,
+}
+
+fn run_one(id: u32, rng: &mut Rng) -> Run {
+    let short_id = output::short_id(rng);
+    let t_c = rng.range(-50.0, 95.0);
+
+    let mut proof = ProofChain::new();
+    proof.seed(&id.to_le_bytes());
+    proof.feed_f64(t_c);
+
+    let mu = elastomeric_seal_friction_surge(t_c, TG_C, MU0);
+    let surge = mu >= SURGE;
+    let stall = mu >= STALL;
+    proof.feed_f64(mu);
+    proof.feed_str(if stall {
+        "STALLED"
+    } else if surge {
+        "SURGED"
+    } else {
+        "NOMINAL"
+    });
+
+    Run {
+        id,
+        short_id,
+        operating_temp_c: (t_c * 10.0).round() / 10.0,
+        effective_friction_mu: (mu * 1000.0).round() / 1000.0,
+        is_friction_surge: surge,
+        is_actuator_stalled: stall,
+        proof_hash: proof.seal(),
+    }
+}
 
 fn main() {
-    let start_time = Instant::now();
-    let export_dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../../data/exports/sovereign");
-    std::fs::create_dir_all(export_dir).unwrap();
-    let file = OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .open(format!("{}/thermal_seal_friction.json", export_dir))
-        .unwrap();
-    let mut writer = BufWriter::new(file);
+    let args: Vec<String> = std::env::args().collect();
+    let n: usize = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(DEFAULT_N);
+    let out = args
+        .iter()
+        .position(|a| a == "--parquet")
+        .and_then(|i| args.get(i + 1))
+        .cloned()
+        .unwrap_or_else(|| {
+            format!(
+                "{}/../../data/exports/sovereign/thermal_seal_friction.parquet",
+                env!("CARGO_MANIFEST_DIR")
+            )
+        });
 
-    println!("=========================================================");
-    println!("G^G SOVEREIGN PHYSICS ENGINE: 1000Hz TRIBOLOGY AUDIT");
-    println!("TARGET: GENERIC COMMERCIAL SYSTEMS");
-    println!("MODULE: THERMAL_SEAL_FRICTION");
-    println!("EXECUTING 1,200,000 TRAJECTORIES...");
-    println!("=========================================================\n");
+    println!("====================================================================");
+    println!("  G^G: NITRILE SEAL FRICTION  (Tg={TG_C} °C)");
+    println!("  n={n}  surge μ≥{SURGE}  stall μ≥{STALL}");
+    println!("====================================================================\n");
 
-    let failed_count = Arc::new(Mutex::new(0usize));
+    let t0 = Instant::now();
+    let mut rng = Rng::new(0x9923_0008);
+    let rows: Vec<Run> = (0..n as u32).map(|i| run_one(i, &mut rng)).collect();
+    let proofs: Vec<String> = rows.iter().map(|r| r.proof_hash.clone()).collect();
+    let seal = proof::seal_run(&proofs);
 
-    let results: Vec<serde_json::Value> = (0..NUM_TRAJECTORIES).into_par_iter().map(|i| {
-        let mut rng = rand::thread_rng();
-        
-        // Simulating deployment on a North Sea Rig in Winter
-        // Nominal idealized training temp: 20C. Physical deployment temp: -15C to 5C.
-        let ambient_temp_c = rng.gen_range(-15.0..5.0);
-        
-        // Polymer seals (PTFE / Rubber) contract exponentially as they approach freezing.
-        // The stiction (static friction) required to break the actuator free spikes.
-        let delta_temp = 20.0 - ambient_temp_c;
-        let seal_friction_multiplier = 1.0 + (delta_temp * 0.15) * rng.gen_range(0.8..1.2); 
-        let actual_seal_stiction = NOMINAL_SEAL_FRICTION * seal_friction_multiplier;
-
-        let mut max_lag_experienced_ms = 0.0;
-        let mut tip_over = false;
-
-        // RL Policy attempts a dynamic maneuver (e.g. stepping over a pipe)
-        // It outputs a torque command expecting immediate kinematic response
-        for _tick in 0..(1.0 * HZ) as usize { 
-            
-            // Torque command ramps up
-            let commanded_torque = rng.gen_range(10.0..50.0); 
-            
-            // To overcome the thermal stiction, a larger threshold of torque is required.
-            // In idealized trainers, this threshold is static.
-            let physical_breakaway_force = actual_seal_stiction * 500.0; // Arbitrary torque map
-            
-            // The time it takes for the motor to ramp up enough current to overcome this unmodeled stiction
-            let physical_lag_ms = if commanded_torque < physical_breakaway_force {
-                // Motor is stalled against the frozen seal
-                (physical_breakaway_force - commanded_torque) * 1.5
-            } else {
-                0.0 // Moves freely once broken free
-            };
-
-            if physical_lag_ms > max_lag_experienced_ms {
-                max_lag_experienced_ms = physical_lag_ms;
-            }
-
-            if max_lag_experienced_ms > FATAL_PHASE_LAG_MS {
-                tip_over = true;
-                break;
-            }
-        }
-
-        if tip_over {
-            let mut fc = failed_count.lock().unwrap();
-            *fc += 1;
-        }
-
-        json!({
-            "trajectory_id": i,
-            "ambient_temperature_C": f64::trunc(ambient_temp_c * 100.0) / 100.0,
-            "simulated_stiction_mu": NOMINAL_SEAL_FRICTION,
-            "actual_thermal_stiction_mu": f64::trunc(actual_seal_stiction * 100.0) / 100.0,
-            "max_actuator_lag_ms": f64::trunc(max_lag_experienced_ms * 100.0) / 100.0,
-            "survived": !tip_over,
-            "failure_mode": if !tip_over { "NOMINAL" } else { "THERMAL_STICTION_PHASE_LAG_TIP_OVER" },
-            "cryptographic_seal": format!("sha256:thermal_seal_friction_{}", i)
-        })
-    }).collect();
-
-    for res in results {
-        writeln!(writer, "{}", res.to_string()).unwrap();
+    if let Some(p) = std::path::Path::new(&out).parent() {
+        std::fs::create_dir_all(p).ok();
     }
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("trajectory_id", DataType::UInt32, false),
+        Field::new("short_id", DataType::Utf8, false),
+        Field::new("operating_temp_c", DataType::Float64, false),
+        Field::new("effective_friction_mu", DataType::Float64, false),
+        Field::new("is_friction_surge", DataType::Boolean, false),
+        Field::new("is_actuator_stalled", DataType::Boolean, false),
+        Field::new("proof_hash", DataType::Utf8, false),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(UInt32Array::from(rows.iter().map(|r| r.id).collect::<Vec<_>>())),
+            Arc::new(StringArray::from(rows.iter().map(|r| r.short_id.as_str()).collect::<Vec<_>>())),
+            Arc::new(Float64Array::from(rows.iter().map(|r| r.operating_temp_c).collect::<Vec<_>>())),
+            Arc::new(Float64Array::from(rows.iter().map(|r| r.effective_friction_mu).collect::<Vec<_>>())),
+            Arc::new(BooleanArray::from(rows.iter().map(|r| r.is_friction_surge).collect::<Vec<_>>())),
+            Arc::new(BooleanArray::from(rows.iter().map(|r| r.is_actuator_stalled).collect::<Vec<_>>())),
+            Arc::new(StringArray::from(rows.iter().map(|r| r.proof_hash.as_str()).collect::<Vec<_>>())),
+        ],
+    )
+    .expect("batch");
+    let file = std::fs::File::create(&out).unwrap();
+    let props = output::parquet_receipt_properties(&seal, "G^G nitrile seal μ(T) dual-regime v3.0");
+    let mut w = ArrowWriter::try_new(file, schema, Some(props)).unwrap();
+    w.write(&batch).unwrap();
+    w.close().unwrap();
 
-    let fc = *failed_count.lock().unwrap();
-    let failure_rate = (fc as f64 / NUM_TRAJECTORIES as f64) * 100.0;
-    
-    println!("THERMAL_SEAL_FRICTION PHYSICS AUDIT COMPLETE.");
-    println!("TOTAL TRAJECTORIES: {:?}", NUM_TRAJECTORIES);
-    println!("CATASTROPHIC TIP-OVER RATE: {} ({:.2}%)", fc, failure_rate);
-    println!("EXECUTION TIME: {:?}", start_time.elapsed());
-    println!("SEALED TO: {}/thermal_seal_friction.json\n", export_dir);
+    let n_f = n as f64;
+    let s = rows.iter().filter(|r| r.is_friction_surge).count();
+    let st = rows.iter().filter(|r| r.is_actuator_stalled).count();
+    println!(
+        "  surge {s} ({:.1}%)  stall {st} ({:.1}%)",
+        100.0 * s as f64 / n_f,
+        100.0 * st as f64 / n_f
+    );
+    println!("  seal {seal}");
+    println!("  parquet {out}");
+    println!("  {:?}", t0.elapsed());
 }

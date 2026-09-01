@@ -1,128 +1,142 @@
-//! 1000Hz GENESIS CORE MODULE: ARMOR_SPALL_SENSOR_SHEARING
-//! TARGET: Generic Commercial/Industrial Autonomous Systems
-//! CLASS: Unmanned Ground Vehicles (UGVs)
-//! SUBSYSTEM: Autonomous E2E Network Infrastructure
-//! VULNERABILITY: Autonomous algorithms require massive bandwidth to shuffle raw LIDAR/Radar data between distributed sensor pods and the central AI brain. To achieve this, the physical vehicle is wired with glass fiber-optic cables routed along the interior armor bulkheads. When a 125mm APFSDS rounds strikes the exterior armor, even if it fails to penetrate, the hydrostatic shock wave sends a literal wave of steel moving through the armor plate. The resulting acoustic shock and microscopic steel spalling acts like a million tiny knives on the interior walls. The rigid glass fiber optics are instantly sheared and shattered along a 2-meter section. The main AI instantly loses connection to its sensors and Engine Control Unit (ECU), bricking the 35-ton robot in the middle of a firefight.
+//! Non-penetrating dart. Delay r/c_steel, peak g ∝ KE/r². Not KE/1e5·15 parked at 550 g.
+//! Mix standoff. Clock: constitutive. Gates: g ≥ 80 stun vs g ≥ 420 brick.
 
-use rayon::prelude::*;
-use serde_json::json;
-use std::fs::{File, OpenOptions};
-use std::io::{BufWriter, Write};
-use std::sync::{Arc, Mutex};
+use genesis_core::output;
+use genesis_core::physics::resonance::{inverse_square_shock_g, STEEL_BAR_WAVE_MS};
+use genesis_core::proof::{self, ProofChain};
+use genesis_core::rng::Rng;
+use serde::Serialize;
+use std::sync::Arc;
 use std::time::Instant;
-use rand::Rng;
 
-const NUM_TRAJECTORIES: usize = 1_200_000;
-const HZ: f64 = 1000.0;
-const DT: f64 = 1.0 / HZ;
+use arrow::array::{BooleanArray, Float64Array, StringArray, UInt32Array};
+use arrow::datatypes::{DataType, Field, Schema};
+use arrow::record_batch::RecordBatch;
+use parquet::arrow::arrow_writer::ArrowWriter;
 
-// Heavy Vehicle Armor Baseline
-const FIBER_SHOCK_CATASTROPHE_THRESHOLD_G: f64 = 550.0; // Rigid glass fiber cladding shatters under extreme high-frequency acoustic shock > 550Gs
+const DEFAULT_N: usize = 2500;
+const MASS: f64 = 4.8;
+const COUPLING: f64 = 1.6e-4;
+const STUN_G: f64 = 80.0;
+const BRICK_G: f64 = 420.0;
+
+#[derive(Debug, Serialize)]
+struct Run {
+    id: u32,
+    short_id: String,
+    dart_velocity_ms: f64,
+    loom_proximity_m: f64,
+    peak_shock_g: f64,
+    is_loom_stunned: bool,
+    is_central_ai_bricked: bool,
+    proof_hash: String,
+}
+
+fn run_one(id: u32, rng: &mut Rng) -> Run {
+    let short_id = output::short_id(rng);
+    let near = rng.chance(0.38);
+    let r = if near {
+        rng.range(0.22, 0.70)
+    } else {
+        rng.range(0.90, 2.40)
+    };
+    let v = rng.range(1100.0, 1700.0);
+
+    let mut proof = ProofChain::new();
+    proof.seed(&id.to_le_bytes());
+    proof.feed_f64(v);
+    proof.feed_f64(r);
+
+    let ke = 0.5 * MASS * v * v;
+    let t_arr = r / STEEL_BAR_WAVE_MS;
+    let g = inverse_square_shock_g(ke, r, COUPLING);
+    let stun = g >= STUN_G;
+    let brick = g >= BRICK_G;
+
+    proof.feed_f64(t_arr);
+    proof.feed_f64(g);
+    proof.feed_str(if brick {
+        "BRICK"
+    } else if stun {
+        "STUN"
+    } else {
+        "HOLD"
+    });
+
+    Run {
+        id,
+        short_id,
+        dart_velocity_ms: (v * 10.0).round() / 10.0,
+        loom_proximity_m: (r * 100.0).round() / 100.0,
+        peak_shock_g: (g * 10.0).round() / 10.0,
+        is_loom_stunned: stun,
+        is_central_ai_bricked: brick,
+        proof_hash: proof.seal(),
+    }
+}
 
 fn main() {
-    let start_time = Instant::now();
-    let export_dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../../data/exports/sovereign");
-    std::fs::create_dir_all(export_dir).unwrap();
-    let file = OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .open(format!("{}/armor_spall_sensor_shearing.json", export_dir))
-        .unwrap();
-    let mut writer = BufWriter::new(file);
-
-    println!("=========================================================");
-    println!("G^G SOVEREIGN PHYSICS ENGINE: 1000Hz KINETIC ACOUSTIC AUDIT");
-    println!("TARGET: GENERIC COMMERCIAL SYSTEMS");
-    println!("MODULE: ARMOR_SPALL_SENSOR_SHEARING");
-    println!("EXECUTING 1,200,000 TRAJECTORIES...");
-    println!("=========================================================\n");
-
-    let failed_count = Arc::new(Mutex::new(0usize));
-
-    let results: Vec<serde_json::Value> = (0..NUM_TRAJECTORIES).into_par_iter().map(|i| {
-        let mut rng = rand::thread_rng();
-        
-        let mut central_ai_bricked = false;
-        
-        // Simulating a non-penetrating hit from a 3VBM17 Mango (Soviet 125mm APFSDS)
-        let dart_mass_kg = 4.8; 
-        let dart_velocity_ms: f64 = rng.gen_range(1600.0..1800.0);
-        
-        let impact_kinetic_energy_j = 0.5 * dart_mass_kg * dart_velocity_ms.powi(2);
-        
-        // Armor properties (RHA steel)
-        let armor_thickness_m = rng.gen_range(0.1..0.2); // Not enough to penetrate a glancing blow on thick hull sections
-        
-        // Distance from impact point to the nearest fiber optic wire loom
-        let loom_proximity_to_impact_m = rng.gen_range(0.2..1.1);
-
-        // Acoustic shock propagation through the steel hull (Speed of sound in steel ~ 5960 m/s)
-        let shock_propagation_speed_ms = 5960.0;
-        let time_to_shock_arrival_s = loom_proximity_to_impact_m / shock_propagation_speed_ms;
-        
-        let mut peak_shock_felt_g = 0.0;
-        let mut spall_density_shrapnel_m2 = 0.0;
-
-        for tick in 0..(0.05 * HZ) as usize { // 50 milliseconds of blast physics
-            
-            let current_time_s = tick as f64 * DT;
-
-            // The shock wave hits the wire loom
-            if current_time_s >= time_to_shock_arrival_s && !central_ai_bricked {
-                
-                // Shock attenuation: The shockwave loses energy via 1/r^2 geometric spreading through the plate volume
-                let attenuation_factor = 1.0 / (loom_proximity_to_impact_m.powi(2) + 0.1); 
-                
-                // The raw kinetic energy dumps into the plate, sending a compressive wave that reflects as a tensile wave on the inside.
-                // Tensile wave > Ultimate Tensile Strength = Spallation
-                // Simplified peak acceleration of the inner armor face (transmitted to the rigid fiber mounts)
-                let peak_acceleration_ms2 = (impact_kinetic_energy_j * 0.001) * attenuation_factor; 
-                peak_shock_felt_g = peak_acceleration_ms2 / 9.81;
-
-                // Spall generation. If the shock is massive, the back of the armor literally flakes off at supersonic speeds
-                if peak_shock_felt_g > 300.0 {
-                    spall_density_shrapnel_m2 = peak_shock_felt_g * rng.gen_range(0.5..2.0);
-                }
-
-                // Idealized stacks assume their internal network is an invincible abstraction.
-                // In reality, fiber optic glass shatters under massive acoustic shock (tensile reflection wave),
-                // and gets physically severed by the spray of hot steel spall filling the interior cavity.
-                
-                if peak_shock_felt_g > FIBER_SHOCK_CATASTROPHE_THRESHOLD_G || spall_density_shrapnel_m2 > 100.0 {
-                    // The glass physically snaps inside its Kevlar jacket, or is cut by shrapnel.
-                    // The 10-Gigabit link drops instantly. The AI falls back into an unconnected hardware panic loop.
-                    central_ai_bricked = true;
-                    break;
-                }
-            }
-        }
-
-        if central_ai_bricked {
-            let mut fc = failed_count.lock().unwrap();
-            *fc += 1;
-        }
-
-        json!({
-            "trajectory_id": i,
-            "impact_ke_megajoules": f64::trunc((impact_kinetic_energy_j / 1_000_000.0) * 100.0) / 100.0,
-            "peak_loom_shock_g": f64::trunc(peak_shock_felt_g * 10.0) / 10.0,
-            "survived": !central_ai_bricked,
-            "failure_mode": if !central_ai_bricked { "NOMINAL" } else { "HYDROSTATIC_FIBER_SHATTER_ISOLATION" },
-            "cryptographic_seal": format!("sha256:armored_hull_spall_{}", i)
-        })
-    }).collect();
-
-    for res in results {
-        writeln!(writer, "{}", res.to_string()).unwrap();
+    let args: Vec<String> = std::env::args().collect();
+    let n: usize = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(DEFAULT_N);
+    let out = args
+        .iter()
+        .position(|a| a == "--parquet")
+        .and_then(|i| args.get(i + 1))
+        .cloned()
+        .unwrap_or_else(|| {
+            format!(
+                "{}/../../data/exports/sovereign/armor_spall_sensor_shearing.parquet",
+                env!("CARGO_MANIFEST_DIR")
+            )
+        });
+    println!("====================================================================");
+    println!("  G^G: HULL SHOCK  (r/c_steel, KE/r²)");
+    println!("  n={n}");
+    println!("====================================================================\n");
+    let t0 = Instant::now();
+    let mut rng = Rng::new(0x5A11_00B7);
+    let rows: Vec<Run> = (0..n as u32).map(|i| run_one(i, &mut rng)).collect();
+    let proofs: Vec<String> = rows.iter().map(|r| r.proof_hash.clone()).collect();
+    let seal = proof::seal_run(&proofs);
+    if let Some(p) = std::path::Path::new(&out).parent() {
+        std::fs::create_dir_all(p).ok();
     }
-
-    let fc = *failed_count.lock().unwrap();
-    let failure_rate = (fc as f64 / NUM_TRAJECTORIES as f64) * 100.0;
-    
-    println!("ARMOR_SPALL_SENSOR_SHEARING PHYSICS AUDIT COMPLETE.");
-    println!("TOTAL TRAJECTORIES: {:?}", NUM_TRAJECTORIES);
-    println!("CATASTROPHIC FIBER OPTIC SEVER RATE: {} ({:.2}%)", fc, failure_rate);
-    println!("EXECUTION TIME: {:?}", start_time.elapsed());
-    println!("SEALED TO: {}/armor_spall_sensor_shearing.json\n", export_dir);
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("trajectory_id", DataType::UInt32, false),
+        Field::new("short_id", DataType::Utf8, false),
+        Field::new("dart_velocity_ms", DataType::Float64, false),
+        Field::new("loom_proximity_m", DataType::Float64, false),
+        Field::new("peak_shock_g", DataType::Float64, false),
+        Field::new("is_loom_stunned", DataType::Boolean, false),
+        Field::new("is_central_ai_bricked", DataType::Boolean, false),
+        Field::new("proof_hash", DataType::Utf8, false),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(UInt32Array::from(rows.iter().map(|r| r.id).collect::<Vec<_>>())),
+            Arc::new(StringArray::from(rows.iter().map(|r| r.short_id.as_str()).collect::<Vec<_>>())),
+            Arc::new(Float64Array::from(rows.iter().map(|r| r.dart_velocity_ms).collect::<Vec<_>>())),
+            Arc::new(Float64Array::from(rows.iter().map(|r| r.loom_proximity_m).collect::<Vec<_>>())),
+            Arc::new(Float64Array::from(rows.iter().map(|r| r.peak_shock_g).collect::<Vec<_>>())),
+            Arc::new(BooleanArray::from(rows.iter().map(|r| r.is_loom_stunned).collect::<Vec<_>>())),
+            Arc::new(BooleanArray::from(rows.iter().map(|r| r.is_central_ai_bricked).collect::<Vec<_>>())),
+            Arc::new(StringArray::from(rows.iter().map(|r| r.proof_hash.as_str()).collect::<Vec<_>>())),
+        ],
+    )
+    .expect("batch");
+    let file = std::fs::File::create(&out).unwrap();
+    let props = output::parquet_receipt_properties(&seal, "G^G hull shock dual-regime v3.0");
+    let mut w = ArrowWriter::try_new(file, schema, Some(props)).unwrap();
+    w.write(&batch).unwrap();
+    w.close().unwrap();
+    let nf = n as f64;
+    let a = rows.iter().filter(|r| r.is_loom_stunned).count();
+    let b = rows.iter().filter(|r| r.is_central_ai_bricked).count();
+    println!(
+        "  stun {a} ({:.1}%)  brick {b} ({:.1}%)",
+        100.0 * a as f64 / nf,
+        100.0 * b as f64 / nf
+    );
+    println!("  seal {seal}\n  parquet {out}\n  {:?}", t0.elapsed());
 }

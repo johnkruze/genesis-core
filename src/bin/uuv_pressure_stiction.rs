@@ -1,5 +1,6 @@
 //! Abyssal fin-shaft stiction. Hydrostatic crush of the seal vs PI windup.
-//! Dual-regime: never breaks away in 2 s (held) vs snap past 25° (tumble).
+//! Dual-regime exclusive: never breaks away in 2 s (held) vs snap past 25° (tumble).
+//! Broke away without tumbling is clean — the fin is still the body's.
 //! 1000 Hz clock — the windup is the halt analog.
 
 use genesis_core::output;
@@ -21,7 +22,6 @@ const HZ: f64 = 1000.0;
 const DT: f64 = 1.0 / HZ;
 const T_SIM: f64 = 2.0;
 const TUMBLE_DEG: f64 = 25.0;
-const CLEAN_DEG: f64 = 5.0;
 
 #[derive(Debug, Serialize)]
 struct StictionRun {
@@ -111,16 +111,14 @@ fn run_one(id: u32, rng: &mut Rng) -> StictionRun {
     }
 
     let held = !broken;
-    let clean = broken && !tumble && (angle - target).abs() < CLEAN_DEG;
+    let clean = broken && !tumble;
     proof.feed_f64(angle);
     proof.feed_str(if tumble {
         "TUMBLE"
     } else if held {
         "STICTION_HELD"
-    } else if clean {
-        "FIN_CLEAN"
     } else {
-        "OVERSHOOT_RECOVERED"
+        "FIN_CLEAN"
     });
 
     StictionRun {
@@ -223,7 +221,7 @@ fn main() {
             parquet::file::metadata::KeyValue::new("cryptographic_seal".to_string(), run_proof.clone()),
             parquet::file::metadata::KeyValue::new(
                 "generator".to_string(),
-                "G^G UUV pressure stiction dual-regime v1.0".to_string(),
+                "G^G UUV pressure stiction dual-regime v1.1".to_string(),
             ),
         ]))
         .build();
@@ -235,8 +233,9 @@ fn main() {
     let held = rows.iter().filter(|r| r.is_stiction_held).count();
     let tumble = rows.iter().filter(|r| r.is_tumble).count();
     let clean = rows.iter().filter(|r| r.is_clean).count();
+    assert_eq!(held + tumble + clean, n as usize);
     println!(
-        "  held {held} ({:.1}%)  tumble {tumble} ({:.1}%)  clean {clean} ({:.1}%)",
+        "  held {held} ({:.1}%)  tumble {tumble} ({:.1}%)  clean {clean} ({:.1}%)  exclusive",
         100.0 * held as f64 / n_f,
         100.0 * tumble as f64 / n_f,
         100.0 * clean as f64 / n_f

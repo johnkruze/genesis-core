@@ -1,109 +1,151 @@
-//! 1000Hz GENESIS CORE MODULE: QUADRUPED_LEG_THERMAL_SINK
-//! TARGET: Generic Commercial/Industrial Autonomous Systems
-//! CLASS: Quadrupedal Robotics
-//! SUBSYSTEM: Idealized RL Locomotion Policy
-//! VULNERABILITY: Idealized trainers enforce rigid-body actuation and flat thermodynamics. In physical environments with extreme ambient variance (e.g., snow at -10C), the aluminum leg casing acts as a massive thermal sink, dynamically freezing the joint grease and increasing static stiction by 500%. The RL policy, unaware of temperature, fails to inject the breakaway torque required to lift the leg, resulting in face-plants.
+//! Quadruped knee grease: Walther viscosity at startup, then lumped heating on a 10 min trot.
+//! Extra shear power scales with ν/ν_40, not a boolean. Clock: one exact 600 s step.
+//! Gates: ν ≥ 500 cSt cold drag vs T_joint ≥ 85 °C overtemp. They anti-correlate.
+//! Organ: walther_lubricant_viscosity_cst, LumpedThermalNode.
+//!
+//! JSON-farm twin museumed: `z_archive/gg-garden-cruft-2026-08-24/bin/quadruped_thermal_monte_carlo.rs`.
 
-use rayon::prelude::*;
-use serde_json::json;
-use std::fs::{File, OpenOptions};
-use std::io::{BufWriter, Write};
-use std::sync::{Arc, Mutex};
+use genesis_core::output;
+use genesis_core::physics::thermal::{walther_lubricant_viscosity_cst, LumpedThermalNode};
+use genesis_core::proof::{self, ProofChain};
+use genesis_core::rng::Rng;
+use serde::Serialize;
+use std::sync::Arc;
 use std::time::Instant;
-use rand::Rng;
 
-const NUM_TRAJECTORIES: usize = 1_200_000;
-const HZ: f64 = 1000.0;
-const DT: f64 = 1.0 / HZ;
+use arrow::array::{BooleanArray, Float64Array, StringArray, UInt32Array};
+use arrow::datatypes::{DataType, Field, Schema};
+use arrow::record_batch::RecordBatch;
+use parquet::arrow::arrow_writer::ArrowWriter;
 
-// Quadruped Actuator Baseline
-const NOMINAL_BREAKAWAY_TORQUE_NM: f64 = 1.5; // Expected stiction at 25C
-const MAX_AVAILABLE_TORQUE_NM: f64 = 23.0; // Peak torque for the knee actuator
+const DEFAULT_N: usize = 2500;
+const TROT_S: f64 = 1200.0; // 20 min — τ ≈ 382 s, so this is 3.1τ (10 min never reached 85 °C)
+const WALTHER_A: f64 = 9.2;
+const WALTHER_B: f64 = 3.6;
+const NU_40: f64 = 46.0;
+const NU_DRAG: f64 = 500.0;
+const T_OVER_C: f64 = 85.0;
+
+#[derive(Debug, Serialize)]
+struct Run {
+    id: u32,
+    short_id: String,
+    initial_ambient_c: f64,
+    initial_viscosity_cst: f64,
+    final_joint_temp_c: f64,
+    is_viscous_drag_surged: bool,
+    is_joint_overtemp_tripped: bool,
+    proof_hash: String,
+}
+
+fn run_one(id: u32, rng: &mut Rng) -> Run {
+    let short_id = output::short_id(rng);
+    let amb = rng.range(-25.0, 45.0);
+    let duty = rng.range(0.50, 1.0);
+
+    let mut proof = ProofChain::new();
+    proof.seed(&id.to_le_bytes());
+    proof.feed_f64(amb);
+    proof.feed_f64(duty);
+
+    let nu = walther_lubricant_viscosity_cst(WALTHER_A, WALTHER_B, amb);
+    let drag = nu >= NU_DRAG;
+    let p_mech = 55.0 * duty;
+    let p_visc = 8.0 * (nu / NU_40).clamp(0.3, 8.0);
+    let mut node = LumpedThermalNode::new(amb, 450.0, 0.85);
+    let t_final = node.step(p_mech + p_visc, amb, TROT_S);
+    let over = t_final >= T_OVER_C;
+
+    proof.feed_f64(nu);
+    proof.feed_f64(t_final);
+    proof.feed_str(if over {
+        "OVERTEMP"
+    } else if drag {
+        "VISCOUS_DRAG"
+    } else {
+        "NOMINAL"
+    });
+
+    Run {
+        id,
+        short_id,
+        initial_ambient_c: (amb * 10.0).round() / 10.0,
+        initial_viscosity_cst: (nu * 10.0).round() / 10.0,
+        final_joint_temp_c: (t_final * 10.0).round() / 10.0,
+        is_viscous_drag_surged: drag,
+        is_joint_overtemp_tripped: over,
+        proof_hash: proof.seal(),
+    }
+}
 
 fn main() {
-    let start_time = Instant::now();
-    let export_dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../../data/exports/sovereign");
-    std::fs::create_dir_all(export_dir).unwrap();
-    let file = OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .open(format!("{}/quadruped_leg_thermal_sink.json", export_dir))
-        .unwrap();
-    let mut writer = BufWriter::new(file);
+    let args: Vec<String> = std::env::args().collect();
+    let n: usize = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(DEFAULT_N);
+    let out = args
+        .iter()
+        .position(|a| a == "--parquet")
+        .and_then(|i| args.get(i + 1))
+        .cloned()
+        .unwrap_or_else(|| {
+            format!(
+                "{}/../../data/exports/sovereign/quadruped_leg_thermal_sink.parquet",
+                env!("CARGO_MANIFEST_DIR")
+            )
+        });
 
-    println!("=========================================================");
-    println!("G^G SOVEREIGN PHYSICS ENGINE: 1000Hz THERMOMECHANICAL AUDIT");
-    println!("TARGET: GENERIC COMMERCIAL SYSTEMS");
-    println!("MODULE: QUADRUPED_LEG_THERMAL_SINK");
-    println!("EXECUTING 1,200,000 TRAJECTORIES...");
-    println!("=========================================================\n");
+    println!("====================================================================");
+    println!("  G^G: QUADRUPED WALTHER GREASE  (ν(T) + lumped 20 min trot)");
+    println!("  n={n}  drag ν≥{NU_DRAG} cSt  overtemp {T_OVER_C} °C");
+    println!("====================================================================\n");
 
-    let failed_count = Arc::new(Mutex::new(0usize));
+    let t0 = Instant::now();
+    let mut rng = Rng::new(0x4488_000A);
+    let rows: Vec<Run> = (0..n as u32).map(|i| run_one(i, &mut rng)).collect();
+    let proofs: Vec<String> = rows.iter().map(|r| r.proof_hash.clone()).collect();
+    let seal = proof::seal_run(&proofs);
 
-    let results: Vec<serde_json::Value> = (0..NUM_TRAJECTORIES).into_par_iter().map(|i| {
-        let mut rng = rand::thread_rng();
-        
-        // Simulating the dog deploying in a snowy or muddy field in winter
-        let ambient_temp_c = rng.gen_range(-25.0..5.0); // Real world winter conditions
-        
-        let mut actual_stiction_nm = NOMINAL_BREAKAWAY_TORQUE_NM;
-        let mut step_execution_failed = false;
-        
-        // Synthesizing the viscosity of the gear grease as a function of temperature.
-        // As temp drops below 0C, standard grease becomes dramatically more viscous.
-        let thermal_stiction_multiplier = if ambient_temp_c < 10.0 {
-            // Exponential increase in static friction as temperature drops below 10C
-            1.0 + (10.0_f64 - ambient_temp_c).powf(1.1) * 0.5
-        } else {
-            1.0
-        };
-
-        actual_stiction_nm *= thermal_stiction_multiplier;
-
-        // The RL policy was trained in a simulated tropical/office environment (viscosity = 1.0 everywhere)
-        // To swing the leg, the policy calculates precisely how much torque to inject. 
-        // It generally applies ~3x the nominal breakaway torque to guarantee a snappy step motion.
-        let rl_commanded_torque_nm = NOMINAL_BREAKAWAY_TORQUE_NM * 3.0 + rng.gen_range(0.0..2.0);
-
-        for _tick in 0..(0.2 * HZ) as usize { // 200ms swing phase initiation
-            
-            // Physical interaction: The RL commanded torque MUST exceed the physical stiction
-            // to break the joint free, otherwise the leg remains pinned while the body moves,
-            // collapsing the support polygon instantly.
-            
-            if rl_commanded_torque_nm < actual_stiction_nm {
-                step_execution_failed = true;
-                break;
-            }
-        }
-
-        if step_execution_failed {
-            let mut fc = failed_count.lock().unwrap();
-            *fc += 1;
-        }
-
-        json!({
-            "trajectory_id": i,
-            "ambient_temp_C": f64::trunc(ambient_temp_c * 10.0) / 10.0,
-            "actual_grease_stiction_Nm": f64::trunc(actual_stiction_nm * 100.0) / 100.0,
-            "rl_commanded_torque_Nm": f64::trunc(rl_commanded_torque_nm * 100.0) / 100.0,
-            "survived": !step_execution_failed,
-            "failure_mode": if !step_execution_failed { "NOMINAL" } else { "UNMODELED_THERMAL_STICTION_TRIP" },
-            "cryptographic_seal": format!("sha256:quadruped_thermal_stiction_{}", i)
-        })
-    }).collect();
-
-    for res in results {
-        writeln!(writer, "{}", res.to_string()).unwrap();
+    if let Some(p) = std::path::Path::new(&out).parent() {
+        std::fs::create_dir_all(p).ok();
     }
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("trajectory_id", DataType::UInt32, false),
+        Field::new("short_id", DataType::Utf8, false),
+        Field::new("initial_ambient_c", DataType::Float64, false),
+        Field::new("initial_viscosity_cst", DataType::Float64, false),
+        Field::new("final_joint_temp_c", DataType::Float64, false),
+        Field::new("is_viscous_drag_surged", DataType::Boolean, false),
+        Field::new("is_joint_overtemp_tripped", DataType::Boolean, false),
+        Field::new("proof_hash", DataType::Utf8, false),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(UInt32Array::from(rows.iter().map(|r| r.id).collect::<Vec<_>>())),
+            Arc::new(StringArray::from(rows.iter().map(|r| r.short_id.as_str()).collect::<Vec<_>>())),
+            Arc::new(Float64Array::from(rows.iter().map(|r| r.initial_ambient_c).collect::<Vec<_>>())),
+            Arc::new(Float64Array::from(rows.iter().map(|r| r.initial_viscosity_cst).collect::<Vec<_>>())),
+            Arc::new(Float64Array::from(rows.iter().map(|r| r.final_joint_temp_c).collect::<Vec<_>>())),
+            Arc::new(BooleanArray::from(rows.iter().map(|r| r.is_viscous_drag_surged).collect::<Vec<_>>())),
+            Arc::new(BooleanArray::from(rows.iter().map(|r| r.is_joint_overtemp_tripped).collect::<Vec<_>>())),
+            Arc::new(StringArray::from(rows.iter().map(|r| r.proof_hash.as_str()).collect::<Vec<_>>())),
+        ],
+    )
+    .expect("batch");
+    let file = std::fs::File::create(&out).unwrap();
+    let props = output::parquet_receipt_properties(&seal, "G^G Walther knee dual-regime v3.0");
+    let mut w = ArrowWriter::try_new(file, schema, Some(props)).unwrap();
+    w.write(&batch).unwrap();
+    w.close().unwrap();
 
-    let fc = *failed_count.lock().unwrap();
-    let failure_rate = (fc as f64 / NUM_TRAJECTORIES as f64) * 100.0;
-    
-    println!("QUADRUPED_LEG_THERMAL_SINK PHYSICS AUDIT COMPLETE.");
-    println!("TOTAL TRAJECTORIES: {:?}", NUM_TRAJECTORIES);
-    println!("CATASTROPHIC COLD-WEATHER FACEPLANT RATE: {} ({:.2}%)", fc, failure_rate);
-    println!("EXECUTION TIME: {:?}", start_time.elapsed());
-    println!("SEALED TO: {}/quadruped_leg_thermal_sink.json\n", export_dir);
+    let n_f = n as f64;
+    let d = rows.iter().filter(|r| r.is_viscous_drag_surged).count();
+    let o = rows.iter().filter(|r| r.is_joint_overtemp_tripped).count();
+    println!(
+        "  viscous_drag {d} ({:.1}%)  overtemp {o} ({:.1}%)",
+        100.0 * d as f64 / n_f,
+        100.0 * o as f64 / n_f
+    );
+    println!("  seal {seal}");
+    println!("  parquet {out}");
+    println!("  {:?}", t0.elapsed());
 }

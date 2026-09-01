@@ -1,139 +1,157 @@
-//! 1000Hz GENESIS CORE MODULE: THERMAL_SIGHT_SATURATION
-//! TARGET: Generic Commercial/Industrial Autonomous Systems
-//! CLASS: Generic Autonomous Platform
-//! SUBSYSTEM: Auto-Exposure / Thermal Gimbal AI
-//! VULNERABILITY: Modern Uncooled Bolometer thermal sights rely on AI-driven local contrast enhancement and auto-gain to extract targets from thermal background noise. In a cold winter environment (0C), the AI sets the sensor gain very high. If a single magnesium or white-phosphorus flare (burning at 2500C+) enters the field of view, the sheer magnitude of the blackbody radiation mathematically crushes the 14-bit dynamic range of the sensor array. The AI's histogram-equalization algorithm furiously ramps down the exposure to compensate, instantly turning the rest of the 0C battlefield completely black and dropping all target tracks until the flare burns out.
+//! MWIR well fill under AGC. Background held at 40 % well; a hot source of fill-factor f
+//! in the same pixel fills (1−f)a + f a (T_s/T_bg)⁴.
+//! Distance sets angular fill: f = clamp((D/r) / IFOV, 0.02, 1). Organ: agc_blackbody_well_fill.
+//! Gates: well ≥ 0.80 saturated vs well ≥ 0.99 blinded.
 
-use rayon::prelude::*;
-use serde_json::json;
-use std::fs::{File, OpenOptions};
-use std::io::{BufWriter, Write};
-use std::sync::{Arc, Mutex};
+use genesis_core::output;
+use genesis_core::physics::thermal::agc_blackbody_well_fill;
+use genesis_core::proof::{self, ProofChain};
+use genesis_core::rng::Rng;
+use serde::Serialize;
+use std::sync::Arc;
 use std::time::Instant;
-use rand::Rng;
 
-const NUM_TRAJECTORIES: usize = 1_200_000;
-const HZ: f64 = 1000.0;
-const DT: f64 = 1.0 / HZ;
+use arrow::array::{BooleanArray, Float64Array, StringArray, UInt32Array};
+use arrow::datatypes::{DataType, Field, Schema};
+use arrow::record_batch::RecordBatch;
+use parquet::arrow::arrow_writer::ArrowWriter;
 
-// Thermal Sight Baseline
-const MINIMUM_CONTRAST_THRESHOLD: f64 = 0.05; // If contrast drops below 5%, the target bounding box drops
+const DEFAULT_N: usize = 2500;
+const IFOV_RAD: f64 = 0.001;
+const AGC_WELL: f64 = 0.40;
+const SAT: f64 = 0.80;
+const BLIND: f64 = 0.99;
+const T_BG_K: f64 = 300.0;
+
+#[derive(Debug, Serialize)]
+struct Run {
+    id: u32,
+    short_id: String,
+    target_emitter_temp_c: f64,
+    range_m: f64,
+    source_fill_factor: f64,
+    fpa_well_fill_ratio: f64,
+    is_well_saturated: bool,
+    is_contrast_blinded: bool,
+    proof_hash: String,
+}
+
+fn run_one(id: u32, rng: &mut Rng) -> Run {
+    let short_id = output::short_id(rng);
+    // Mix: unresolved exhaust/spark (typical) vs resolved furnace/flare (tail).
+    let t_c = if rng.chance(0.18) {
+        rng.range(450.0, 900.0)
+    } else {
+        rng.range(40.0, 280.0)
+    };
+    let range_m = rng.range(120.0, 500.0);
+    let source_m = rng.range(0.03, 0.12);
+
+    let mut proof = ProofChain::new();
+    proof.seed(&id.to_le_bytes());
+    proof.feed_f64(t_c);
+    proof.feed_f64(range_m);
+    proof.feed_f64(source_m);
+
+    let angular = source_m / range_m.max(1.0);
+    let fill = (angular / IFOV_RAD).clamp(0.02, 1.0);
+    let well = agc_blackbody_well_fill(t_c + 273.15, T_BG_K, fill, AGC_WELL);
+    let sat = well >= SAT;
+    let blind = well >= BLIND;
+
+    proof.feed_f64(fill);
+    proof.feed_f64(well);
+    proof.feed_str(if blind {
+        "BLINDED"
+    } else if sat {
+        "SATURATED"
+    } else {
+        "NOMINAL"
+    });
+
+    Run {
+        id,
+        short_id,
+        target_emitter_temp_c: (t_c * 10.0).round() / 10.0,
+        range_m: (range_m * 10.0).round() / 10.0,
+        source_fill_factor: (fill * 1000.0).round() / 1000.0,
+        fpa_well_fill_ratio: (well * 1000.0).round() / 1000.0,
+        is_well_saturated: sat,
+        is_contrast_blinded: blind,
+        proof_hash: proof.seal(),
+    }
+}
 
 fn main() {
-    let start_time = Instant::now();
-    let export_dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../../data/exports/sovereign");
-    std::fs::create_dir_all(export_dir).unwrap();
-    let file = OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .open(format!("{}/thermal_sight_saturation.json", export_dir))
-        .unwrap();
-    let mut writer = BufWriter::new(file);
+    let args: Vec<String> = std::env::args().collect();
+    let n: usize = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(DEFAULT_N);
+    let out = args
+        .iter()
+        .position(|a| a == "--parquet")
+        .and_then(|i| args.get(i + 1))
+        .cloned()
+        .unwrap_or_else(|| {
+            format!(
+                "{}/../../data/exports/sovereign/thermal_sight_saturation.parquet",
+                env!("CARGO_MANIFEST_DIR")
+            )
+        });
 
-    println!("=========================================================");
-    println!("G^G SOVEREIGN PHYSICS ENGINE: 1000Hz ELECTRO-OPTICAL AUDIT");
-    println!("TARGET: GENERIC COMMERCIAL SYSTEMS");
-    println!("MODULE: THERMAL_SIGHT_SATURATION");
-    println!("EXECUTING 1,200,000 TRAJECTORIES...");
-    println!("=========================================================\n");
+    println!("====================================================================");
+    println!("  G^G: MWIR AGC WELL FILL  (T⁴ contrast, fill from D/r)");
+    println!("  n={n}  sat ≥{SAT}  blind ≥{BLIND}");
+    println!("====================================================================\n");
 
-    let failed_count = Arc::new(Mutex::new(0usize));
+    let t0 = Instant::now();
+    let mut rng = Rng::new(0x3819_000B);
+    let rows: Vec<Run> = (0..n as u32).map(|i| run_one(i, &mut rng)).collect();
+    let proofs: Vec<String> = rows.iter().map(|r| r.proof_hash.clone()).collect();
+    let seal = proof::seal_run(&proofs);
 
-    let results: Vec<serde_json::Value> = (0..NUM_TRAJECTORIES).into_par_iter().map(|i| {
-        let mut rng = rand::thread_rng();
-        
-        let mut target_lost = false;
-        let mut max_blind_duration_s = 0.0;
-        
-        // Simulating a cold-weather engagement
-        let background_temp_k: f64 = rng.gen_range(260.0..280.0); // -13C to 7C
-        let target_soldier_temp_k: f64 = 300.0; // 27C (exposed skin/gear)
-        
-        // A magnesium flare is popped 200 meters away, in the FOV
-        let flare_ignition_tick = 2000; // 2 seconds in
-        let flare_duration_s = rng.gen_range(30.0..45.0);
-        let flare_temp_k: f64 = rng.gen_range(2500.0..3000.0);
-        
-        // Stefan-Boltzmann Law: Power emitted is proportional to T^4
-        // The sensor sees irradiance. 
-        let background_radiance = background_temp_k.powi(4);
-        let target_radiance = target_soldier_temp_k.powi(4);
-        let flare_radiance = flare_temp_k.powi(4);
-        
-        let mut current_sensor_gain = 1.0;
-        let mut current_blind_time = 0.0;
-
-        for tick in 0..(50.0 * HZ) as usize { // 50 seconds covering the flare burn
-            
-            let mut total_scene_radiance_max = target_radiance;
-            
-            if tick > flare_ignition_tick && tick < flare_ignition_tick + (flare_duration_s * HZ) as usize {
-                // The flare is in the FOV. The maximum radiance in the scene spikes by a factor of 10,000x
-                total_scene_radiance_max = flare_radiance;
-            }
-
-            // The AI auto-exposure loop (Automatic Gain Control - AGC)
-            // It tries to normalize the maximum radiance to the top of its 14-bit digital range (16383)
-            let digital_max = 16383.0;
-            let target_gain = digital_max / total_scene_radiance_max;
-            
-            // Gain adjusts smoothly over time (e.g. 100ms time constant)
-            current_sensor_gain += (target_gain - current_sensor_gain) * 10.0 * DT;
-            
-            // Calculate how the actual target soldier appears after the gain is applied
-            // Digital value = Radiance * Gain
-            let digital_target_brightness = target_radiance * current_sensor_gain;
-            let digital_background_brightness = background_radiance * current_sensor_gain;
-            
-            // Contrast = (Target - Background) / Digital_Max
-            let apparent_contrast = (digital_target_brightness - digital_background_brightness) / digital_max;
-
-            // If the flare is burning, the gain drops so low that the target soldier's 300K radiance
-            // gets quantized down to essentially the same digital value as the 270K background.
-            if apparent_contrast < MINIMUM_CONTRAST_THRESHOLD {
-                current_blind_time += DT;
-                if current_blind_time > max_blind_duration_s {
-                    max_blind_duration_s = current_blind_time;
-                }
-            } else {
-                current_blind_time = 0.0;
-            }
-
-            // If the AI loses the target for more than 5 consecutive seconds, it drops the lock.
-            // On a modern battlefield, 5 seconds of blindness means the target has moved to hard cover.
-            if max_blind_duration_s > 5.0 {
-                target_lost = true;
-                break;
-            }
-        }
-
-        if target_lost {
-            let mut fc = failed_count.lock().unwrap();
-            *fc += 1;
-        }
-
-        json!({
-            "trajectory_id": i,
-            "flare_temp_kelvin": f64::trunc(flare_temp_k * 10.0) / 10.0,
-            "max_radiance_ratio": f64::trunc((flare_radiance / target_radiance) * 1.0) / 1.0,
-            "blindness_duration_s": f64::trunc(max_blind_duration_s * 10.0) / 10.0,
-            "survived": !target_lost,
-            "failure_mode": if !target_lost { "NOMINAL" } else { "THERMAL_AGC_DYNAMIC_RANGE_COLLAPSE" },
-            "cryptographic_seal": format!("sha256:thermal_sight_blind_{}", i)
-        })
-    }).collect();
-
-    for res in results {
-        writeln!(writer, "{}", res.to_string()).unwrap();
+    if let Some(p) = std::path::Path::new(&out).parent() {
+        std::fs::create_dir_all(p).ok();
     }
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("trajectory_id", DataType::UInt32, false),
+        Field::new("short_id", DataType::Utf8, false),
+        Field::new("target_emitter_temp_c", DataType::Float64, false),
+        Field::new("range_m", DataType::Float64, false),
+        Field::new("source_fill_factor", DataType::Float64, false),
+        Field::new("fpa_well_fill_ratio", DataType::Float64, false),
+        Field::new("is_well_saturated", DataType::Boolean, false),
+        Field::new("is_contrast_blinded", DataType::Boolean, false),
+        Field::new("proof_hash", DataType::Utf8, false),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(UInt32Array::from(rows.iter().map(|r| r.id).collect::<Vec<_>>())),
+            Arc::new(StringArray::from(rows.iter().map(|r| r.short_id.as_str()).collect::<Vec<_>>())),
+            Arc::new(Float64Array::from(rows.iter().map(|r| r.target_emitter_temp_c).collect::<Vec<_>>())),
+            Arc::new(Float64Array::from(rows.iter().map(|r| r.range_m).collect::<Vec<_>>())),
+            Arc::new(Float64Array::from(rows.iter().map(|r| r.source_fill_factor).collect::<Vec<_>>())),
+            Arc::new(Float64Array::from(rows.iter().map(|r| r.fpa_well_fill_ratio).collect::<Vec<_>>())),
+            Arc::new(BooleanArray::from(rows.iter().map(|r| r.is_well_saturated).collect::<Vec<_>>())),
+            Arc::new(BooleanArray::from(rows.iter().map(|r| r.is_contrast_blinded).collect::<Vec<_>>())),
+            Arc::new(StringArray::from(rows.iter().map(|r| r.proof_hash.as_str()).collect::<Vec<_>>())),
+        ],
+    )
+    .expect("batch");
+    let file = std::fs::File::create(&out).unwrap();
+    let props = output::parquet_receipt_properties(&seal, "G^G MWIR AGC T^4 well dual-regime v3.0");
+    let mut w = ArrowWriter::try_new(file, schema, Some(props)).unwrap();
+    w.write(&batch).unwrap();
+    w.close().unwrap();
 
-    let fc = *failed_count.lock().unwrap();
-    let failure_rate = (fc as f64 / NUM_TRAJECTORIES as f64) * 100.0;
-    
-    println!("THERMAL_SIGHT_SATURATION PHYSICS AUDIT COMPLETE.");
-    println!("TOTAL TRAJECTORIES: {:?}", NUM_TRAJECTORIES);
-    println!("CATASTROPHIC TARGET TRACK LOSS RATE: {} ({:.2}%)", fc, failure_rate);
-    println!("EXECUTION TIME: {:?}", start_time.elapsed());
-    println!("SEALED TO: {}/thermal_sight_saturation.json\n", export_dir);
+    let n_f = n as f64;
+    let sat = rows.iter().filter(|r| r.is_well_saturated).count();
+    let blind = rows.iter().filter(|r| r.is_contrast_blinded).count();
+    println!(
+        "  saturated {sat} ({:.1}%)  blinded {blind} ({:.1}%)",
+        100.0 * sat as f64 / n_f,
+        100.0 * blind as f64 / n_f
+    );
+    println!("  seal {seal}");
+    println!("  parquet {out}");
+    println!("  {:?}", t0.elapsed());
 }

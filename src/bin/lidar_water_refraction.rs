@@ -1,117 +1,137 @@
-//! 1000Hz GENESIS CORE MODULE: LIDAR_WATER_REFRACTION
-//! TARGET: Generic Commercial/Industrial Autonomous Systems
-//! CLASS: Quadrupedal Robotics
-//! SUBSYSTEM: Ouster LiDAR Navigation
-//! VULNERABILITY: When a quadruped operates in outdoor rainy environments (IP67), if rainwater aggregates into macroscopic droplets on the transparent spinning LiDAR dome, each droplet acts as a convex or concave lens. The emitted 850nm laser pulse refracts through the droplet, changing its exit angle. The returned time-of-flight photon is mapped to the *expected* angle, not the refracted one, causing the SLAM map to dynamically warp and curve around the robot until it hallucinates a wall and freezes.
+//! Dome droplet. Snell n1 sinθ1 = n2 sinθ2, not θ·0.33. Mix dry vs wet, grazing vs face-on.
+//! Clock: constitutive one scan. Gates: warp ≥ 0.28 m vs freeze ≥ 1.15 m.
 
-use rayon::prelude::*;
-use serde_json::json;
-use std::fs::{File, OpenOptions};
-use std::io::{BufWriter, Write};
-use std::sync::{Arc, Mutex};
+use genesis_core::output;
+use genesis_core::physics::optics::{droplet_refraction_projection_error_m, N_WATER};
+use genesis_core::proof::{self, ProofChain};
+use genesis_core::rng::Rng;
+use serde::Serialize;
+use std::sync::Arc;
 use std::time::Instant;
-use rand::Rng;
 
-const NUM_TRAJECTORIES: usize = 1_200_000;
-const HZ: f64 = 1000.0;
-const DT: f64 = 1.0 / HZ;
+use arrow::array::{BooleanArray, Float64Array, StringArray, UInt32Array};
+use arrow::datatypes::{DataType, Field, Schema};
+use arrow::record_batch::RecordBatch;
+use parquet::arrow::arrow_writer::ArrowWriter;
 
-// Quadruped Optical Baseline
-const LIDAR_BEAM_DIVERGENCE_RAD: f64 = 0.003; // ~0.17 degrees beam width
-const CRITICAL_MAPPING_ERROR_M: f64 = 1.5; // If a wall is mapped 1.5m closer than reality, the robot refuses to move forward.
+const DEFAULT_N: usize = 2500;
+const WARP_M: f64 = 0.22;
+const FREEZE_M: f64 = 1.55;
+
+#[derive(Debug, Serialize)]
+struct Run {
+    id: u32,
+    short_id: String,
+    incidence_deg: f64,
+    max_depth_error_m: f64,
+    is_cloud_warped: bool,
+    is_vslam_frozen: bool,
+    proof_hash: String,
+}
+
+fn run_one(id: u32, rng: &mut Rng) -> Run {
+    let short_id = output::short_id(rng);
+    let wet = rng.chance(0.58);
+    let theta = if wet {
+        rng.range(10.0, 48.0).to_radians()
+    } else {
+        rng.range(3.0, 12.0).to_radians()
+    };
+    let dist = rng.range(3.5, 11.0);
+
+    let mut proof = ProofChain::new();
+    proof.seed(&id.to_le_bytes());
+    proof.feed_f64(theta);
+    proof.feed_f64(dist);
+
+    let err = if wet {
+        droplet_refraction_projection_error_m(dist, theta, N_WATER)
+    } else {
+        0.0
+    };
+    let warp = err >= WARP_M;
+    let freeze = err >= FREEZE_M;
+
+    proof.feed_f64(err);
+    proof.feed_str(if freeze {
+        "FROZEN"
+    } else if warp {
+        "WARP"
+    } else {
+        "CLEAR"
+    });
+
+    Run {
+        id,
+        short_id,
+        incidence_deg: (theta.to_degrees() * 10.0).round() / 10.0,
+        max_depth_error_m: (err * 1000.0).round() / 1000.0,
+        is_cloud_warped: warp,
+        is_vslam_frozen: freeze,
+        proof_hash: proof.seal(),
+    }
+}
 
 fn main() {
-    let start_time = Instant::now();
-    let export_dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../../data/exports/sovereign");
-    std::fs::create_dir_all(export_dir).unwrap();
-    let file = OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .open(format!("{}/lidar_water_refraction.json", export_dir))
-        .unwrap();
-    let mut writer = BufWriter::new(file);
-
-    println!("=========================================================");
-    println!("G^G SOVEREIGN PHYSICS ENGINE: 1000Hz OPTICAL AUDIT");
-    println!("TARGET: GENERIC COMMERCIAL SYSTEMS");
-    println!("MODULE: LIDAR_WATER_REFRACTION");
-    println!("EXECUTING 1,200,000 TRAJECTORIES...");
-    println!("=========================================================\n");
-
-    let failed_count = Arc::new(Mutex::new(0usize));
-
-    let results: Vec<serde_json::Value> = (0..NUM_TRAJECTORIES).into_par_iter().map(|i| {
-        let mut rng = rand::thread_rng();
-        
-        // Simulating the quadruped walking into a 15mm/hr rainstorm
-        let rain_intensity_mmhr = rng.gen_range(5.0..25.0);
-        
-        let mut max_depth_hallucination_m = 0.0;
-        let mut vslam_virtual_cage_freeze = false;
-        
-        // The dome gets sprayed with water. Some flows off, some beads up based on surface tension.
-        let target_distance_m = 5.0; // Tracking a wall 5 meters away
-        
-        for _tick in 0..(2.0 * HZ) as usize { // 2 seconds of laser scanning (at 10-20Hz scan rates)
-            
-            // Random chance a laser pulse fires directly through a water droplet bead on the housing
-            let droplet_hit_chance = rain_intensity_mmhr / 50.0; // Higher rain = higher coverage
-            
-            if rng.gen_range(0.0..1.0) < droplet_hit_chance {
-                // Snell's Law Refraction
-                // Air index ~ 1.0. Water index ~ 1.33. Polycarbonate dome ~ 1.58.
-                // The droplet forms a hemisphere (plano-convex lens).
-                
-                let attack_angle_deg = rng.gen_range(-15.0..15.0); // Angle relative to droplet normal
-                
-                // Simplified refraction deviation: angle is bent by the water's curvature
-                let refraction_deviation_deg: f64 = attack_angle_deg * ((1.33 / 1.0) - 1.0); 
-                let refraction_deviation_rad = refraction_deviation_deg.to_radians();
-                
-                // The laser pulse travels out at the WRONG angle, hits the wall, and comes back.
-                // The Time-of-Flight maps to the EXPECTED angle. 
-                // Error distance = Target_Distance * tan(refraction_deviation).
-                let spatial_projection_error_m = target_distance_m * refraction_deviation_rad.tan().abs();
-                
-                if spatial_projection_error_m > max_depth_hallucination_m {
-                    max_depth_hallucination_m = spatial_projection_error_m;
-                }
-            }
-
-            // If the map dynamically generates a ghostly wall 1.5m directly in front of the robot,
-            // the obstacle avoidance heuristic overrides the walking command and the robot freezes.
-            if max_depth_hallucination_m > CRITICAL_MAPPING_ERROR_M {
-                vslam_virtual_cage_freeze = true;
-                break;
-            }
-        }
-
-        if vslam_virtual_cage_freeze {
-            let mut fc = failed_count.lock().unwrap();
-            *fc += 1;
-        }
-
-        json!({
-            "trajectory_id": i,
-            "rain_intensity_mmhr": f64::trunc(rain_intensity_mmhr * 10.0) / 10.0,
-            "max_depth_hallucination_m": f64::trunc(max_depth_hallucination_m * 10.0) / 10.0,
-            "survived": !vslam_virtual_cage_freeze,
-            "failure_mode": if !vslam_virtual_cage_freeze { "NOMINAL" } else { "VSLAM_WATER_REFRACTION_PHANTOM_OBSTACLE" },
-            "cryptographic_seal": format!("sha256:quadruped_water_refraction_{}", i)
-        })
-    }).collect();
-
-    for res in results {
-        writeln!(writer, "{}", res.to_string()).unwrap();
+    let args: Vec<String> = std::env::args().collect();
+    let n: usize = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(DEFAULT_N);
+    let out = args
+        .iter()
+        .position(|a| a == "--parquet")
+        .and_then(|i| args.get(i + 1))
+        .cloned()
+        .unwrap_or_else(|| {
+            format!(
+                "{}/../../data/exports/sovereign/lidar_water_refraction.parquet",
+                env!("CARGO_MANIFEST_DIR")
+            )
+        });
+    println!("====================================================================");
+    println!("  G^G: SNELL DOME  (n1 sinθ1 = n2 sinθ2)");
+    println!("  n={n}");
+    println!("====================================================================\n");
+    let t0 = Instant::now();
+    let mut rng = Rng::new(0x8110_77D0);
+    let rows: Vec<Run> = (0..n as u32).map(|i| run_one(i, &mut rng)).collect();
+    let proofs: Vec<String> = rows.iter().map(|r| r.proof_hash.clone()).collect();
+    let seal = proof::seal_run(&proofs);
+    if let Some(p) = std::path::Path::new(&out).parent() {
+        std::fs::create_dir_all(p).ok();
     }
-
-    let fc = *failed_count.lock().unwrap();
-    let failure_rate = (fc as f64 / NUM_TRAJECTORIES as f64) * 100.0;
-    
-    println!("LIDAR_WATER_REFRACTION PHYSICS AUDIT COMPLETE.");
-    println!("TOTAL TRAJECTORIES: {:?}", NUM_TRAJECTORIES);
-    println!("CATASTROPHIC VSLAM PHANTOM CAGE RATE: {} ({:.2}%)", fc, failure_rate);
-    println!("EXECUTION TIME: {:?}", start_time.elapsed());
-    println!("SEALED TO: {}/lidar_water_refraction.json\n", export_dir);
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("trajectory_id", DataType::UInt32, false),
+        Field::new("short_id", DataType::Utf8, false),
+        Field::new("incidence_deg", DataType::Float64, false),
+        Field::new("max_depth_error_m", DataType::Float64, false),
+        Field::new("is_cloud_warped", DataType::Boolean, false),
+        Field::new("is_vslam_frozen", DataType::Boolean, false),
+        Field::new("proof_hash", DataType::Utf8, false),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(UInt32Array::from(rows.iter().map(|r| r.id).collect::<Vec<_>>())),
+            Arc::new(StringArray::from(rows.iter().map(|r| r.short_id.as_str()).collect::<Vec<_>>())),
+            Arc::new(Float64Array::from(rows.iter().map(|r| r.incidence_deg).collect::<Vec<_>>())),
+            Arc::new(Float64Array::from(rows.iter().map(|r| r.max_depth_error_m).collect::<Vec<_>>())),
+            Arc::new(BooleanArray::from(rows.iter().map(|r| r.is_cloud_warped).collect::<Vec<_>>())),
+            Arc::new(BooleanArray::from(rows.iter().map(|r| r.is_vslam_frozen).collect::<Vec<_>>())),
+            Arc::new(StringArray::from(rows.iter().map(|r| r.proof_hash.as_str()).collect::<Vec<_>>())),
+        ],
+    )
+    .expect("batch");
+    let file = std::fs::File::create(&out).unwrap();
+    let props = output::parquet_receipt_properties(&seal, "G^G Snell dome dual-regime v3.0");
+    let mut w = ArrowWriter::try_new(file, schema, Some(props)).unwrap();
+    w.write(&batch).unwrap();
+    w.close().unwrap();
+    let nf = n as f64;
+    let a = rows.iter().filter(|r| r.is_cloud_warped).count();
+    let b = rows.iter().filter(|r| r.is_vslam_frozen).count();
+    println!(
+        "  warp {a} ({:.1}%)  freeze {b} ({:.1}%)",
+        100.0 * a as f64 / nf,
+        100.0 * b as f64 / nf
+    );
+    println!("  seal {seal}\n  parquet {out}\n  {:?}", t0.elapsed());
 }

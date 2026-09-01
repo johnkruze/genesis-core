@@ -1,109 +1,139 @@
-//! 1000Hz GENESIS CORE MODULE: TENDON_SNAP
-//! TARGET: Generic Commercial/Industrial Autonomous Systems
-//! CLASS: Bipedal Humanoid
-//! SUBSYSTEM: End-to-End Neural Control & Wire-Driven Tendon Actuation
-//! VULNERABILITY: Localized cable fraying/snapping under unmodeled un-smoothed dynamic tension spikes.
+//! UHMWPE micro-braid shock. σ = F/A via cable_elastic_mechanics.
+//! Gates: σ ≥ 1800 MPa yield vs σ ≥ 2800 MPa UTS snap. Constitutive.
 
-use rayon::prelude::*;
-use serde_json::json;
-use std::fs::{File, OpenOptions};
-use std::io::{BufWriter, Write};
-use std::sync::{Arc, Mutex};
+use genesis_core::output;
+use genesis_core::physics::tribology::cable_elastic_mechanics;
+use genesis_core::proof::{self, ProofChain};
+use genesis_core::rng::Rng;
+use serde::Serialize;
+use std::sync::Arc;
 use std::time::Instant;
-use rand::Rng;
 
-const NUM_TRAJECTORIES: usize = 1_200_000;
-const HZ: f64 = 1000.0;
-const DT: f64 = 1.0 / HZ;
+use arrow::array::{BooleanArray, Float64Array, StringArray, UInt32Array};
+use arrow::datatypes::{DataType, Field, Schema};
+use arrow::record_batch::RecordBatch;
+use parquet::arrow::arrow_writer::ArrowWriter;
 
-// Synthetic Tendon Physics Baseline
-const CABLE_TENSILE_LIMIT_N: f64 = 2500.0; // Assume 2500 Newtons break force for synthetic tendon
-const PAYLOAD_MASS_KG: f64 = 15.0; // Box lift scenario
-const GRAVITY: f64 = 9.81;
+const DEFAULT_N: usize = 2500;
+const D_MM: f64 = 1.20;
+const L_M: f64 = 0.85;
+const E_GPA: f64 = 140.0;
+const YIELD_MPA: f64 = 1800.0;
+const UTS_MPA: f64 = 2800.0;
+
+#[derive(Debug, Serialize)]
+struct Run {
+    id: u32,
+    short_id: String,
+    shock_tension_n: f64,
+    peak_tensile_stress_mpa: f64,
+    elastic_elongation_mm: f64,
+    is_fiber_yield_warning: bool,
+    is_tendon_snapped: bool,
+    proof_hash: String,
+}
+
+fn run_one(id: u32, rng: &mut Rng) -> Run {
+    let short_id = output::short_id(rng);
+    let f = rng.range(1000.0, 4000.0);
+
+    let mut proof = ProofChain::new();
+    proof.seed(&id.to_le_bytes());
+    proof.feed_f64(f);
+
+    let (dl, stress) = cable_elastic_mechanics(f, L_M, D_MM, E_GPA);
+    let yld = stress >= YIELD_MPA;
+    let snap = stress >= UTS_MPA;
+
+    proof.feed_f64(stress);
+    proof.feed_str(if snap {
+        "SNAPPED"
+    } else if yld {
+        "YIELD"
+    } else {
+        "NOMINAL"
+    });
+
+    Run {
+        id,
+        short_id,
+        shock_tension_n: (f * 10.0).round() / 10.0,
+        peak_tensile_stress_mpa: (stress * 10.0).round() / 10.0,
+        elastic_elongation_mm: (dl * 1e3 * 100.0).round() / 100.0,
+        is_fiber_yield_warning: yld,
+        is_tendon_snapped: snap,
+        proof_hash: proof.seal(),
+    }
+}
 
 fn main() {
-    let start_time = Instant::now();
-    let export_dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../../data/exports/sovereign");
-    std::fs::create_dir_all(export_dir).unwrap();
-    let file = OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .open(format!("{}/humanoid_tendon_snap.json", export_dir))
-        .unwrap();
-    let mut writer = BufWriter::new(file);
+    let args: Vec<String> = std::env::args().collect();
+    let n: usize = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(DEFAULT_N);
+    let out = args
+        .iter()
+        .position(|a| a == "--parquet")
+        .and_then(|i| args.get(i + 1))
+        .cloned()
+        .unwrap_or_else(|| {
+            format!(
+                "{}/../../data/exports/sovereign/tendon_snap.parquet",
+                env!("CARGO_MANIFEST_DIR")
+            )
+        });
 
-    println!("=========================================================");
-    println!("G^G SOVEREIGN PHYSICS ENGINE: 1000Hz STRUCTURAL TENSION AUDIT");
-    println!("TARGET: GENERIC COMMERCIAL SYSTEMS");
-    println!("MODULE: TENDON_SNAP");
-    println!("EXECUTING 1,200,000 TRAJECTORIES...");
-    println!("=========================================================\n");
+    println!("====================================================================");
+    println!("  G^G: TENDON UTS  (σ = F/A, yield {YIELD_MPA} / UTS {UTS_MPA} MPa)");
+    println!("  n={n}");
+    println!("====================================================================\n");
 
-    let failed_count = Arc::new(Mutex::new(0usize));
+    let t0 = Instant::now();
+    let mut rng = Rng::new(0x7186_0006);
+    let rows: Vec<Run> = (0..n as u32).map(|i| run_one(i, &mut rng)).collect();
+    let proofs: Vec<String> = rows.iter().map(|r| r.proof_hash.clone()).collect();
+    let seal = proof::seal_run(&proofs);
 
-    let results: Vec<serde_json::Value> = (0..NUM_TRAJECTORIES).into_par_iter().map(|i| {
-        let mut rng = rand::thread_rng();
-        
-        let mut max_tension_experienced = 0.0;
-        let mut tendon_snapped = false;
-        
-        // Simulating a dynamic 15kg catch/lift. 
-        // End-to-End vision models are notoriously noisy. They output raw joint commands.
-        // A traditional PID loop uses heavy filtering. E2E models feed direct noise into actuators.
-        let neural_noise_amplitude = rng.gen_range(0.5..3.0); // Spasmodic neural output variance
-
-        for tick in 0..(2.0 * HZ) as usize { // 2 second dynamic lift window
-            let _time = tick as f64 * DT;
-
-            // Base tension required to hold payload (leverage assumed 10:1 ratio)
-            let base_tension = PAYLOAD_MASS_KG * GRAVITY * 10.0; 
-            
-            // The End-to-End model hallucinates a quick visual shift and issues a sharp jerk command
-            // Because it lacks internal kinematic smoothing logic, it commands instantaneous torque
-            let jerk_acceleration = base_tension * neural_noise_amplitude; 
-            
-            // Unmodeled mechanical resonance amplification
-            let resonance_spike = if tick % 42 == 0 { rng.gen_range(1.1..1.4) } else { 1.0 };
-            
-            let instantaneous_tension = base_tension + (jerk_acceleration * resonance_spike);
-
-            if instantaneous_tension > max_tension_experienced {
-                max_tension_experienced = instantaneous_tension;
-            }
-
-            if instantaneous_tension > CABLE_TENSILE_LIMIT_N {
-                tendon_snapped = true;
-                break;
-            }
-        }
-
-        if tendon_snapped {
-            let mut fc = failed_count.lock().unwrap();
-            *fc += 1;
-        }
-
-        json!({
-            "trajectory_id": i,
-            "neural_spasm_multiplier": f64::trunc(neural_noise_amplitude * 100.0) / 100.0,
-            "max_tension_experienced_N": f64::trunc(max_tension_experienced * 100.0) / 100.0,
-            "tendon_structural_limit_N": CABLE_TENSILE_LIMIT_N,
-            "survived": !tendon_snapped,
-            "failure_mode": if !tendon_snapped { "NOMINAL" } else { "E2E_GENERATIVE_TENDON_SHEAR" },
-            "cryptographic_seal": format!("sha256:humanoid_tendon_snap_{}", i)
-        })
-    }).collect();
-
-    for res in results {
-        writeln!(writer, "{}", res.to_string()).unwrap();
+    if let Some(p) = std::path::Path::new(&out).parent() {
+        std::fs::create_dir_all(p).ok();
     }
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("trajectory_id", DataType::UInt32, false),
+        Field::new("short_id", DataType::Utf8, false),
+        Field::new("shock_tension_n", DataType::Float64, false),
+        Field::new("peak_tensile_stress_mpa", DataType::Float64, false),
+        Field::new("elastic_elongation_mm", DataType::Float64, false),
+        Field::new("is_fiber_yield_warning", DataType::Boolean, false),
+        Field::new("is_tendon_snapped", DataType::Boolean, false),
+        Field::new("proof_hash", DataType::Utf8, false),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(UInt32Array::from(rows.iter().map(|r| r.id).collect::<Vec<_>>())),
+            Arc::new(StringArray::from(rows.iter().map(|r| r.short_id.as_str()).collect::<Vec<_>>())),
+            Arc::new(Float64Array::from(rows.iter().map(|r| r.shock_tension_n).collect::<Vec<_>>())),
+            Arc::new(Float64Array::from(rows.iter().map(|r| r.peak_tensile_stress_mpa).collect::<Vec<_>>())),
+            Arc::new(Float64Array::from(rows.iter().map(|r| r.elastic_elongation_mm).collect::<Vec<_>>())),
+            Arc::new(BooleanArray::from(rows.iter().map(|r| r.is_fiber_yield_warning).collect::<Vec<_>>())),
+            Arc::new(BooleanArray::from(rows.iter().map(|r| r.is_tendon_snapped).collect::<Vec<_>>())),
+            Arc::new(StringArray::from(rows.iter().map(|r| r.proof_hash.as_str()).collect::<Vec<_>>())),
+        ],
+    )
+    .expect("batch");
+    let file = std::fs::File::create(&out).unwrap();
+    let props = output::parquet_receipt_properties(&seal, "G^G tendon UTS dual-regime v3.0");
+    let mut w = ArrowWriter::try_new(file, schema, Some(props)).unwrap();
+    w.write(&batch).unwrap();
+    w.close().unwrap();
 
-    let fc = *failed_count.lock().unwrap();
-    let failure_rate = (fc as f64 / NUM_TRAJECTORIES as f64) * 100.0;
-    
-    println!("TENDON_SNAP PHYSICS AUDIT COMPLETE.");
-    println!("TOTAL TRAJECTORIES: {:?}", NUM_TRAJECTORIES);
-    println!("CATASTROPHIC TENDON SHEAR RATE: {} ({:.2}%)", fc, failure_rate);
-    println!("EXECUTION TIME: {:?}", start_time.elapsed());
-    println!("SEALED TO: {}/humanoid_tendon_snap.json\n", export_dir);
+    let n_f = n as f64;
+    let y = rows.iter().filter(|r| r.is_fiber_yield_warning).count();
+    let s = rows.iter().filter(|r| r.is_tendon_snapped).count();
+    println!(
+        "  yield {y} ({:.1}%)  snap {s} ({:.1}%)",
+        100.0 * y as f64 / n_f,
+        100.0 * s as f64 / n_f
+    );
+    println!("  seal {seal}");
+    println!("  parquet {out}");
+    println!("  {:?}", t0.elapsed());
 }

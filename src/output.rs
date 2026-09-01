@@ -141,3 +141,21 @@ impl DatasetStreamer {
         Ok(())
     }
 }
+
+/// Snappy Parquet writer props with the run seal in the file footer.
+/// Disk law: quote `cryptographic_seal` from this metadata, not from a sitting table.
+pub fn parquet_receipt_properties(
+    seal: &str,
+    generator: &str,
+) -> parquet::file::properties::WriterProperties {
+    use parquet::basic::Compression;
+    use parquet::file::metadata::KeyValue;
+    use parquet::file::properties::WriterProperties;
+    WriterProperties::builder()
+        .set_compression(Compression::SNAPPY)
+        .set_key_value_metadata(Some(vec![
+            KeyValue::new("cryptographic_seal".to_string(), seal.to_string()),
+            KeyValue::new("generator".to_string(), generator.to_string()),
+        ]))
+        .build()
+}

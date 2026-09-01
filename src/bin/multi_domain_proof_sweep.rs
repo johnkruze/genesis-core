@@ -73,7 +73,7 @@ mod targets {
                 domain: "Atheric",
                 batch_size: 250_000,
                 parameters: DomainParams::Atheric {
-                    frequency: 432.0,
+                    frequency: 2.4e9,
                     noise_floor: -110.0,
                 },
             },

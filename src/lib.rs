@@ -101,5 +101,25 @@ pub extern "C" fn ztp_micro_evaluate_release(
     }
 }
 
+#[unsafe(no_mangle)]
+pub extern "C" fn ztp_dexterous_evaluate_hand(
+    state: *mut physics::dexterous::C_HandTendonState,
+    dt: f32,
+) -> physics::dexterous::C_HandTendonResult {
+    if state.is_null() {
+        return physics::dexterous::C_HandTendonResult {
+            tendon_overstretch: false,
+            pad_slip: false,
+            commanded_force: 0.0,
+            margin: 0.0,
+            tendon_tension_n: 0.0,
+            pad_normal_n: 0.0,
+            stretch_m: 0.0,
+            strain: 0.0,
+        };
+    }
+    unsafe { physics::dexterous::evaluate_hand_tendon_dynamics(&mut *state, dt) }
+}
+
 
 

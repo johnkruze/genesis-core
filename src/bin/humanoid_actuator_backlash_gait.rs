@@ -1,111 +1,178 @@
-//! 1000Hz GENESIS CORE MODULE: HUMANOID_ACTUATOR_BACKLASH_GAIT
-//! TARGET: Generic Commercial/Industrial Autonomous Systems
-//! CLASS: Bipedal Humanoid
-//! SUBSYSTEM: Idealized RL Locomotion Policy
-//! VULNERABILITY: Idealized trainers enforce perfect, immediate torque transfer. It does not natively model the 0.5-2.0 degrees of mechanical backlash (slop) in high-ratio planetary gearboxes. Over millions of steps, this persistent unmodeled deadband accumulates catastrophic phase-lag in the walking gait cycle, leading to resonance and self-destruction.
+//! Bipedal CoM as inverted pendulum with gearbox deadband on the ankle PD.
+//! k_p > m g h or the upright is unstabilizable. Clock: 100 Hz, 8 s (10 strides).
+//! Gates: |θ| ≥ 0.06 rad asymmetry vs |θ| ≥ 0.20 rad fall.
+//! Organ: resonance::InvertedPendulum, backlash_deadband_torque_nm.
+//! Not tribology — locomotion. TSV organ = resonance.
 
-use rayon::prelude::*;
-use serde_json::json;
-use std::fs::{File, OpenOptions};
-use std::io::{BufWriter, Write};
-use std::sync::{Arc, Mutex};
+use genesis_core::output;
+use genesis_core::physics::resonance::{
+    backlash_deadband_torque_nm, pd_ankle_torque_nm, InvertedPendulum,
+};
+use genesis_core::proof::{self, ProofChain};
+use genesis_core::rng::Rng;
+use serde::Serialize;
+use std::sync::Arc;
 use std::time::Instant;
-use rand::Rng;
 
-const NUM_TRAJECTORIES: usize = 1_200_000;
-const HZ: f64 = 1000.0;
-const DT: f64 = 1.0 / HZ;
+use arrow::array::{BooleanArray, Float64Array, StringArray, UInt32Array};
+use arrow::datatypes::{DataType, Field, Schema};
+use arrow::record_batch::RecordBatch;
+use parquet::arrow::arrow_writer::ArrowWriter;
 
-// Humanoid Actuator Baseline
-const NOMINAL_GAIT_CYCLE_S: f64 = 0.8; // Time for one full left-right step
-const CRITICAL_PHASE_LAG_S: f64 = 0.15; // Being 150ms out-of-phase with the COM swing means the foot lands while the body is already falling.
+const DEFAULT_N: usize = 2500;
+const DT: f64 = 0.01;
+const HORIZON_S: f64 = 8.0;
+const ASYM_RAD: f64 = 0.06;
+const FALL_RAD: f64 = 0.20;
 
-fn main() {
-    let start_time = Instant::now();
-    let export_dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../../data/exports/sovereign");
-    std::fs::create_dir_all(export_dir).unwrap();
-    let file = OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .open(format!("{}/humanoid_actuator_backlash_gait.json", export_dir))
-        .unwrap();
-    let mut writer = BufWriter::new(file);
+#[derive(Debug, Serialize)]
+struct Run {
+    id: u32,
+    short_id: String,
+    gearbox_backlash_mrad: f64,
+    max_tracking_error_rad: f64,
+    final_com_pitch_error_rad: f64,
+    is_gait_asymmetric: bool,
+    is_dynamic_fall_failed: bool,
+    proof_hash: String,
+}
 
-    println!("=========================================================");
-    println!("G^G SOVEREIGN PHYSICS ENGINE: 1000Hz KINEMATIC AUDIT");
-    println!("TARGET: GENERIC COMMERCIAL SYSTEMS");
-    println!("MODULE: HUMANOID_ACTUATOR_BACKLASH_GAIT");
-    println!("EXECUTING 1,200,000 TRAJECTORIES...");
-    println!("=========================================================\n");
+fn run_one(id: u32, rng: &mut Rng) -> Run {
+    let short_id = output::short_id(rng);
+    let backlash_mrad = rng.range(0.3, 6.0);
+    let mass = rng.range(58.0, 82.0);
+    let h = rng.range(0.80, 0.95);
+    let v_walk = rng.range(0.6, 1.6);
 
-    let failed_count = Arc::new(Mutex::new(0usize));
+    let mut proof = ProofChain::new();
+    proof.seed(&id.to_le_bytes());
+    proof.feed_f64(backlash_mrad);
+    proof.feed_f64(mass);
+    proof.feed_f64(h);
+    proof.feed_f64(v_walk);
 
-    let results: Vec<serde_json::Value> = (0..NUM_TRAJECTORIES).into_par_iter().map(|i| {
-        let mut rng = rand::thread_rng();
-        
-        let mut accumulated_phase_lag_s = 0.0;
-        let mut catastrophic_fall = false;
-        
-        // Simulating the robot walking for 1 minute (75 gait cycles)
-        // Backlash is randomly distributed based on manufacturing tolerances and gear wear over time.
-        // E.g. A well-worn planetary gear might have 1.5 degrees of slop upon reversing direction.
-        let gearbox_backlash_deg = rng.gen_range(0.2..2.5); 
-        
-        let total_gait_cycles = 75;
+    let mut plant = InvertedPendulum::new(0.02, h, mass);
+    let kp = plant.mgh_nm_per_rad() * rng.range(1.15, 1.80);
+    let kd = 2.0 * (kp * plant.inertia_kg_m2()).sqrt() * rng.range(0.4, 0.9);
+    let tau_max = rng.range(80.0, 140.0);
+    let k_series = rng.range(400.0, 1800.0);
+    let tau_db = k_series * (backlash_mrad * 1e-3);
 
-        for _cycle in 0..total_gait_cycles {
-            
-            // In a single gait cycle, the hip and knee joints must reverse direction twice (swing phase, stance phase).
-            // At every directional change, the motor spins through the backlash deadband before the leg physically moves.
-            
-            // Time lost per reversal = Backlash Angle / Motor Velocity
-            // Average motor velocity in a walk is ~180 deg/sec
-            let deadband_transit_time_s = gearbox_backlash_deg / 180.0;
-            
-            // 4 major reversals per cycle per leg
-            let time_lost_per_cycle = deadband_transit_time_s * 4.0; 
-            
-            // The RL policy expects the leg to be planted at exactly t=0.4s. 
-            // The physical leg arrives `total_time_lost` late.
-            // The network has no latent state memory to "learn" this permanent offset over time; it only reacts to instantaneous joint state.
-            // When it reacts, it commands higher torque to catch up, inducing ringing.
-            
-            let reactive_ringing_multiplier = rng.gen_range(1.0..1.2);
-            accumulated_phase_lag_s += time_lost_per_cycle * reactive_ringing_multiplier;
-
-            // If the physical foot lands 150ms after the Center of Mass has already shifted past the support polygon, it falls.
-            if accumulated_phase_lag_s > CRITICAL_PHASE_LAG_S {
-                catastrophic_fall = true;
-                break;
-            }
+    let mut peak = plant.theta_rad.abs();
+    let steps = (HORIZON_S / DT) as usize;
+    for k in 0..steps {
+        // Two torque reversals per 0.8 s stride: a small push at heel-strike.
+        let t = k as f64 * DT;
+        let stride_phase = (t / 0.80).fract();
+        if stride_phase < DT / 0.80 {
+            plant.omega_rad_s += 0.035 * v_walk * (1.0 + backlash_mrad / 8.0);
         }
-
-        if catastrophic_fall {
-            let mut fc = failed_count.lock().unwrap();
-            *fc += 1;
+        let cmd = pd_ankle_torque_nm(plant.theta_rad, plant.omega_rad_s, kp, kd, tau_max);
+        let tau = backlash_deadband_torque_nm(cmd, tau_db);
+        plant.step(tau, DT);
+        let e = plant.theta_rad.abs();
+        if e > peak {
+            peak = e;
         }
-
-        json!({
-            "trajectory_id": i,
-            "gearbox_backlash_deg": f64::trunc(gearbox_backlash_deg * 100.0) / 100.0,
-            "accumulated_phase_lag_s": f64::trunc(accumulated_phase_lag_s * 1000.0) / 1000.0,
-            "survived": !catastrophic_fall,
-            "failure_mode": if !catastrophic_fall { "NOMINAL" } else { "UNMODELED_BACKLASH_RESONANCE_FALL" },
-            "cryptographic_seal": format!("sha256:humanoid_gait_backlash_{}", i)
-        })
-    }).collect();
-
-    for res in results {
-        writeln!(writer, "{}", res.to_string()).unwrap();
+        if peak >= FALL_RAD {
+            break;
+        }
+        if k % 100 == 0 {
+            proof.feed_f64(plant.theta_rad);
+        }
     }
 
-    let fc = *failed_count.lock().unwrap();
-    let failure_rate = (fc as f64 / NUM_TRAJECTORIES as f64) * 100.0;
-    
-    println!("HUMANOID_ACTUATOR_BACKLASH_GAIT PHYSICS AUDIT COMPLETE.");
-    println!("TOTAL TRAJECTORIES: {:?}", NUM_TRAJECTORIES);
-    println!("CATASTROPHIC PHASE-LAG COLLAPSE RATE: {} ({:.2}%)", fc, failure_rate);
-    println!("EXECUTION TIME: {:?}", start_time.elapsed());
-    println!("SEALED TO: {}/humanoid_actuator_backlash_gait.json\n", export_dir);
+    let asym = peak >= ASYM_RAD;
+    let fall = peak >= FALL_RAD;
+    proof.feed_f64(peak);
+    proof.feed_str(if fall {
+        "FALL"
+    } else if asym {
+        "ASYMMETRIC"
+    } else {
+        "NOMINAL"
+    });
+
+    Run {
+        id,
+        short_id,
+        gearbox_backlash_mrad: (backlash_mrad * 100.0).round() / 100.0,
+        max_tracking_error_rad: (peak * 1000.0).round() / 1000.0,
+        final_com_pitch_error_rad: (plant.theta_rad * 1000.0).round() / 1000.0,
+        is_gait_asymmetric: asym,
+        is_dynamic_fall_failed: fall,
+        proof_hash: proof.seal(),
+    }
+}
+
+fn main() {
+    let args: Vec<String> = std::env::args().collect();
+    let n: usize = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(DEFAULT_N);
+    let out = args
+        .iter()
+        .position(|a| a == "--parquet")
+        .and_then(|i| args.get(i + 1))
+        .cloned()
+        .unwrap_or_else(|| {
+            format!(
+                "{}/../../data/exports/sovereign/humanoid_actuator_backlash_gait.parquet",
+                env!("CARGO_MANIFEST_DIR")
+            )
+        });
+
+    println!("====================================================================");
+    println!("  G^G: GAIT LIP + BACKLASH  (100 Hz, k_p > m g h)");
+    println!("  n={n}  asym {ASYM_RAD} rad  fall {FALL_RAD} rad");
+    println!("====================================================================\n");
+
+    let t0 = Instant::now();
+    let mut rng = Rng::new(0x7187_0007);
+    let rows: Vec<Run> = (0..n as u32).map(|i| run_one(i, &mut rng)).collect();
+    let proofs: Vec<String> = rows.iter().map(|r| r.proof_hash.clone()).collect();
+    let seal = proof::seal_run(&proofs);
+
+    if let Some(p) = std::path::Path::new(&out).parent() {
+        std::fs::create_dir_all(p).ok();
+    }
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("trajectory_id", DataType::UInt32, false),
+        Field::new("short_id", DataType::Utf8, false),
+        Field::new("gearbox_backlash_mrad", DataType::Float64, false),
+        Field::new("max_tracking_error_rad", DataType::Float64, false),
+        Field::new("final_com_pitch_error_rad", DataType::Float64, false),
+        Field::new("is_gait_asymmetric", DataType::Boolean, false),
+        Field::new("is_dynamic_fall_failed", DataType::Boolean, false),
+        Field::new("proof_hash", DataType::Utf8, false),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(UInt32Array::from(rows.iter().map(|r| r.id).collect::<Vec<_>>())),
+            Arc::new(StringArray::from(rows.iter().map(|r| r.short_id.as_str()).collect::<Vec<_>>())),
+            Arc::new(Float64Array::from(rows.iter().map(|r| r.gearbox_backlash_mrad).collect::<Vec<_>>())),
+            Arc::new(Float64Array::from(rows.iter().map(|r| r.max_tracking_error_rad).collect::<Vec<_>>())),
+            Arc::new(Float64Array::from(rows.iter().map(|r| r.final_com_pitch_error_rad).collect::<Vec<_>>())),
+            Arc::new(BooleanArray::from(rows.iter().map(|r| r.is_gait_asymmetric).collect::<Vec<_>>())),
+            Arc::new(BooleanArray::from(rows.iter().map(|r| r.is_dynamic_fall_failed).collect::<Vec<_>>())),
+            Arc::new(StringArray::from(rows.iter().map(|r| r.proof_hash.as_str()).collect::<Vec<_>>())),
+        ],
+    )
+    .expect("batch");
+    let file = std::fs::File::create(&out).unwrap();
+    let props = output::parquet_receipt_properties(&seal, "G^G gait LIP backlash dual-regime v3.0");
+    let mut w = ArrowWriter::try_new(file, schema, Some(props)).unwrap();
+    w.write(&batch).unwrap();
+    w.close().unwrap();
+
+    let n_f = n as f64;
+    let a = rows.iter().filter(|r| r.is_gait_asymmetric).count();
+    let f = rows.iter().filter(|r| r.is_dynamic_fall_failed).count();
+    println!(
+        "  asymmetric {a} ({:.1}%)  fall {f} ({:.1}%)",
+        100.0 * a as f64 / n_f,
+        100.0 * f as f64 / n_f
+    );
+    println!("  seal {seal}");
+    println!("  parquet {out}");
+    println!("  {:?}", t0.elapsed());
 }

@@ -1,140 +1,162 @@
-//! 1000Hz GENESIS CORE MODULE: HYDRAULIC_SHEAR_STICTION
-//! TARGET: Generic Commercial/Industrial Autonomous Systems
-//! CLASS: Generic Autonomous Platform
-//! SUBSYSTEM: Autonomous Turret AI Controller
-//! VULNERABILITY: RCV autonomous tracking AI is tuned using standard hydraulic responses at 20C. When deploying to Arctic conditions (-40C), the hydraulic fluid viscosity increases exponentially. The AI commands the turret to track a fast-moving drone, but the turret lags due to viscous drag. To compensate, the AI integrates the massive tracking error and dumps 100% pressure into the actuator. The static friction breaks violently, and the thick, spongy fluid violently slingshots the 2-ton turret past the target, resulting in catastrophic tracking divergence.
+//! Arctic turret. Walther visc, then organ viscous drag. Not 14·exp((20−T)·0.08).
+//! Mix arctic vs temperate. Clock: 50 Hz, 5 s. Gates: lag ≥ 2° vs sling ≥ 8°.
 
-use rayon::prelude::*;
-use serde_json::json;
-use std::fs::{File, OpenOptions};
-use std::io::{BufWriter, Write};
-use std::sync::{Arc, Mutex};
+use genesis_core::output;
+use genesis_core::physics::hydraulics::hydraulic_actuator_viscous_drag_n;
+use genesis_core::physics::thermal::walther_lubricant_viscosity_cst;
+use genesis_core::proof::{self, ProofChain};
+use genesis_core::rng::Rng;
+use serde::Serialize;
+use std::sync::Arc;
 use std::time::Instant;
-use rand::Rng;
 
-const NUM_TRAJECTORIES: usize = 1_200_000;
-const HZ: f64 = 1000.0;
-const DT: f64 = 1.0 / HZ;
+use arrow::array::{BooleanArray, Float64Array, StringArray, UInt32Array};
+use arrow::datatypes::{DataType, Field, Schema};
+use arrow::record_batch::RecordBatch;
+use parquet::arrow::arrow_writer::ArrowWriter;
 
-// Arctic Hydraulic Baseline
-const CRITICAL_TRACKING_ERROR_DEG: f64 = 8.0; // If the turret misses by > 8 degrees, it loses radar-lock on the drone.
+const DEFAULT_N: usize = 2500;
+const DT: f64 = 0.02;
+const HORIZON_S: f64 = 5.0;
+const WALTHER_A: f64 = 9.0;
+const WALTHER_B: f64 = 3.55;
+const LAG_DEG: f64 = 4.5;
+const SLING_DEG: f64 = 8.0;
+
+#[derive(Debug, Serialize)]
+struct Run {
+    id: u32,
+    short_id: String,
+    ambient_temp_c: f64,
+    max_tracking_error_deg: f64,
+    is_lagging: bool,
+    is_radar_lock_lost: bool,
+    proof_hash: String,
+}
+
+fn run_one(id: u32, rng: &mut Rng) -> Run {
+    let short_id = output::short_id(rng);
+    let arctic = rng.chance(0.42);
+    let t_c = if arctic {
+        rng.range(-42.0, -18.0)
+    } else {
+        rng.range(0.0, 28.0)
+    };
+
+    let mut proof = ProofChain::new();
+    proof.seed(&id.to_le_bytes());
+    proof.feed_f64(t_c);
+
+    let nu = walther_lubricant_viscosity_cst(WALTHER_A, WALTHER_B, t_c);
+    let mut th = 0.0;
+    let mut w = 0.0;
+    let mut peak: f64 = 0.0;
+    let tgt_rate = 0.12; // rad/s
+    let steps = (HORIZON_S / DT) as usize;
+    for k in 0..steps {
+        let tgt = tgt_rate * k as f64 * DT;
+        let err = tgt - th;
+        let tau_cmd = (280.0 * err - 35.0 * w).clamp(-400.0, 400.0);
+        let v_piston = (w * 0.30).abs();
+        let drag = hydraulic_actuator_viscous_drag_n(nu, 870.0, v_piston.max(0.005), 0.008, 2e-5);
+        let tau_drag = drag * 0.30;
+        let coulomb = 8.0 + 0.006 * nu;
+        let stuck = w.abs() < 1e-4 && tau_cmd.abs() < coulomb;
+        let tau_net = if stuck {
+            0.0
+        } else {
+            tau_cmd - tau_drag.copysign(w) - coulomb.copysign(tau_cmd)
+        };
+        w += (tau_net / 40.0) * DT;
+        th += w * DT;
+        peak = peak.max((tgt - th).abs());
+        if k % 10 == 0 {
+            proof.feed_f64(th);
+        }
+    }
+    let lag = peak.to_degrees() >= LAG_DEG;
+    let lost = peak.to_degrees() >= SLING_DEG;
+
+    proof.feed_f64(peak);
+    proof.feed_str(if lost {
+        "SLING"
+    } else if lag {
+        "LAG"
+    } else {
+        "LOCK"
+    });
+
+    Run {
+        id,
+        short_id,
+        ambient_temp_c: (t_c * 10.0).round() / 10.0,
+        max_tracking_error_deg: (peak.to_degrees() * 10.0).round() / 10.0,
+        is_lagging: lag,
+        is_radar_lock_lost: lost,
+        proof_hash: proof.seal(),
+    }
+}
 
 fn main() {
-    let start_time = Instant::now();
-    let export_dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../../data/exports/sovereign");
-    std::fs::create_dir_all(export_dir).unwrap();
-    let file = OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .open(format!("{}/hydraulic_shear_stiction.json", export_dir))
-        .unwrap();
-    let mut writer = BufWriter::new(file);
-
-    println!("=========================================================");
-    println!("G^G SOVEREIGN PHYSICS ENGINE: 1000Hz THERMO-FLUIDIC AUDIT");
-    println!("TARGET: GENERIC COMMERCIAL SYSTEMS");
-    println!("MODULE: HYDRAULIC_SHEAR_STICTION");
-    println!("EXECUTING 1,200,000 TRAJECTORIES...");
-    println!("=========================================================\n");
-
-    let failed_count = Arc::new(Mutex::new(0usize));
-
-    let results: Vec<serde_json::Value> = (0..NUM_TRAJECTORIES).into_par_iter().map(|i| {
-        let mut rng = rand::thread_rng();
-        
-        let mut max_tracking_error_deg = 0.0;
-        let mut radar_lock_loss_failure = false;
-        
-        // Simulating the RCV deploying in Anchorage / Arctic Circle
-        let ambient_temp_c = rng.gen_range(-45.0..-25.0); 
-        
-        // Hydraulic fluid viscosity (Centistokes - cSt) changes exponentially with temp
-        // E.g., MIL-PRF-87257 fluid: 14 cSt @ 20C, but spikes to 1500+ cSt @ -40C.
-        let nominal_viscosity_cst = 14.0;
-        let temp_exponent: f64 = (-ambient_temp_c + 20.0) * 0.08;
-        let actual_viscosity_cst = nominal_viscosity_cst * temp_exponent.exp();
-        
-        // Viscous Drag Coefficient scales linearly-ish with viscosity in this domain
-        let viscous_drag_coefficient = actual_viscosity_cst * 50.0; // Extreme damping
-
-        let mut actual_turret_angle_deg = 0.0;
-        let mut actual_turret_velocity = 0.0;
-        let mut target_drone_angle_deg = 0.0;
-        
-        let mut pid_integral = 0.0;
-
-        for tick in 0..(3.0 * HZ) as usize { // 3 seconds tracking a fast crossing drone
-            
-            // Fast moving FPV drone crossing laterally at 10 deg/sec
-            target_drone_angle_deg += 10.0 * DT;
-            
-            let angle_error = target_drone_angle_deg - actual_turret_angle_deg;
-            
-            // The AI is tuned for nominal 20C hydraulics. 
-            // It expects a responsive turret, so it has a moderate P gain and a fast I gain.
-            let k_p = 500.0; 
-            let k_i = 1200.0; 
-            
-            pid_integral += angle_error * DT;
-            
-            // Command is fundamentally torque mapped from pressure valves
-            let commanded_torque_nm = (k_p * angle_error) + (k_i * pid_integral);
-
-            // The physical fluid imposes immense drag at -40C. 
-            let viscous_drag_torque = viscous_drag_coefficient * actual_turret_velocity;
-            
-            let net_torque = commanded_torque_nm - viscous_drag_torque;
-            
-            // Turret Moment of Inertia (2-ton gun)
-            let turret_moi = 1500.0; 
-            
-            let angular_acceleration = net_torque / turret_moi;
-            
-            actual_turret_velocity += angular_acceleration * DT;
-            actual_turret_angle_deg += actual_turret_velocity * DT;
-
-            let instantaneous_error = (target_drone_angle_deg - actual_turret_angle_deg).abs();
-            if instantaneous_error > max_tracking_error_deg {
-                max_tracking_error_deg = instantaneous_error;
-            }
-
-            // The AI allows the error to build up because the turret is stuck in the thick fluid.
-            // When the integral term finally generates enough pressure to overcome the drag, 
-            // it violently over-corrects (because it never un-winds the massive integral sum fast enough).
-            // It slingshots past the target drone, breaking the radar tracking envelope.
-            if instantaneous_error > CRITICAL_TRACKING_ERROR_DEG {
-                radar_lock_loss_failure = true;
-                break;
-            }
-        }
-
-        if radar_lock_loss_failure {
-            let mut fc = failed_count.lock().unwrap();
-            *fc += 1;
-        }
-
-        json!({
-            "trajectory_id": i,
-            "ambient_temp_C": f64::trunc(ambient_temp_c * 10.0) / 10.0,
-            "fluid_viscosity_cSt": f64::trunc(actual_viscosity_cst * 1.0) / 1.0,
-            "max_tracking_error_deg": f64::trunc(max_tracking_error_deg * 10.0) / 10.0,
-            "survived": !radar_lock_loss_failure,
-            "failure_mode": if !radar_lock_loss_failure { "NOMINAL" } else { "ARCTIC_VISCOUS_SLINGSHOT_DIVERGENCE" },
-            "cryptographic_seal": format!("sha256:arctic_hydraulic_stiction_{}", i)
-        })
-    }).collect();
-
-    for res in results {
-        writeln!(writer, "{}", res.to_string()).unwrap();
+    let args: Vec<String> = std::env::args().collect();
+    let n: usize = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(DEFAULT_N);
+    let out = args
+        .iter()
+        .position(|a| a == "--parquet")
+        .and_then(|i| args.get(i + 1))
+        .cloned()
+        .unwrap_or_else(|| {
+            format!(
+                "{}/../../data/exports/sovereign/hydraulic_shear_stiction.parquet",
+                env!("CARGO_MANIFEST_DIR")
+            )
+        });
+    println!("====================================================================");
+    println!("  G^G: WALTHER STICK  (87257 named, 50 Hz)");
+    println!("  n={n}");
+    println!("====================================================================\n");
+    let t0 = Instant::now();
+    let mut rng = Rng::new(0x5E11_00AA);
+    let rows: Vec<Run> = (0..n as u32).map(|i| run_one(i, &mut rng)).collect();
+    let proofs: Vec<String> = rows.iter().map(|r| r.proof_hash.clone()).collect();
+    let seal = proof::seal_run(&proofs);
+    if let Some(p) = std::path::Path::new(&out).parent() {
+        std::fs::create_dir_all(p).ok();
     }
-
-    let fc = *failed_count.lock().unwrap();
-    let failure_rate = (fc as f64 / NUM_TRAJECTORIES as f64) * 100.0;
-    
-    println!("HYDRAULIC_SHEAR_STICTION PHYSICS AUDIT COMPLETE.");
-    println!("TOTAL TRAJECTORIES: {:?}", NUM_TRAJECTORIES);
-    println!("CATASTROPHIC TARGET LOCK DIVERGENCE RATE: {} ({:.2}%)", fc, failure_rate);
-    println!("EXECUTION TIME: {:?}", start_time.elapsed());
-    println!("SEALED TO: {}/hydraulic_shear_stiction.json\n", export_dir);
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("trajectory_id", DataType::UInt32, false),
+        Field::new("short_id", DataType::Utf8, false),
+        Field::new("ambient_temp_c", DataType::Float64, false),
+        Field::new("max_tracking_error_deg", DataType::Float64, false),
+        Field::new("is_lagging", DataType::Boolean, false),
+        Field::new("is_radar_lock_lost", DataType::Boolean, false),
+        Field::new("proof_hash", DataType::Utf8, false),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(UInt32Array::from(rows.iter().map(|r| r.id).collect::<Vec<_>>())),
+            Arc::new(StringArray::from(rows.iter().map(|r| r.short_id.as_str()).collect::<Vec<_>>())),
+            Arc::new(Float64Array::from(rows.iter().map(|r| r.ambient_temp_c).collect::<Vec<_>>())),
+            Arc::new(Float64Array::from(rows.iter().map(|r| r.max_tracking_error_deg).collect::<Vec<_>>())),
+            Arc::new(BooleanArray::from(rows.iter().map(|r| r.is_lagging).collect::<Vec<_>>())),
+            Arc::new(BooleanArray::from(rows.iter().map(|r| r.is_radar_lock_lost).collect::<Vec<_>>())),
+            Arc::new(StringArray::from(rows.iter().map(|r| r.proof_hash.as_str()).collect::<Vec<_>>())),
+        ],
+    )
+    .expect("batch");
+    let file = std::fs::File::create(&out).unwrap();
+    let props = output::parquet_receipt_properties(&seal, "G^G Walther stiction dual-regime v3.0");
+    let mut w = ArrowWriter::try_new(file, schema, Some(props)).unwrap();
+    w.write(&batch).unwrap();
+    w.close().unwrap();
+    let nf = n as f64;
+    let a = rows.iter().filter(|r| r.is_lagging).count();
+    let b = rows.iter().filter(|r| r.is_radar_lock_lost).count();
+    println!(
+        "  lag {a} ({:.1}%)  sling {b} ({:.1}%)",
+        100.0 * a as f64 / nf,
+        100.0 * b as f64 / nf
+    );
+    println!("  seal {seal}\n  parquet {out}\n  {:?}", t0.elapsed());
 }

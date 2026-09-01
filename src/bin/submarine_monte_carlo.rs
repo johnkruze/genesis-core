@@ -1,5 +1,5 @@
 //! Hull crush vs power-starved ascent. Buoyancy + hydrostatic from MarinePhysics.
-//! Dual-regime: depth > true crush is not the same column as battery hitting reserve.
+//! Dual-regime exclusive: hull crush is terminal. Starve only seals if the hull lives.
 //! Believed crush can be optimistic — that is the reconstructible mission error.
 
 use genesis_core::output;
@@ -155,10 +155,12 @@ fn run_one(id: u32, rng: &mut Rng) -> SubRun {
 
     let peak_p = physics.hydrostatic_pressure(max_depth) / 1.0e6;
     let used = (1.0 - auv.battery_fraction()) * 100.0;
+    // Crush is the terminal event. Starve is the other axis only when the hull lives.
+    let starved_flag = starved && !crushed;
     proof.feed_f64(max_depth);
     proof.feed_str(if crushed {
         "HULL_CRUSHED"
-    } else if starved {
+    } else if starved_flag {
         "POWER_STARVED"
     } else {
         "SURFACED"
@@ -177,7 +179,7 @@ fn run_one(id: u32, rng: &mut Rng) -> SubRun {
         peak_pressure_mpa: peak_p,
         battery_used_pct: used,
         is_crushed: crushed,
-        is_power_starved: starved,
+        is_power_starved: starved_flag,
         proof_hash: proof.seal(),
     }
 }
@@ -255,7 +257,7 @@ fn main() {
             parquet::file::metadata::KeyValue::new("cryptographic_seal".to_string(), run_proof.clone()),
             parquet::file::metadata::KeyValue::new(
                 "generator".to_string(),
-                "G^G submarine crush dual-regime v1.0".to_string(),
+                "G^G submarine crush dual-regime v1.1".to_string(),
             ),
         ]))
         .build();
@@ -266,19 +268,15 @@ fn main() {
     let n_f = n as f64;
     let crush = rows.iter().filter(|r| r.is_crushed).count();
     let star = rows.iter().filter(|r| r.is_power_starved).count();
-    let both = rows
-        .iter()
-        .filter(|r| r.is_crushed && r.is_power_starved)
-        .count();
     let live = rows
         .iter()
         .filter(|r| !r.is_crushed && !r.is_power_starved)
         .count();
+    assert_eq!(crush + star + live, n as usize);
     println!(
-        "  crushed {crush} ({:.1}%)  power-starved {star} ({:.1}%)  both {both} ({:.1}%)  live {live} ({:.1}%)",
+        "  crushed {crush} ({:.1}%)  power-starved {star} ({:.1}%)  live {live} ({:.1}%)  exclusive",
         100.0 * crush as f64 / n_f,
         100.0 * star as f64 / n_f,
-        100.0 * both as f64 / n_f,
         100.0 * live as f64 / n_f
     );
     println!("  seal {run_proof}");

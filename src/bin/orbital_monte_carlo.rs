@@ -9,6 +9,7 @@
 // This is the Dark Window. No human in the loop. The body proves sovereignty.
 
 use std::time::Instant;
+use std::sync::Arc;
 use genesis_core::physics::orbital::{
     self, OrbitalPhysics, SatelliteState,
     ReactionWheel, ThrusterSet, RateGyro, PowerSystem,
@@ -16,6 +17,10 @@ use genesis_core::physics::orbital::{
 use genesis_core::rng::Rng;
 use genesis_core::proof::{self, ProofChain};
 use genesis_core::output::{self, DatasetMetadata, TrajectoryRecord};
+use arrow::array::{BooleanArray, Float64Array, StringArray, UInt32Array};
+use arrow::datatypes::{DataType, Field, Schema};
+use arrow::record_batch::RecordBatch;
+use parquet::arrow::arrow_writer::ArrowWriter;
 
 // ─── FAILURE MODES ──────────────────────────────────────────────
 
@@ -76,6 +81,10 @@ struct TrajectoryResult {
     failure: Option<FailureMode>,
     wheel_saturations: u32,
     thruster_fires: u32,
+    is_tumble: bool,
+    is_wheelsat: bool,
+    is_power: bool,
+    is_arrested: bool,
     telemetry: Vec<serde_json::Value>,
 }
 
@@ -341,9 +350,23 @@ fn run_single_trajectory(
         recovery_time = step as f64 * dt; // total time used
     }
 
+    let is_arrested = phase == Phase::Stabilized;
+    let is_power = !is_arrested && outcome == "POWER_DEAD";
+    let is_wheelsat = !is_arrested && !is_power && matches!(failure, Some(FailureMode::WheelLock));
+    let is_tumble = !is_arrested && !is_power && !is_wheelsat;
+    let class = if is_arrested {
+        "ARRESTED"
+    } else if is_power {
+        "POWER"
+    } else if is_wheelsat {
+        "WHEELSAT"
+    } else {
+        "TUMBLE"
+    };
+
     proof.feed_f64(final_omega_mag);
     proof.feed_str(phase.as_str());
-    proof.feed_str(outcome);
+    proof.feed_str(class);
     let proof_hash = proof.seal();
 
     TrajectoryResult {
@@ -368,6 +391,10 @@ fn run_single_trajectory(
         failure,
         wheel_saturations,
         thruster_fires,
+        is_tumble,
+        is_wheelsat,
+        is_power,
+        is_arrested,
         telemetry,
     }
 }
@@ -376,11 +403,20 @@ fn main() {
     let args: Vec<String> = std::env::args().collect();
     let n_trajectories: u32 = args.get(1)
         .and_then(|s| s.parse().ok())
-        .unwrap_or(10_000);
+        .unwrap_or(2_500);
     let json_output = args.iter().any(|a| a == "--json");
     let json_path = args.iter().position(|a| a == "--out")
         .and_then(|i| args.get(i + 1))
         .cloned();
+    let parquet_path = args.iter().position(|a| a == "--parquet")
+        .and_then(|i| args.get(i + 1))
+        .cloned()
+        .unwrap_or_else(|| {
+            format!(
+                "{}/../../data/exports/sovereign/orbital_tumble.parquet",
+                env!("CARGO_MANIFEST_DIR")
+            )
+        });
 
     if !json_output {
         println!("====================================================================");
@@ -512,6 +548,8 @@ fn main() {
     };
 
     let elapsed = start.elapsed();
+
+    write_orbital_parquet(&results, &run_proof, &parquet_path);
 
     // === JSON OUTPUT MODE ===
     if json_output || json_path.is_some() {
@@ -647,4 +685,67 @@ fn main() {
     println!("  {} trajectories x 100Hz x SHA-256 = SOVEREIGN", total);
     println!("  DARK WINDOW. NO STAR TRACKER. THE BODY FELT ITS WAY.");
     println!("====================================================================");
+}
+
+fn write_orbital_parquet(results: &[TrajectoryResult], seal: &str, out: &str) {
+    if let Some(p) = std::path::Path::new(out).parent() {
+        std::fs::create_dir_all(p).ok();
+    }
+    let n = results.len();
+    let unique: std::collections::HashSet<&str> = results.iter().map(|r| r.proof_hash.as_str()).collect();
+    assert_eq!(unique.len(), n, "proof_hash must be unique");
+    let both = results.iter().filter(|r| {
+        (r.is_tumble as u8) + (r.is_wheelsat as u8) + (r.is_power as u8) + (r.is_arrested as u8) != 1
+    }).count();
+    assert_eq!(both, 0, "exclusive partition");
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("trajectory_id", DataType::UInt32, false),
+        Field::new("short_id", DataType::Utf8, false),
+        Field::new("persona", DataType::Utf8, false),
+        Field::new("initial_omega_mag", DataType::Float64, false),
+        Field::new("final_omega_mag", DataType::Float64, false),
+        Field::new("altitude_km", DataType::Float64, false),
+        Field::new("recovery_time_s", DataType::Float64, false),
+        Field::new("is_tumble", DataType::Boolean, false),
+        Field::new("is_wheelsat", DataType::Boolean, false),
+        Field::new("is_power", DataType::Boolean, false),
+        Field::new("is_arrested", DataType::Boolean, false),
+        Field::new("proof_hash", DataType::Utf8, false),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(UInt32Array::from(results.iter().map(|r| r.id).collect::<Vec<_>>())),
+            Arc::new(StringArray::from(results.iter().map(|r| r.short_id.as_str()).collect::<Vec<_>>())),
+            Arc::new(StringArray::from(results.iter().map(|r| r.persona).collect::<Vec<_>>())),
+            Arc::new(Float64Array::from(results.iter().map(|r| r.initial_omega_mag).collect::<Vec<_>>())),
+            Arc::new(Float64Array::from(results.iter().map(|r| r.final_omega_mag).collect::<Vec<_>>())),
+            Arc::new(Float64Array::from(results.iter().map(|r| r.altitude_km).collect::<Vec<_>>())),
+            Arc::new(Float64Array::from(results.iter().map(|r| r.recovery_time_s).collect::<Vec<_>>())),
+            Arc::new(BooleanArray::from(results.iter().map(|r| r.is_tumble).collect::<Vec<_>>())),
+            Arc::new(BooleanArray::from(results.iter().map(|r| r.is_wheelsat).collect::<Vec<_>>())),
+            Arc::new(BooleanArray::from(results.iter().map(|r| r.is_power).collect::<Vec<_>>())),
+            Arc::new(BooleanArray::from(results.iter().map(|r| r.is_arrested).collect::<Vec<_>>())),
+            Arc::new(StringArray::from(results.iter().map(|r| r.proof_hash.as_str()).collect::<Vec<_>>())),
+        ],
+    )
+    .expect("batch");
+    let file = std::fs::File::create(out).unwrap();
+    let props = output::parquet_receipt_properties(seal, "G^G orbital tumble dual-regime v1.0");
+    let mut w = ArrowWriter::try_new(file, schema, Some(props)).unwrap();
+    w.write(&batch).unwrap();
+    w.close().unwrap();
+    let nf = n as f64;
+    let tumble = results.iter().filter(|r| r.is_tumble).count();
+    let wheel = results.iter().filter(|r| r.is_wheelsat).count();
+    let power = results.iter().filter(|r| r.is_power).count();
+    let arrested = results.iter().filter(|r| r.is_arrested).count();
+    eprintln!(
+        "  exclusive tumble {tumble} ({:.1}%)  wheelsat {wheel} ({:.1}%)  power {power} ({:.1}%)  arrested {arrested} ({:.1}%)",
+        100.0 * tumble as f64 / nf,
+        100.0 * wheel as f64 / nf,
+        100.0 * power as f64 / nf,
+        100.0 * arrested as f64 / nf
+    );
+    eprintln!("  unique proofs {n}  seal {seal}\n  parquet {out}");
 }

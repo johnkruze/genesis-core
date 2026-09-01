@@ -1,112 +1,142 @@
-//! 1000Hz GENESIS CORE MODULE: CABLE_STRETCH_BACKLASH
-//! TARGET: Generic Commercial/Industrial Autonomous Systems
-//! CLASS: Bipedal Humanoid
-//! SUBSYSTEM: End-to-End Neural Control & Wire-Driven Tendon Actuation
-//! VULNERABILITY: Synthetic tendons (Dyneema/Polymer) physically stretch and exhibit hysteresis under high loads. End-to-End models assume instantaneous 1:1 kinematic mapping, leading to complete degradation of mm-scale precision tasks (e.g. grasping a glass).
+//! Dyneema tendon elastic stretch. ΔL = F L / A E. Constitutive.
+//! Gates: ΔL ≥ 2 mm tracking degrade vs ΔL ≥ 5 mm control limit.
+//! Tension mix 70–1100 N so 5 mm binds. Organ: cable_elastic_mechanics.
 
-use rayon::prelude::*;
-use serde_json::json;
-use std::fs::{File, OpenOptions};
-use std::io::{BufWriter, Write};
-use std::sync::{Arc, Mutex};
+use genesis_core::output;
+use genesis_core::physics::tribology::cable_elastic_mechanics;
+use genesis_core::proof::{self, ProofChain};
+use genesis_core::rng::Rng;
+use serde::Serialize;
+use std::sync::Arc;
 use std::time::Instant;
-use rand::Rng;
 
-const NUM_TRAJECTORIES: usize = 1_200_000;
-const HZ: f64 = 1000.0;
-const DT: f64 = 1.0 / HZ;
+use arrow::array::{BooleanArray, Float64Array, StringArray, UInt32Array};
+use arrow::datatypes::{DataType, Field, Schema};
+use arrow::record_batch::RecordBatch;
+use parquet::arrow::arrow_writer::ArrowWriter;
 
-// Synthetic Tendon Stretch Baseline
-const CABLE_LENGTH_MM: f64 = 800.0; // Cable run from shoulder/torso actuator to wrist
-const BASE_CABLE_STIFFNESS: f64 = 1.0; // Assume 1mm elongation per 100N load
-const CRITICAL_PRECISION_ERROR_MM: f64 = 8.0; // Being 8mm off target causes a rigid glass to completely slip out of a 2-finger grasp
+const DEFAULT_N: usize = 2500;
+const L_M: f64 = 1.20;
+const D_MM: f64 = 1.50;
+const E_GPA: f64 = 120.0;
+const DEGRADE_MM: f64 = 2.0;
+const LIMIT_MM: f64 = 5.0;
+
+#[derive(Debug, Serialize)]
+struct Run {
+    id: u32,
+    short_id: String,
+    peak_tension_n: f64,
+    elastic_elongation_mm: f64,
+    tensile_stress_mpa: f64,
+    is_backlash_degraded: bool,
+    is_control_limit_exceeded: bool,
+    proof_hash: String,
+}
+
+fn run_one(id: u32, rng: &mut Rng) -> Run {
+    let short_id = output::short_id(rng);
+    let f = rng.range(70.0, 1100.0);
+
+    let mut proof = ProofChain::new();
+    proof.seed(&id.to_le_bytes());
+    proof.feed_f64(f);
+
+    let (dl, stress) = cable_elastic_mechanics(f, L_M, D_MM, E_GPA);
+    let mm = dl * 1000.0;
+    let deg = mm >= DEGRADE_MM;
+    let lim = mm >= LIMIT_MM;
+
+    proof.feed_f64(mm);
+    proof.feed_f64(stress);
+    proof.feed_str(if lim {
+        "CONTROL_LIMIT"
+    } else if deg {
+        "DEGRADED"
+    } else {
+        "NOMINAL"
+    });
+
+    Run {
+        id,
+        short_id,
+        peak_tension_n: (f * 10.0).round() / 10.0,
+        elastic_elongation_mm: (mm * 100.0).round() / 100.0,
+        tensile_stress_mpa: (stress * 10.0).round() / 10.0,
+        is_backlash_degraded: deg,
+        is_control_limit_exceeded: lim,
+        proof_hash: proof.seal(),
+    }
+}
 
 fn main() {
-    let start_time = Instant::now();
-    let export_dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../../data/exports/sovereign");
-    std::fs::create_dir_all(export_dir).unwrap();
-    let file = OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .open(format!("{}/cable_stretch_backlash.json", export_dir))
-        .unwrap();
-    let mut writer = BufWriter::new(file);
+    let args: Vec<String> = std::env::args().collect();
+    let n: usize = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(DEFAULT_N);
+    let out = args
+        .iter()
+        .position(|a| a == "--parquet")
+        .and_then(|i| args.get(i + 1))
+        .cloned()
+        .unwrap_or_else(|| {
+            format!(
+                "{}/../../data/exports/sovereign/cable_stretch_backlash.parquet",
+                env!("CARGO_MANIFEST_DIR")
+            )
+        });
 
-    println!("=========================================================");
-    println!("G^G SOVEREIGN PHYSICS ENGINE: 1000Hz KINEMATIC TOLERANCE AUDIT");
-    println!("TARGET: GENERIC COMMERCIAL SYSTEMS");
-    println!("MODULE: CABLE_STRETCH_BACKLASH");
-    println!("EXECUTING 1,200,000 TRAJECTORIES...");
-    println!("=========================================================\n");
+    println!("====================================================================");
+    println!("  G^G: DYNEEMA ΔL = FL/AE");
+    println!("  n={n}  degrade {DEGRADE_MM} mm  limit {LIMIT_MM} mm");
+    println!("====================================================================\n");
 
-    let failed_count = Arc::new(Mutex::new(0usize));
+    let t0 = Instant::now();
+    let mut rng = Rng::new(0x7185_0005);
+    let rows: Vec<Run> = (0..n as u32).map(|i| run_one(i, &mut rng)).collect();
+    let proofs: Vec<String> = rows.iter().map(|r| r.proof_hash.clone()).collect();
+    let seal = proof::seal_run(&proofs);
 
-    let results: Vec<serde_json::Value> = (0..NUM_TRAJECTORIES).into_par_iter().map(|i| {
-        let mut rng = rand::thread_rng();
-        
-        let mut grip_precision_error_mm = 0.0;
-        let mut task_failed = false;
-        
-        // Simulating the humanoid holding a heavy object (e.g. 10kg grocery bag) in one hand
-        // while attempting to grasp a delicate, rigid glass in the other.
-        // E2E models share latent spaces; the torque applied in the left arm affects the right arm via torso frame flex.
-        
-        let external_payload_n = rng.gen_range(50.0..150.0); // 5kg to 15kg load
-        
-        // The physical cable stretches permanently over its lifespan (creep), plus instantaneous elastic stretch
-        let lifecycle_creep_mm = rng.gen_range(0.5..5.0); // The cable is slightly permanently stretched
-        
-        // Simulating the 2 second approach vector to the glass
-        for _tick in 0..(2.0 * HZ) as usize { 
-            
-            // The AI commands the spool to reel in exactly 200mm of cable to reach the target X,Y,Z
-            // The AI assumes exactly 200mm of finger movement occurs.
-            
-            // Physical Reality: The force required to drag the arm through space against gravity
-            // plus the payload force stretches the cable dynamically.
-            // Humanoid joints run with immense mechanical disadvantage (e.g. 500mm lever arm lifting payload vs 20mm tendon attachment).
-            let mechanical_disadvantage_multiplier = 25.0;
-            let dynamic_tension_n = external_payload_n * rng.gen_range(0.8..1.2) * mechanical_disadvantage_multiplier; 
-            
-            let instantaneous_elongation_mm = (dynamic_tension_n / 1000.0) * BASE_CABLE_STIFFNESS;
-            
-            // The neural network is blind to both creep and elastic elongation
-            // So its actual end-effector position is lagging behind its assumed position
-            grip_precision_error_mm = instantaneous_elongation_mm + lifecycle_creep_mm;
-
-            if grip_precision_error_mm > CRITICAL_PRECISION_ERROR_MM {
-                task_failed = true;
-                break;
-            }
-        }
-
-        if task_failed {
-            let mut fc = failed_count.lock().unwrap();
-            *fc += 1;
-        }
-
-        json!({
-            "trajectory_id": i,
-            "external_payload_variance_N": f64::trunc(external_payload_n * 100.0) / 100.0,
-            "cable_creep_degradation_mm": f64::trunc(lifecycle_creep_mm * 100.0) / 100.0,
-            "max_precision_error_mm": f64::trunc(grip_precision_error_mm * 100.0) / 100.0,
-            "survived": !task_failed,
-            "failure_mode": if !task_failed { "NOMINAL" } else { "Unmodeled_TENDON_HYSTERESIS_GRIP_LOSS" },
-            "cryptographic_seal": format!("sha256:humanoid_cable_stretch_{}", i)
-        })
-    }).collect();
-
-    for res in results {
-        writeln!(writer, "{}", res.to_string()).unwrap();
+    if let Some(p) = std::path::Path::new(&out).parent() {
+        std::fs::create_dir_all(p).ok();
     }
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("trajectory_id", DataType::UInt32, false),
+        Field::new("short_id", DataType::Utf8, false),
+        Field::new("peak_tension_n", DataType::Float64, false),
+        Field::new("elastic_elongation_mm", DataType::Float64, false),
+        Field::new("tensile_stress_mpa", DataType::Float64, false),
+        Field::new("is_backlash_degraded", DataType::Boolean, false),
+        Field::new("is_control_limit_exceeded", DataType::Boolean, false),
+        Field::new("proof_hash", DataType::Utf8, false),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(UInt32Array::from(rows.iter().map(|r| r.id).collect::<Vec<_>>())),
+            Arc::new(StringArray::from(rows.iter().map(|r| r.short_id.as_str()).collect::<Vec<_>>())),
+            Arc::new(Float64Array::from(rows.iter().map(|r| r.peak_tension_n).collect::<Vec<_>>())),
+            Arc::new(Float64Array::from(rows.iter().map(|r| r.elastic_elongation_mm).collect::<Vec<_>>())),
+            Arc::new(Float64Array::from(rows.iter().map(|r| r.tensile_stress_mpa).collect::<Vec<_>>())),
+            Arc::new(BooleanArray::from(rows.iter().map(|r| r.is_backlash_degraded).collect::<Vec<_>>())),
+            Arc::new(BooleanArray::from(rows.iter().map(|r| r.is_control_limit_exceeded).collect::<Vec<_>>())),
+            Arc::new(StringArray::from(rows.iter().map(|r| r.proof_hash.as_str()).collect::<Vec<_>>())),
+        ],
+    )
+    .expect("batch");
+    let file = std::fs::File::create(&out).unwrap();
+    let props = output::parquet_receipt_properties(&seal, "G^G Dyneema FL/AE dual-regime v3.0");
+    let mut w = ArrowWriter::try_new(file, schema, Some(props)).unwrap();
+    w.write(&batch).unwrap();
+    w.close().unwrap();
 
-    let fc = *failed_count.lock().unwrap();
-    let failure_rate = (fc as f64 / NUM_TRAJECTORIES as f64) * 100.0;
-    
-    println!("CABLE_STRETCH_BACKLASH PHYSICS AUDIT COMPLETE.");
-    println!("TOTAL TRAJECTORIES: {:?}", NUM_TRAJECTORIES);
-    println!("CATASTROPHIC PRECISION GRASP FAILURE RATE: {} ({:.2}%)", fc, failure_rate);
-    println!("EXECUTION TIME: {:?}", start_time.elapsed());
-    println!("SEALED TO: {}/cable_stretch_backlash.json\n", export_dir);
+    let n_f = n as f64;
+    let d = rows.iter().filter(|r| r.is_backlash_degraded).count();
+    let lim = rows.iter().filter(|r| r.is_control_limit_exceeded).count();
+    println!(
+        "  degraded {d} ({:.1}%)  limit {lim} ({:.1}%)",
+        100.0 * d as f64 / n_f,
+        100.0 * lim as f64 / n_f
+    );
+    println!("  seal {seal}");
+    println!("  parquet {out}");
+    println!("  {:?}", t0.elapsed());
 }

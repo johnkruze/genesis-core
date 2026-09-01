@@ -1,23 +1,20 @@
-// Category 2: Autonomous Vehicles & Heavy Logistics (Tire-Terrain Dynamics)
-// 1000Hz Euler Integration of chassis dynamics under Pacejka magic formula tire-slip.
-// Enforces compile-time assertion that the state struct size is exactly 128 bytes to align with UMA cache lines.
+//! Hydroplane. Pacejka + freshwater ρ. 1 kHz chassis, 5 s. Mix dry vs puddle.
+//! Dual-regime: Pacejka μ < 0.25 vs missed 500 m arc (|y| < 10 m). reprC 128 cache line.
+//! Organ: terran::RHO_FRESHWATER. Do not run museum twin vehicle_hydroplaning.
 
+use genesis_core::output;
 use genesis_core::physics::terran::RHO_FRESHWATER;
+use genesis_core::proof::{self, ProofChain};
 use genesis_core::rng::Rng;
 use rayon::prelude::*;
 use serde::Serialize;
-use std::fs::File;
+use std::sync::Arc;
 use std::time::Instant;
-use sha2::{Sha256, Digest};
 
-// Arrow / Parquet imports for native writing
-use arrow::array::*;
+use arrow::array::{BooleanArray, Float64Array, StringArray, UInt32Array};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use parquet::arrow::arrow_writer::ArrowWriter;
-use parquet::file::properties::WriterProperties;
-use parquet::basic::Compression;
-use std::sync::Arc;
 
 const M_CHASSIS: f32 = 2000.0; // kg
 const G: f32 = 9.81;
@@ -28,6 +25,8 @@ const TRACK_W: f32 = 1.6;      // m - track width
 const H_CG: f32 = 0.6;         // m - center of gravity height
 const R_WHEEL: f32 = 0.35;     // m - wheel radius
 const I_WHEEL: f32 = 2.0;      // kg*m^2 - wheel rotational inertia
+const HYDRO_MU: f32 = 0.25;    // Pacejka μ collapse
+const CORNER_LOST_M: f32 = 10.0; // missed the ~500 m arc (dry sagitta ~40 m)
 
 // 32-Dimensional state struct, size assertion = exactly 128 bytes
 #[allow(dead_code)]
@@ -48,69 +47,21 @@ struct VehicleDynamicsState {
 // Compile-time assertion of exactly 128 bytes for L1/L2 cache line alignment
 const _: () = assert!(std::mem::size_of::<VehicleDynamicsState>() == 128);
 
-#[derive(Serialize)]
-struct VehicleStepState {
-    timestamp: f32,
-    chassis_q_x: f32,
-    chassis_q_y: f32,
-    chassis_q_z: f32,
-    chassis_q_roll: f32,
-    chassis_q_pitch: f32,
-    chassis_q_yaw: f32,
-    chassis_dq_x: f32,
-    chassis_dq_y: f32,
-    chassis_dq_z: f32,
-    chassis_dq_roll_rate: f32,
-    chassis_dq_pitch_rate: f32,
-    chassis_dq_yaw_rate: f32,
-    wheel_q_fl: f32,
-    wheel_q_fr: f32,
-    wheel_q_rl: f32,
-    wheel_q_rr: f32,
-    wheel_dq_fl: f32,
-    wheel_dq_fr: f32,
-    wheel_dq_rl: f32,
-    wheel_dq_rr: f32,
-    wheel_torque_fl: f32,
-    wheel_torque_fr: f32,
-    wheel_torque_rl: f32,
-    wheel_torque_rr: f32,
-    pacejka_jacobian_fl: f32,
-    pacejka_jacobian_fr: f32,
-    pacejka_jacobian_rl: f32,
-    pacejka_jacobian_rr: f32,
-    normal_load_front: f32,
-    normal_load_rear: f32,
-    thermal_accumulated: f32,
-    mu_friction: f32,
-    terrain_moisture: f32,
-    x_water: f32,
-    gg_ekf_divergence: f32,
-    fy_fl: f32,
-    fy_fr: f32,
-    fy_rl: f32,
-    fy_rr: f32,
-    fx_fl: f32,
-    fx_fr: f32,
-    fx_rl: f32,
-    fx_rr: f32,
-    steer_target: f32,
-    steer_actual: f32,
-    fluid_temp_c: f32,
-    actual_viscosity_cst: f32,
-    brake_fluid_temp_c: f32,
-    d_roll: f32,
-    d_pitch: f32,
+#[derive(Debug, Serialize)]
+struct Run {
+    id: u32,
+    short_id: String,
     scenario: String,
-    sha256_seal: String,
-}
-
-#[derive(Serialize)]
-struct VehicleTrajectory {
-    trajectory_id: String,
-    data: Vec<VehicleStepState>,
+    v_start_ms: f64,
+    x_water_m: f64,
+    min_mu: f64,
+    max_ekf_drift_m: f64,
+    max_abs_yaw_rate: f64,
+    max_abs_pos_y_m: f64,
+    is_wet: bool,
+    is_hydroplane: bool,
+    is_corner_lost: bool,
     proof_hash: String,
-    ekf_drift_failed: bool,
 }
 
 // Pacejka Magic Formula for lateral tire force
@@ -131,8 +82,9 @@ fn pacejka_longitudinal_force(kappa: f32, fz: f32, mu: f32) -> f32 {
     d * (c * (b * kappa - e * (b * kappa - (b * kappa).atan()))).atan().sin()
 }
 
-fn run_single_trajectory(index: usize, seed: u64, scenario: &str) -> VehicleTrajectory {
+fn run_single_trajectory(index: usize, seed: u64, scenario: &str) -> Run {
     let mut rng = Rng::new(seed);
+    let short_id = output::short_id(&mut rng);
     
     // Dynamic mass and moments of inertia
     let (m_chassis, i_yaw) = match scenario {
@@ -172,19 +124,17 @@ fn run_single_trajectory(index: usize, seed: u64, scenario: &str) -> VehicleTraj
     let mut ekf_v = v_start;
     let mut ekf_p = [0.0f32; 16];
     ekf_p[0] = 0.1; ekf_p[5] = 0.1; ekf_p[10] = 0.1; ekf_p[15] = 0.1;
-    let x_water = rng.range(4.0, 12.0) as f32;
+    let wet = rng.chance(0.40);
+    let x_water = if wet {
+        rng.range(4.0, 12.0) as f32
+    } else {
+        1.0e6f32
+    };
     let water_transition_len = rng.range(0.1, 0.5) as f32;
     
     let dt = 0.001f32; // 1000Hz (1.0ms steps)
     let total_time = 5.0f32; // 5.0 second simulation
     let steps_count = (total_time / dt) as usize;
-    
-    let mut states = Vec::with_capacity(steps_count / 10);
-    
-    // Cryptographic running hash chain
-    let mut running_hash = Sha256::new();
-    running_hash.update(&seed.to_le_bytes());
-    let mut last_hash = running_hash.finalize();
     
     let fluid_temp_c = if scenario == "arctic_cold_start" {
         rng.range(-40.0, 0.0) as f32
@@ -199,8 +149,10 @@ fn run_single_trajectory(index: usize, seed: u64, scenario: &str) -> VehicleTraj
     let mut brake_fluid_temp_c = 20.0f32;
 
     let mut max_ekf_drift = 0.0f32;
+    let mut min_mu = 1.0f32;
+    let mut max_abs_yaw_rate = 0.0f32;
+    let mut max_abs_pos_y = 0.0f32;
     let mut thermal_tax = 0.0f32;
-    let mut consecutive_fail_steps = 0;
     
     let mut prev_vel_x = v_start;
     let mut lon_accel_filtered = 0.0f32;
@@ -244,6 +196,7 @@ fn run_single_trajectory(index: usize, seed: u64, scenario: &str) -> VehicleTraj
         let rho_scale = (RHO_FRESHWATER as f32) / 1000.0;
         let mu_wet_dynamic = mu_wet / (1.0f32 + 0.0005f32 * vel_x * vel_x * rho_scale);
         let mu_actual = mu_dry - (mu_dry - mu_wet_dynamic) * terrain_moisture;
+        min_mu = min_mu.min(mu_actual);
         
         // Dynamic Weight Transfer (Lateral and Longitudinal)
         let lat_accel = vel_x * yaw_rate;
@@ -388,7 +341,7 @@ fn run_single_trajectory(index: usize, seed: u64, scenario: &str) -> VehicleTraj
         brake_fluid_temp_c -= (brake_fluid_temp_c - 20.0f32) * 0.5f32 * dt;
 
         let damper_fade_factor = if brake_fluid_temp_c > 120.0f32 {
-            (1.0f32 - 0.70f32 * ((brake_fluid_temp_c - 120.0f32) / 80.0f32).min(1.0f32))
+            1.0f32 - 0.70f32 * ((brake_fluid_temp_c - 120.0f32) / 80.0f32).min(1.0f32)
         } else {
             1.0f32
         };
@@ -411,9 +364,11 @@ fn run_single_trajectory(index: usize, seed: u64, scenario: &str) -> VehicleTraj
         vel_y += (acc_y - vel_x * yaw_rate) * dt;
         yaw_rate += yaw_accel * dt;
         yaw += yaw_rate * dt;
+        max_abs_yaw_rate = max_abs_yaw_rate.max(yaw_rate.abs());
         
         pos_x += (vel_x * yaw.cos() - vel_y * yaw.sin()) * dt;
         pos_y += (vel_x * yaw.sin() + vel_y * yaw.cos()) * dt;
+        max_abs_pos_y = max_abs_pos_y.max(pos_y.abs());
         
         // Suspension dynamics (roll & pitch)
         let k_roll = 25000.0f32; let d_roll = d_roll_dynamic;
@@ -430,13 +385,13 @@ fn run_single_trajectory(index: usize, seed: u64, scenario: &str) -> VehicleTraj
         // True 4-State Kinematic EKF Prediction & Update (blind to lateral slip)
         let cos_yaw = ekf_yaw.cos();
         let sin_yaw = ekf_yaw.sin();
-        let tan_steer = ekf_steer.tan();
+        let tan_steer = steer_actual.tan();
         let l_wheelbase = A_FRONT + B_REAR;
         
         let next_ekf_x = ekf_x + ekf_v * cos_yaw * dt;
         let next_ekf_y = ekf_y + ekf_v * sin_yaw * dt;
         let next_ekf_yaw = ekf_yaw + (ekf_v / l_wheelbase) * tan_steer * dt;
-        let next_ekf_v = ekf_v + lon_accel_filtered * dt;
+        let _next_ekf_v = ekf_v + lon_accel_filtered * dt;
         
         // Jacobian F (4x4)
         let mut f_mat = [0.0f32; 16];
@@ -469,523 +424,172 @@ fn run_single_trajectory(index: usize, seed: u64, scenario: &str) -> VehicleTraj
         // Add process noise
         p_next[0] += 0.001; p_next[5] += 0.001; p_next[10] += 0.001; p_next[15] += 0.001;
         
-        // Measurement updates: GPS (x,y) and speedometer (v) with noise
-        let z_x = pos_x + rng.range(-0.05, 0.05) as f32;
-        let z_y = pos_y + rng.range(-0.05, 0.05) as f32;
-        let z_v = vel_x + rng.range(-0.1, 0.1) as f32;
-        
-        let inn_x = z_x - next_ekf_x;
-        let inn_y = z_y - next_ekf_y;
-        let inn_v = z_v - next_ekf_v;
-        
-        // Measurement covariance S = H * P * H^T + R
-        let s00 = p_next[0] + 0.01;  let s01 = p_next[1];        let s02 = p_next[3];
-        let s10 = p_next[4];         let s11 = p_next[5] + 0.01;  let s12 = p_next[7];
-        let s20 = p_next[12];        let s21 = p_next[13];       let s22 = p_next[15] + 0.01;
-        
-        let det_s = s00 * (s11 * s22 - s12 * s21)
-                  - s01 * (s10 * s22 - s12 * s20)
-                  + s02 * (s10 * s21 - s11 * s20);
-                  
-        if det_s.abs() > 1e-6 {
-            let inv_det_s = 1.0 / det_s;
-            let inv_s00 = (s11 * s22 - s12 * s21) * inv_det_s;
-            let inv_s01 = -(s01 * s22 - s02 * s21) * inv_det_s;
-            let inv_s02 = (s01 * s12 - s02 * s11) * inv_det_s;
-            
-            let inv_s10 = -(s10 * s22 - s12 * s20) * inv_det_s;
-            let inv_s11 = (s00 * s22 - s02 * s20) * inv_det_s;
-            let inv_s12 = -(s00 * s12 - s02 * s10) * inv_det_s;
-            
-            let inv_s20 = (s10 * s21 - s11 * s20) * inv_det_s;
-            let inv_s21 = -(s00 * s21 - s01 * s20) * inv_det_s;
-            let inv_s22 = (s00 * s11 - s01 * s10) * inv_det_s;
-            
-            // Kalman Gain K = P * H^T * S^-1 (4x3)
-            let mut k_mat = [0.0f32; 12];
-            for r in 0..4 {
-                let p0 = p_next[r*4 + 0];
-                let p1 = p_next[r*4 + 1];
-                let p2 = p_next[r*4 + 3];
-                k_mat[r*3 + 0] = p0 * inv_s00 + p1 * inv_s10 + p2 * inv_s20;
-                k_mat[r*3 + 1] = p0 * inv_s01 + p1 * inv_s11 + p2 * inv_s21;
-                k_mat[r*3 + 2] = p0 * inv_s02 + p1 * inv_s12 + p2 * inv_s22;
-            }
-            
-            // State Update
-            ekf_x = next_ekf_x + k_mat[0] * inn_x + k_mat[1] * inn_y + k_mat[2] * inn_v;
-            ekf_y = next_ekf_y + k_mat[3] * inn_x + k_mat[4] * inn_y + k_mat[5] * inn_v;
-            ekf_yaw = next_ekf_yaw + k_mat[6] * inn_x + k_mat[7] * inn_y + k_mat[8] * inn_v;
-            ekf_v = next_ekf_v + k_mat[9] * inn_x + k_mat[10] * inn_y + k_mat[11] * inn_v;
-            
-            // Covariance Update P = (I - K * H) * P
-            let mut khp = [0.0f32; 16];
-            for r in 0..4 {
-                let k0 = k_mat[r*3 + 0];
-                let k1 = k_mat[r*3 + 1];
-                let k2 = k_mat[r*3 + 2];
-                for c in 0..4 {
-                    khp[r*4 + c] = k0 * p_next[0*4 + c] + k1 * p_next[1*4 + c] + k2 * p_next[3*4 + c];
-                }
-            }
-            for i in 0..16 {
-                ekf_p[i] = p_next[i] - khp[i];
-            }
-        } else {
-            ekf_x = next_ekf_x;
-            ekf_y = next_ekf_y;
-            ekf_yaw = next_ekf_yaw;
-            ekf_v = next_ekf_v;
-            ekf_p = p_next;
-        }
+        // Blind bicycle: no GPS. Speedometer on v. Lateral slip is the cliff.
+        ekf_x = next_ekf_x;
+        ekf_y = next_ekf_y;
+        ekf_yaw = next_ekf_yaw;
+        ekf_v = vel_x + rng.range(-0.1, 0.1) as f32;
+        ekf_p = p_next;
         
         let gg_ekf_divergence = ((pos_x - ekf_x).powi(2) + (pos_y - ekf_y).powi(2)).sqrt();
         if gg_ekf_divergence > max_ekf_drift {
             max_ekf_drift = gg_ekf_divergence;
         }
-        
-        if gg_ekf_divergence > 1.25f32 {
-            consecutive_fail_steps += 1;
-        } else {
-            consecutive_fail_steps = 0;
-        }
-        
-        let is_logging_step = step % 10 == 0;
-        let is_terminal_step = step == steps_count - 1 || consecutive_fail_steps >= 50;
 
-        if is_logging_step || is_terminal_step {
-            // Cryptographic running hash chain update
-            let mut hasher = Sha256::new();
-            hasher.update(&last_hash);
-            hasher.update(&t.to_le_bytes());
-            hasher.update(&pos_x.to_le_bytes());
-            hasher.update(&pos_y.to_le_bytes());
-            hasher.update(&pos_z.to_le_bytes());
-            hasher.update(&roll.to_le_bytes());
-            hasher.update(&pitch.to_le_bytes());
-            hasher.update(&yaw.to_le_bytes());
-            hasher.update(&vel_x.to_le_bytes());
-            hasher.update(&vel_y.to_le_bytes());
-            hasher.update(&0.0f32.to_le_bytes()); // placeholder/vz is 0
-            hasher.update(&roll_rate.to_le_bytes());
-            hasher.update(&pitch_rate.to_le_bytes());
-            hasher.update(&yaw_rate.to_le_bytes());
-            hasher.update(&wheel_q[0].to_le_bytes());
-            hasher.update(&wheel_q[1].to_le_bytes());
-            hasher.update(&wheel_q[2].to_le_bytes());
-            hasher.update(&wheel_q[3].to_le_bytes());
-            hasher.update(&wheel_dq[0].to_le_bytes());
-            hasher.update(&wheel_dq[1].to_le_bytes());
-            hasher.update(&wheel_dq[2].to_le_bytes());
-            hasher.update(&wheel_dq[3].to_le_bytes());
-            hasher.update(&torque_fl.to_le_bytes());
-            hasher.update(&torque_fr.to_le_bytes());
-            hasher.update(&torque_rl.to_le_bytes());
-            hasher.update(&torque_rr.to_le_bytes());
-            hasher.update(&jacobian_fl.to_le_bytes());
-            hasher.update(&jacobian_fr.to_le_bytes());
-            hasher.update(&jacobian_rl.to_le_bytes());
-            hasher.update(&jacobian_rr.to_le_bytes());
-            hasher.update(&normal_load_front.to_le_bytes());
-            hasher.update(&normal_load_rear.to_le_bytes());
-            hasher.update(&thermal_tax.to_le_bytes());
-            hasher.update(&x_water.to_le_bytes());
-            hasher.update(&f_y_fl.to_le_bytes());
-            hasher.update(&f_y_fr.to_le_bytes());
-            hasher.update(&f_y_rl.to_le_bytes());
-            hasher.update(&f_y_rr.to_le_bytes());
-            hasher.update(&f_x_fl.to_le_bytes());
-            hasher.update(&f_x_fr.to_le_bytes());
-            hasher.update(&f_x_rl.to_le_bytes());
-            hasher.update(&f_x_rr.to_le_bytes());
-            hasher.update(&steer_target.to_le_bytes());
-            hasher.update(&steer_actual.to_le_bytes());
-            hasher.update(&fluid_temp_c.to_le_bytes());
-            hasher.update(&actual_viscosity_cst.to_le_bytes());
-            hasher.update(&brake_fluid_temp_c.to_le_bytes());
-            hasher.update(&d_roll_dynamic.to_le_bytes());
-            hasher.update(&d_pitch_dynamic.to_le_bytes());
-            
-            last_hash = hasher.finalize();
-            let sha256_seal = hex::encode(last_hash);
-
-            states.push(VehicleStepState {
-                timestamp: t,
-                chassis_q_x: pos_x,
-                chassis_q_y: pos_y,
-                chassis_q_z: pos_z,
-                chassis_q_roll: roll,
-                chassis_q_pitch: pitch,
-                chassis_q_yaw: yaw,
-                chassis_dq_x: vel_x,
-                chassis_dq_y: vel_y,
-                chassis_dq_z: 0.0f32,
-                chassis_dq_roll_rate: roll_rate,
-                chassis_dq_pitch_rate: pitch_rate,
-                chassis_dq_yaw_rate: yaw_rate,
-                wheel_q_fl: wheel_q[0],
-                wheel_q_fr: wheel_q[1],
-                wheel_q_rl: wheel_q[2],
-                wheel_q_rr: wheel_q[3],
-                wheel_dq_fl: wheel_dq[0],
-                wheel_dq_fr: wheel_dq[1],
-                wheel_dq_rl: wheel_dq[2],
-                wheel_dq_rr: wheel_dq[3],
-                wheel_torque_fl: torque_fl,
-                wheel_torque_fr: torque_fr,
-                wheel_torque_rl: torque_rl,
-                wheel_torque_rr: torque_rr,
-                pacejka_jacobian_fl: jacobian_fl,
-                pacejka_jacobian_fr: jacobian_fr,
-                pacejka_jacobian_rl: jacobian_rl,
-                pacejka_jacobian_rr: jacobian_rr,
-                normal_load_front,
-                normal_load_rear,
-                thermal_accumulated: thermal_tax,
-                mu_friction: mu_actual,
-                terrain_moisture,
-                x_water,
-                gg_ekf_divergence,
-                fy_fl: f_y_fl,
-                fy_fr: f_y_fr,
-                fy_rl: f_y_rl,
-                fy_rr: f_y_rr,
-                fx_fl: f_x_fl,
-                fx_fr: f_x_fr,
-                fx_rl: f_x_rl,
-                fx_rr: f_x_rr,
-                steer_target,
-                steer_actual,
-                fluid_temp_c,
-                actual_viscosity_cst,
-                brake_fluid_temp_c,
-                d_roll: d_roll_dynamic,
-                d_pitch: d_pitch_dynamic,
-                scenario: scenario.to_string(),
-                sha256_seal,
-            });
-        }
-        
-        if consecutive_fail_steps >= 50 {
-            break;
-        }
+        let _ = (
+            pos_z,
+            jacobian_fl,
+            jacobian_fr,
+            jacobian_rl,
+            jacobian_rr,
+            normal_load_front,
+            normal_load_rear,
+            thermal_tax,
+            ekf_steer,
+        );
     }
-    
-    let proof_hash = hex::encode(last_hash);
-    let ekf_drift_failed = max_ekf_drift > 1.25f32;
-    
-    VehicleTrajectory {
-        trajectory_id: format!("pg_veh_{:05x}", index),
-        data: states,
-        proof_hash,
-        ekf_drift_failed,
+
+    let hydroplane = min_mu < HYDRO_MU;
+    let corner_lost = max_abs_pos_y < CORNER_LOST_M;
+    let class = if corner_lost {
+        "UNDER"
+    } else if hydroplane {
+        "HYDRO"
+    } else {
+        "GRIP"
+    };
+
+    let mut proof = ProofChain::new();
+    proof.seed(&(index as u32).to_le_bytes());
+    proof.feed_f64(v_start as f64);
+    proof.feed_f64(x_water as f64);
+    proof.feed_f64(min_mu as f64);
+    proof.feed_f64(max_abs_pos_y as f64);
+    proof.feed_str(class);
+
+    Run {
+        id: index as u32,
+        short_id,
+        scenario: scenario.to_string(),
+        v_start_ms: (v_start as f64 * 100.0).round() / 100.0,
+        x_water_m: if wet {
+            (x_water as f64 * 100.0).round() / 100.0
+        } else {
+            -1.0
+        },
+        min_mu: (min_mu as f64 * 1000.0).round() / 1000.0,
+        max_ekf_drift_m: (max_ekf_drift as f64 * 1000.0).round() / 1000.0,
+        max_abs_yaw_rate: (max_abs_yaw_rate as f64 * 1000.0).round() / 1000.0,
+        max_abs_pos_y_m: (max_abs_pos_y as f64 * 100.0).round() / 100.0,
+        is_wet: wet,
+        is_hydroplane: hydroplane,
+        is_corner_lost: corner_lost,
+        proof_hash: proof.seal(),
     }
 }
 
 fn main() {
+    const DEFAULT_N: usize = 2500;
     let args: Vec<String> = std::env::args().collect();
-    let n_trajectories: usize = args.get(1)
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(10000);
-        
-    let out_path = args.iter().position(|a| a == "--out")
+    let n: usize = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(DEFAULT_N);
+    let out = args
+        .iter()
+        .position(|a| a == "--parquet" || a == "--out")
         .and_then(|i| args.get(i + 1))
         .cloned()
-        .unwrap_or_else(|| concat!(env!("CARGO_MANIFEST_DIR"), "/../../data/products/autonomous_vehicles_heavy_logistics.parquet").to_string());
-
-    let scenario = args.iter().position(|a| a == "--scenario")
+        .unwrap_or_else(|| {
+            format!(
+                "{}/../../data/exports/sovereign/vehicle_hydroplane.parquet",
+                env!("CARGO_MANIFEST_DIR")
+            )
+        });
+    let scenario = args
+        .iter()
+        .position(|a| a == "--scenario")
         .and_then(|i| args.get(i + 1))
         .cloned()
-        .unwrap_or_else(|| "nominal".to_string());
-        
-    eprintln!("Generating {} Vehicle trajectories to Parquet...", n_trajectories);
-    let start = Instant::now();
+        .unwrap_or_else(|| "sweep".to_string());
 
-    // Define Arrow schema
-    let schema = Arc::new(Schema::new(vec![
-        Field::new("timestamp", DataType::Float32, false),
-        Field::new("chassis_q_x", DataType::Float32, false),
-        Field::new("chassis_q_y", DataType::Float32, false),
-        Field::new("chassis_q_z", DataType::Float32, false),
-        Field::new("chassis_q_roll", DataType::Float32, false),
-        Field::new("chassis_q_pitch", DataType::Float32, false),
-        Field::new("chassis_q_yaw", DataType::Float32, false),
-        Field::new("chassis_dq_x", DataType::Float32, false),
-        Field::new("chassis_dq_y", DataType::Float32, false),
-        Field::new("chassis_dq_z", DataType::Float32, false),
-        Field::new("chassis_dq_roll_rate", DataType::Float32, false),
-        Field::new("chassis_dq_pitch_rate", DataType::Float32, false),
-        Field::new("chassis_dq_yaw_rate", DataType::Float32, false),
-        Field::new("wheel_q_fl", DataType::Float32, false),
-        Field::new("wheel_q_fr", DataType::Float32, false),
-        Field::new("wheel_q_rl", DataType::Float32, false),
-        Field::new("wheel_q_rr", DataType::Float32, false),
-        Field::new("wheel_dq_fl", DataType::Float32, false),
-        Field::new("wheel_dq_fr", DataType::Float32, false),
-        Field::new("wheel_dq_rl", DataType::Float32, false),
-        Field::new("wheel_dq_rr", DataType::Float32, false),
-        Field::new("wheel_torque_fl", DataType::Float32, false),
-        Field::new("wheel_torque_fr", DataType::Float32, false),
-        Field::new("wheel_torque_rl", DataType::Float32, false),
-        Field::new("wheel_torque_rr", DataType::Float32, false),
-        Field::new("pacejka_jacobian_fl", DataType::Float32, false),
-        Field::new("pacejka_jacobian_fr", DataType::Float32, false),
-        Field::new("pacejka_jacobian_rl", DataType::Float32, false),
-        Field::new("pacejka_jacobian_rr", DataType::Float32, false),
-        Field::new("normal_load_front", DataType::Float32, false),
-        Field::new("normal_load_rear", DataType::Float32, false),
-        Field::new("thermal_accumulated", DataType::Float32, false),
-        Field::new("mu_friction", DataType::Float32, false),
-        Field::new("terrain_moisture", DataType::Float32, false),
-        Field::new("x_water", DataType::Float32, false),
-        Field::new("gg_ekf_divergence", DataType::Float32, false),
-        Field::new("fy_fl", DataType::Float32, false),
-        Field::new("fy_fr", DataType::Float32, false),
-        Field::new("fy_rl", DataType::Float32, false),
-        Field::new("fy_rr", DataType::Float32, false),
-        Field::new("fx_fl", DataType::Float32, false),
-        Field::new("fx_fr", DataType::Float32, false),
-        Field::new("fx_rl", DataType::Float32, false),
-        Field::new("fx_rr", DataType::Float32, false),
-        Field::new("steer_target", DataType::Float32, false),
-        Field::new("steer_actual", DataType::Float32, false),
-        Field::new("fluid_temp_c", DataType::Float32, false),
-        Field::new("actual_viscosity_cst", DataType::Float32, false),
-        Field::new("brake_fluid_temp_c", DataType::Float32, false),
-        Field::new("d_roll", DataType::Float32, false),
-        Field::new("d_pitch", DataType::Float32, false),
-        Field::new("scenario", DataType::Utf8, false),
-        Field::new("sha256_seal", DataType::Utf8, false),
-        Field::new("trajectory_id", DataType::Utf8, false),
-    ]));
-
-    let file = File::create(&out_path).expect("Failed to create output Parquet file");
-    let props = WriterProperties::builder()
-        .set_compression(Compression::SNAPPY)
-        .build();
-    let mut writer = ArrowWriter::try_new(file, schema.clone(), Some(props))
-        .expect("Failed to create ArrowWriter");
-    
-    // Seed generator
+    println!("====================================================================");
+    println!("  G^G: HYDROPLANE  (Pacejka + ρ_fresh, 1 kHz, 5 s)");
+    println!("  n={n}  scenario={scenario}");
+    println!("====================================================================\n");
+    let t0 = Instant::now();
     let base_seed = 0xDECD_BAFC_A0FE_1337u64;
     let seed_multiplier = 0x9E37_79B1_85EB_CA87u64;
-
-    // Chunk size to prevent OOM
-    let chunk_size = 2000;
-    let mut written_count = 0;
-    let mut total_rows = 0;
-
-    while written_count < n_trajectories {
-        let this_chunk_size = std::cmp::min(chunk_size, n_trajectories - written_count);
-        let start_i = written_count;
-        let end_i = start_i + this_chunk_size;
-        
-        let trajectories: Vec<VehicleTrajectory> = (start_i..end_i)
-            .into_par_iter()
-            .map(|i| {
-                let seed = base_seed ^ (i as u64).wrapping_mul(seed_multiplier);
-                let scenario_for_traj = if scenario == "sweep" {
-                    match i % 5 {
-                        0 => "nominal",
-                        1 => "loaded",
-                        2 => "ice",
-                        3 => "mud",
-                        _ => "arctic_cold_start",
-                    }
-                } else {
-                    &scenario
-                };
-                run_single_trajectory(i, seed, scenario_for_traj)
-            })
-            .collect();
-            
-        // Columnar buffers for RecordBatch
-        let mut timestamp = Vec::new();
-        let mut chassis_q_x = Vec::new();
-        let mut chassis_q_y = Vec::new();
-        let mut chassis_q_z = Vec::new();
-        let mut chassis_q_roll = Vec::new();
-        let mut chassis_q_pitch = Vec::new();
-        let mut chassis_q_yaw = Vec::new();
-        let mut chassis_dq_x = Vec::new();
-        let mut chassis_dq_y = Vec::new();
-        let mut chassis_dq_z = Vec::new();
-        let mut chassis_dq_roll_rate = Vec::new();
-        let mut chassis_dq_pitch_rate = Vec::new();
-        let mut chassis_dq_yaw_rate = Vec::new();
-        let mut wheel_q_fl = Vec::new();
-        let mut wheel_q_fr = Vec::new();
-        let mut wheel_q_rl = Vec::new();
-        let mut wheel_q_rr = Vec::new();
-        let mut wheel_dq_fl = Vec::new();
-        let mut wheel_dq_fr = Vec::new();
-        let mut wheel_dq_rl = Vec::new();
-        let mut wheel_dq_rr = Vec::new();
-        let mut wheel_torque_fl = Vec::new();
-        let mut wheel_torque_fr = Vec::new();
-        let mut wheel_torque_rl = Vec::new();
-        let mut wheel_torque_rr = Vec::new();
-        let mut pacejka_jacobian_fl = Vec::new();
-        let mut pacejka_jacobian_fr = Vec::new();
-        let mut pacejka_jacobian_rl = Vec::new();
-        let mut pacejka_jacobian_rr = Vec::new();
-        let mut normal_load_front = Vec::new();
-        let mut normal_load_rear = Vec::new();
-        let mut thermal_accumulated = Vec::new();
-        let mut mu_friction = Vec::new();
-        let mut terrain_moisture = Vec::new();
-        let mut x_water = Vec::new();
-        let mut gg_ekf_divergence = Vec::new();
-        let mut fy_fl = Vec::new();
-        let mut fy_fr = Vec::new();
-        let mut fy_rl = Vec::new();
-        let mut fy_rr = Vec::new();
-        let mut fx_fl = Vec::new();
-        let mut fx_fr = Vec::new();
-        let mut fx_rl = Vec::new();
-        let mut fx_rr = Vec::new();
-        let mut steer_target = Vec::new();
-        let mut steer_actual = Vec::new();
-        let mut fluid_temp_c = Vec::new();
-        let mut actual_viscosity_cst = Vec::new();
-        let mut brake_fluid_temp_c = Vec::new();
-        let mut d_roll = Vec::new();
-        let mut d_pitch = Vec::new();
-        let mut scenario_vec = Vec::new();
-        let mut sha256_seal = Vec::new();
-        let mut trajectory_id = Vec::new();
-
-        for traj in trajectories {
-            let t_id = traj.trajectory_id;
-            for step in traj.data {
-                timestamp.push(step.timestamp);
-                chassis_q_x.push(step.chassis_q_x);
-                chassis_q_y.push(step.chassis_q_y);
-                chassis_q_z.push(step.chassis_q_z);
-                chassis_q_roll.push(step.chassis_q_roll);
-                chassis_q_pitch.push(step.chassis_q_pitch);
-                chassis_q_yaw.push(step.chassis_q_yaw);
-                chassis_dq_x.push(step.chassis_dq_x);
-                chassis_dq_y.push(step.chassis_dq_y);
-                chassis_dq_z.push(step.chassis_dq_z);
-                chassis_dq_roll_rate.push(step.chassis_dq_roll_rate);
-                chassis_dq_pitch_rate.push(step.chassis_dq_pitch_rate);
-                chassis_dq_yaw_rate.push(step.chassis_dq_yaw_rate);
-                wheel_q_fl.push(step.wheel_q_fl);
-                wheel_q_fr.push(step.wheel_q_fr);
-                wheel_q_rl.push(step.wheel_q_rl);
-                wheel_q_rr.push(step.wheel_q_rr);
-                wheel_dq_fl.push(step.wheel_dq_fl);
-                wheel_dq_fr.push(step.wheel_dq_fr);
-                wheel_dq_rl.push(step.wheel_dq_rl);
-                wheel_dq_rr.push(step.wheel_dq_rr);
-                wheel_torque_fl.push(step.wheel_torque_fl);
-                wheel_torque_fr.push(step.wheel_torque_fr);
-                wheel_torque_rl.push(step.wheel_torque_rl);
-                wheel_torque_rr.push(step.wheel_torque_rr);
-                pacejka_jacobian_fl.push(step.pacejka_jacobian_fl);
-                pacejka_jacobian_fr.push(step.pacejka_jacobian_fr);
-                pacejka_jacobian_rl.push(step.pacejka_jacobian_rl);
-                pacejka_jacobian_rr.push(step.pacejka_jacobian_rr);
-                normal_load_front.push(step.normal_load_front);
-                normal_load_rear.push(step.normal_load_rear);
-                thermal_accumulated.push(step.thermal_accumulated);
-                mu_friction.push(step.mu_friction);
-                terrain_moisture.push(step.terrain_moisture);
-                x_water.push(step.x_water);
-                gg_ekf_divergence.push(step.gg_ekf_divergence);
-                fy_fl.push(step.fy_fl);
-                fy_fr.push(step.fy_fr);
-                fy_rl.push(step.fy_rl);
-                fy_rr.push(step.fy_rr);
-                fx_fl.push(step.fx_fl);
-                fx_fr.push(step.fx_fr);
-                fx_rl.push(step.fx_rl);
-                fx_rr.push(step.fx_rr);
-                steer_target.push(step.steer_target);
-                steer_actual.push(step.steer_actual);
-                fluid_temp_c.push(step.fluid_temp_c);
-                actual_viscosity_cst.push(step.actual_viscosity_cst);
-                brake_fluid_temp_c.push(step.brake_fluid_temp_c);
-                d_roll.push(step.d_roll);
-                d_pitch.push(step.d_pitch);
-                scenario_vec.push(step.scenario.clone());
-                sha256_seal.push(step.sha256_seal);
-                trajectory_id.push(t_id.clone());
-            }
-        }
-        
-        let rows_in_batch = timestamp.len();
-        if rows_in_batch > 0 {
-            let batch = RecordBatch::try_new(
-                schema.clone(),
-                vec![
-                    Arc::new(Float32Array::from(timestamp)),
-                    Arc::new(Float32Array::from(chassis_q_x)),
-                    Arc::new(Float32Array::from(chassis_q_y)),
-                    Arc::new(Float32Array::from(chassis_q_z)),
-                    Arc::new(Float32Array::from(chassis_q_roll)),
-                    Arc::new(Float32Array::from(chassis_q_pitch)),
-                    Arc::new(Float32Array::from(chassis_q_yaw)),
-                    Arc::new(Float32Array::from(chassis_dq_x)),
-                    Arc::new(Float32Array::from(chassis_dq_y)),
-                    Arc::new(Float32Array::from(chassis_dq_z)),
-                    Arc::new(Float32Array::from(chassis_dq_roll_rate)),
-                    Arc::new(Float32Array::from(chassis_dq_pitch_rate)),
-                    Arc::new(Float32Array::from(chassis_dq_yaw_rate)),
-                    Arc::new(Float32Array::from(wheel_q_fl)),
-                    Arc::new(Float32Array::from(wheel_q_fr)),
-                    Arc::new(Float32Array::from(wheel_q_rl)),
-                    Arc::new(Float32Array::from(wheel_q_rr)),
-                    Arc::new(Float32Array::from(wheel_dq_fl)),
-                    Arc::new(Float32Array::from(wheel_dq_fr)),
-                    Arc::new(Float32Array::from(wheel_dq_rl)),
-                    Arc::new(Float32Array::from(wheel_dq_rr)),
-                    Arc::new(Float32Array::from(wheel_torque_fl)),
-                    Arc::new(Float32Array::from(wheel_torque_fr)),
-                    Arc::new(Float32Array::from(wheel_torque_rl)),
-                    Arc::new(Float32Array::from(wheel_torque_rr)),
-                    Arc::new(Float32Array::from(pacejka_jacobian_fl)),
-                    Arc::new(Float32Array::from(pacejka_jacobian_fr)),
-                    Arc::new(Float32Array::from(pacejka_jacobian_rl)),
-                    Arc::new(Float32Array::from(pacejka_jacobian_rr)),
-                    Arc::new(Float32Array::from(normal_load_front)),
-                    Arc::new(Float32Array::from(normal_load_rear)),
-                    Arc::new(Float32Array::from(thermal_accumulated)),
-                    Arc::new(Float32Array::from(mu_friction)),
-                    Arc::new(Float32Array::from(terrain_moisture)),
-                    Arc::new(Float32Array::from(x_water)),
-                    Arc::new(Float32Array::from(gg_ekf_divergence)),
-                    Arc::new(Float32Array::from(fy_fl)),
-                    Arc::new(Float32Array::from(fy_fr)),
-                    Arc::new(Float32Array::from(fy_rl)),
-                    Arc::new(Float32Array::from(fy_rr)),
-                    Arc::new(Float32Array::from(fx_fl)),
-                    Arc::new(Float32Array::from(fx_fr)),
-                    Arc::new(Float32Array::from(fx_rl)),
-                    Arc::new(Float32Array::from(fx_rr)),
-                    Arc::new(Float32Array::from(steer_target)),
-                    Arc::new(Float32Array::from(steer_actual)),
-                    Arc::new(Float32Array::from(fluid_temp_c)),
-                    Arc::new(Float32Array::from(actual_viscosity_cst)),
-                    Arc::new(Float32Array::from(brake_fluid_temp_c)),
-                    Arc::new(Float32Array::from(d_roll)),
-                    Arc::new(Float32Array::from(d_pitch)),
-                    Arc::new(StringArray::from(scenario_vec)),
-                    Arc::new(StringArray::from(sha256_seal)),
-                    Arc::new(StringArray::from(trajectory_id)),
-                ],
-            ).expect("Failed to create RecordBatch");
-
-            writer.write(&batch).expect("Failed to write RecordBatch");
-            total_rows += rows_in_batch;
-        }
-
-        written_count += this_chunk_size;
-        eprintln!("  Generated {}/{} trajectories...", written_count, n_trajectories);
+    let rows: Vec<Run> = (0..n)
+        .into_par_iter()
+        .map(|i| {
+            let seed = base_seed ^ (i as u64).wrapping_mul(seed_multiplier);
+            let scenario_for_traj = if scenario == "sweep" {
+                match i % 5 {
+                    0 => "nominal",
+                    1 => "loaded",
+                    2 => "ice",
+                    3 => "mud",
+                    _ => "arctic_cold_start",
+                }
+            } else {
+                scenario.as_str()
+            };
+            run_single_trajectory(i, seed, scenario_for_traj)
+        })
+        .collect();
+    let proofs: Vec<String> = rows.iter().map(|r| r.proof_hash.clone()).collect();
+    let seal = proof::seal_run(&proofs);
+    if let Some(p) = std::path::Path::new(&out).parent() {
+        std::fs::create_dir_all(p).ok();
     }
-    
-    writer.close().expect("Failed to close ArrowWriter");
-    
-    eprintln!("Successfully generated dataset ({} total rows). Total time: {:.2?}", total_rows, start.elapsed());
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("trajectory_id", DataType::UInt32, false),
+        Field::new("short_id", DataType::Utf8, false),
+        Field::new("scenario", DataType::Utf8, false),
+        Field::new("v_start_ms", DataType::Float64, false),
+        Field::new("x_water_m", DataType::Float64, false),
+        Field::new("min_mu", DataType::Float64, false),
+        Field::new("max_ekf_drift_m", DataType::Float64, false),
+        Field::new("max_abs_yaw_rate", DataType::Float64, false),
+        Field::new("max_abs_pos_y_m", DataType::Float64, false),
+        Field::new("is_wet", DataType::Boolean, false),
+        Field::new("is_hydroplane", DataType::Boolean, false),
+        Field::new("is_corner_lost", DataType::Boolean, false),
+        Field::new("proof_hash", DataType::Utf8, false),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(UInt32Array::from(rows.iter().map(|r| r.id).collect::<Vec<_>>())),
+            Arc::new(StringArray::from(rows.iter().map(|r| r.short_id.as_str()).collect::<Vec<_>>())),
+            Arc::new(StringArray::from(rows.iter().map(|r| r.scenario.as_str()).collect::<Vec<_>>())),
+            Arc::new(Float64Array::from(rows.iter().map(|r| r.v_start_ms).collect::<Vec<_>>())),
+            Arc::new(Float64Array::from(rows.iter().map(|r| r.x_water_m).collect::<Vec<_>>())),
+            Arc::new(Float64Array::from(rows.iter().map(|r| r.min_mu).collect::<Vec<_>>())),
+            Arc::new(Float64Array::from(rows.iter().map(|r| r.max_ekf_drift_m).collect::<Vec<_>>())),
+            Arc::new(Float64Array::from(rows.iter().map(|r| r.max_abs_yaw_rate).collect::<Vec<_>>())),
+            Arc::new(Float64Array::from(rows.iter().map(|r| r.max_abs_pos_y_m).collect::<Vec<_>>())),
+            Arc::new(BooleanArray::from(rows.iter().map(|r| r.is_wet).collect::<Vec<_>>())),
+            Arc::new(BooleanArray::from(rows.iter().map(|r| r.is_hydroplane).collect::<Vec<_>>())),
+            Arc::new(BooleanArray::from(rows.iter().map(|r| r.is_corner_lost).collect::<Vec<_>>())),
+            Arc::new(StringArray::from(rows.iter().map(|r| r.proof_hash.as_str()).collect::<Vec<_>>())),
+        ],
+    )
+    .expect("batch");
+    let file = std::fs::File::create(&out).unwrap();
+    let props = output::parquet_receipt_properties(&seal, "G^G hydroplane dual-regime v1.1");
+    let mut w = ArrowWriter::try_new(file, schema, Some(props)).unwrap();
+    w.write(&batch).unwrap();
+    w.close().unwrap();
+    let nf = n as f64;
+    let wet = rows.iter().filter(|r| r.is_wet).count();
+    let hydro = rows.iter().filter(|r| r.is_hydroplane).count();
+    let lost = rows.iter().filter(|r| r.is_corner_lost).count();
+    let grip = rows.iter().filter(|r| !r.is_hydroplane && !r.is_corner_lost).count();
+    println!(
+        "  wet {wet} ({:.1}%)  hydro {hydro} ({:.1}%)  corner-lost {lost} ({:.1}%)  grip {grip} ({:.1}%)",
+        100.0 * wet as f64 / nf,
+        100.0 * hydro as f64 / nf,
+        100.0 * lost as f64 / nf,
+        100.0 * grip as f64 / nf
+    );
+    println!("  seal {seal}\n  parquet {out}\n  {:?}", t0.elapsed());
 }

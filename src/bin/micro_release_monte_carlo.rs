@@ -1,4 +1,5 @@
 //! Micro-assembly release: capillary stiction · ESD · piezo shake · safe retract.
+//! Dual-regime exclusive: ESD is terminal. Stiction (and piezo) only if charge lives.
 
 use genesis_core::output;
 use genesis_core::physics::dexterous::{
@@ -44,8 +45,6 @@ fn run_one(id: u32, rng: &mut Rng) -> MicroRun {
     let mut charge = rng.range(5.0, 40.0) as f32;
     let mut stiction = false;
     let mut esd = false;
-    let mut piezo = false;
-    let mut safe = false;
 
     let mut proof = ProofChain::new();
     proof.seed(&id.to_le_bytes());
@@ -70,17 +69,20 @@ fn run_one(id: u32, rng: &mut Rng) -> MicroRun {
         let res = evaluate_micro_release_dynamics(&auditor, dt);
         stiction = res.release_stiction_active;
         esd = res.electrostatic_charge_violation;
-        piezo = res.piezo_shake_trigger;
-        safe = res.safe_to_retract;
         if step % 20 == 0 {
             proof.feed_f64(pull as f64);
             proof.feed_f64(charge as f64);
         }
     }
 
+    // ESD is the terminal event. Stiction only seals if charge lives.
+    let esd_flag = esd;
+    let stiction_flag = stiction && !esd;
+    let piezo_flag = stiction_flag;
+    let safe = !stiction_flag && !esd_flag;
     proof.feed_str(if safe {
         "SAFE_RETRACT"
-    } else if esd {
+    } else if esd_flag {
         "ESD_VIOLATION"
     } else {
         "STICTION_BOUND"
@@ -93,9 +95,9 @@ fn run_one(id: u32, rng: &mut Rng) -> MicroRun {
         final_pull_off_un: pull as f64,
         final_jaw_separation_um: jaw as f64,
         final_charge_v: charge as f64,
-        release_stiction_active: stiction,
-        electrostatic_charge_violation: esd,
-        piezo_shake_trigger: piezo,
+        release_stiction_active: stiction_flag,
+        electrostatic_charge_violation: esd_flag,
+        piezo_shake_trigger: piezo_flag,
         safe_to_retract: safe,
         proof_hash: proof.seal(),
     }
@@ -161,7 +163,10 @@ fn main() {
         .set_compression(Compression::SNAPPY)
         .set_key_value_metadata(Some(vec![
             parquet::file::metadata::KeyValue::new("cryptographic_seal".to_string(), run_proof.clone()),
-            parquet::file::metadata::KeyValue::new("generator".to_string(), "G^G micro-assembly release v1.0".to_string()),
+            parquet::file::metadata::KeyValue::new(
+                "generator".to_string(),
+                "G^G micro-assembly release dual-regime v1.1".to_string(),
+            ),
         ]))
         .build();
     let mut w = ArrowWriter::try_new(file, schema, Some(props)).unwrap();
@@ -171,7 +176,14 @@ fn main() {
     let safe = rows.iter().filter(|r| r.safe_to_retract).count();
     let st = rows.iter().filter(|r| r.release_stiction_active).count();
     let esd = rows.iter().filter(|r| r.electrostatic_charge_violation).count();
-    println!("  safe_retract {safe} ({:.1}%)  stiction {st}  esd {esd}", 100.0 * safe as f64 / n as f64);
+    assert_eq!(safe + st + esd, n as usize);
+    let n_f = n as f64;
+    println!(
+        "  safe {safe} ({:.1}%)  stiction {st} ({:.1}%)  esd {esd} ({:.1}%)  exclusive",
+        100.0 * safe as f64 / n_f,
+        100.0 * st as f64 / n_f,
+        100.0 * esd as f64 / n_f
+    );
     println!("  seal {run_proof}");
     println!("  parquet {out}");
     println!("  {:?}", t0.elapsed());

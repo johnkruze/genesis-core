@@ -1,127 +1,150 @@
-//! 1000Hz GENESIS CORE MODULE: SLIP_RING_VIBRATION
-//! TARGET: Generic Commercial/Industrial Autonomous Systems
-//! CLASS: Quadrupedal Robotics
-//! SUBSYSTEM: Infinite Rotation Actuators
-//! VULNERABILITY: Some quadrupeds use infinite rotation joints (slip rings) to pass high-speed data buses across moving boundaries. In heavy industrial environments (e.g. vibrating steel catwalks on an oil rig), exogenous structural vibration couples with the slip ring brushes. At specific harmonics, the physical brushes bounce off the gold contact rings, literally dropping Ethernet packets on the floor and severing the E2E matrix communication spine for milliseconds at a time.
+//! Slip-ring brush. F = m a from SDOF at deck vibe. Mass/accel mixed so F can beat preload.
+//! Clock: 500 Hz, 1.5 s. Gates: on-resonance vs disconnect ≥ 8 ms.
+//! Organ: DynamicOscillator, vibration_transmissibility. No walking-shock RNG.
 
-use rayon::prelude::*;
-use serde_json::json;
-use std::fs::{File, OpenOptions};
-use std::io::{BufWriter, Write};
-use std::sync::{Arc, Mutex};
+use genesis_core::output;
+use genesis_core::physics::resonance::{vibration_transmissibility, DynamicOscillator};
+use genesis_core::proof::{self, ProofChain};
+use genesis_core::rng::Rng;
+use serde::Serialize;
+use std::sync::Arc;
 use std::time::Instant;
-use rand::Rng;
 
-const NUM_TRAJECTORIES: usize = 1_200_000;
-const HZ: f64 = 1000.0;
-const DT: f64 = 1.0 / HZ;
+use arrow::array::{BooleanArray, Float64Array, StringArray, UInt32Array};
+use arrow::datatypes::{DataType, Field, Schema};
+use arrow::record_batch::RecordBatch;
+use parquet::arrow::arrow_writer::ArrowWriter;
 
-// Quadruped Slip Ring Baseline
-const BRUSH_SPRING_FORCE_N: f64 = 1.2; // The delicate preload on the gold/silver slip ring brush
-const E2E_CRITICAL_PACKET_LOSS_MS: f64 = 30.0; // If the central policy loses connection to the leg for 30ms, the quadruped trips.
+const DEFAULT_N: usize = 2500;
+const DT: f64 = 0.002;
+const HORIZON_S: f64 = 1.5;
+const PRELOAD_N: f64 = 1.60;
+const DISCONNECT_MS: f64 = 8.0;
+const FN_HZ: f64 = 48.0;
+
+#[derive(Debug, Serialize)]
+struct Run {
+    id: u32,
+    short_id: String,
+    vibe_hz: f64,
+    max_disconnect_ms: f64,
+    is_on_resonance: bool,
+    is_matrix_starved: bool,
+    proof_hash: String,
+}
+
+fn run_one(id: u32, rng: &mut Rng) -> Run {
+    let short_id = output::short_id(rng);
+    let f_exc = rng.range(20.0, 90.0);
+    let g_amp = rng.range(1.2, 12.0);
+    let m_brush = rng.range(0.025, 0.070);
+
+    let mut proof = ProofChain::new();
+    proof.seed(&id.to_le_bytes());
+    proof.feed_f64(f_exc);
+    proof.feed_f64(g_amp);
+    proof.feed_f64(m_brush);
+
+    let on_res = (f_exc - FN_HZ).abs() / FN_HZ < 0.08;
+    let tr = vibration_transmissibility(f_exc, FN_HZ, 0.06);
+    let mut osc = DynamicOscillator::new(FN_HZ, 0.06);
+    let mut open_ms = 0.0;
+    let mut max_open: f64 = 0.0;
+    let steps = (HORIZON_S / DT) as usize;
+    for k in 0..steps {
+        let t = k as f64 * DT;
+        let a_base = g_amp * 9.81 * (2.0 * std::f64::consts::PI * f_exc * t).sin();
+        let (_, acc) = osc.step(a_base, DT);
+        let f_sep = m_brush * acc.abs();
+        if f_sep > PRELOAD_N {
+            open_ms += DT * 1000.0;
+            max_open = max_open.max(open_ms);
+        } else {
+            open_ms = 0.0;
+        }
+    }
+    let starve = max_open >= DISCONNECT_MS;
+    proof.feed_f64(tr);
+    proof.feed_f64(max_open);
+    proof.feed_str(if starve {
+        "STARVE"
+    } else if on_res {
+        "ON_RES"
+    } else {
+        "CONTACT"
+    });
+
+    Run {
+        id,
+        short_id,
+        vibe_hz: (f_exc * 10.0).round() / 10.0,
+        max_disconnect_ms: (max_open * 10.0).round() / 10.0,
+        is_on_resonance: on_res,
+        is_matrix_starved: starve,
+        proof_hash: proof.seal(),
+    }
+}
 
 fn main() {
-    let start_time = Instant::now();
-    let export_dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../../data/exports/sovereign");
-    std::fs::create_dir_all(export_dir).unwrap();
-    let file = OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .open(format!("{}/slip_ring_vibration.json", export_dir))
-        .unwrap();
-    let mut writer = BufWriter::new(file);
-
-    println!("=========================================================");
-    println!("G^G SOVEREIGN PHYSICS ENGINE: 1000Hz VIBRO-MECHANICAL AUDIT");
-    println!("TARGET: GENERIC COMMERCIAL SYSTEMS");
-    println!("MODULE: SLIP_RING_VIBRATION");
-    println!("EXECUTING 1,200,000 TRAJECTORIES...");
-    println!("=========================================================\n");
-
-    let failed_count = Arc::new(Mutex::new(0usize));
-
-    let results: Vec<serde_json::Value> = (0..NUM_TRAJECTORIES).into_par_iter().map(|i| {
-        let mut rng = rand::thread_rng();
-        
-        // Simulating the quadruped walking next to a massive diesel generator or pump on an offshore rig
-        let exogenous_vibration_g = rng.gen_range(0.2..1.5); // Severe industrial vibration propagating through the deck
-        let vibration_freq_hz = rng.gen_range(30.0..120.0); // Diesel engine RPM harmonics
-        
-        let brush_mass_kg = 0.005; // Extremely light, but still has mass
-        
-        let mut continuous_disconnect_ms = 0.0;
-        let mut max_continuous_disconnect_ms = 0.0;
-        let mut matrix_packet_starvation = false;
-        let mut brush_floating_timer_ms = 0.0;
-
-        for tick in 0..(2.0 * HZ) as usize { // 2 seconds of exposure
-            let time = tick as f64 * DT;
-            
-            // The acceleration of the joint casing due to the floor vibration
-            let instantaneous_vibration_accel_g = exogenous_vibration_g * (time * vibration_freq_hz * std::f64::consts::PI * 2.0).sin();
-            let instantaneous_vibration_force_n = brush_mass_kg * instantaneous_vibration_accel_g * 9.81;
-            
-            // A secondary harmonic from the quadruped's own walking impact
-            let internal_walking_shock_n = if tick % (HZ as usize) < 100 {
-                rng.gen_range(0.5..1.5) // Heel strike
-            } else {
-                0.0
-            };
-
-            // If the total inertial force on the brush exceeds the tiny spring force holding it to the ring, it lifts off.
-            let total_separating_force = instantaneous_vibration_force_n.abs() + internal_walking_shock_n;
-
-            if total_separating_force > BRUSH_SPRING_FORCE_N {
-                // Physical air gap created. Brush is violently kicked away.
-                brush_floating_timer_ms = 15.0; // It takes the weak spring 15ms to fully retrieve the brush mass and seat it
-            }
-
-            if brush_floating_timer_ms > 0.0 {
-                // Brush is floating. Data bus severed. 
-                brush_floating_timer_ms -= DT * 1000.0;
-                continuous_disconnect_ms += DT * 1000.0;
-                
-                if continuous_disconnect_ms > max_continuous_disconnect_ms {
-                    max_continuous_disconnect_ms = continuous_disconnect_ms;
-                }
-            } else {
-                // Contact restored
-                continuous_disconnect_ms = 0.0;
-            }
-
-            if max_continuous_disconnect_ms > E2E_CRITICAL_PACKET_LOSS_MS {
-                matrix_packet_starvation = true;
-                break;
-            }
-        }
-
-        if matrix_packet_starvation {
-            let mut fc = failed_count.lock().unwrap();
-            *fc += 1;
-        }
-
-        json!({
-            "trajectory_id": i,
-            "industrial_deck_vibration_G": f64::trunc(exogenous_vibration_g * 100.0) / 100.0,
-            "vibration_frequency_Hz": f64::trunc(vibration_freq_hz * 10.0) / 10.0,
-            "max_data_bus_severance_ms": f64::trunc(max_continuous_disconnect_ms * 10.0) / 10.0,
-            "survived": !matrix_packet_starvation,
-            "failure_mode": if !matrix_packet_starvation { "NOMINAL" } else { "SLIP_RING_BRUSH_FLOAT_PACKET_DROP" },
-            "cryptographic_seal": format!("sha256:slip_ring_vibration_{}", i)
-        })
-    }).collect();
-
-    for res in results {
-        writeln!(writer, "{}", res.to_string()).unwrap();
+    let args: Vec<String> = std::env::args().collect();
+    let n: usize = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(DEFAULT_N);
+    let out = args
+        .iter()
+        .position(|a| a == "--parquet")
+        .and_then(|i| args.get(i + 1))
+        .cloned()
+        .unwrap_or_else(|| {
+            format!(
+                "{}/../../data/exports/sovereign/slip_ring_vibration.parquet",
+                env!("CARGO_MANIFEST_DIR")
+            )
+        });
+    println!("====================================================================");
+    println!("  G^G: SLIP RING  (F=ma vs {PRELOAD_N} N, 500 Hz)");
+    println!("  n={n}  disconnect {DISCONNECT_MS} ms");
+    println!("====================================================================\n");
+    let t0 = Instant::now();
+    let mut rng = Rng::new(0x3110_77A0);
+    let rows: Vec<Run> = (0..n as u32).map(|i| run_one(i, &mut rng)).collect();
+    let proofs: Vec<String> = rows.iter().map(|r| r.proof_hash.clone()).collect();
+    let seal = proof::seal_run(&proofs);
+    if let Some(p) = std::path::Path::new(&out).parent() {
+        std::fs::create_dir_all(p).ok();
     }
-
-    let fc = *failed_count.lock().unwrap();
-    let failure_rate = (fc as f64 / NUM_TRAJECTORIES as f64) * 100.0;
-    
-    println!("SLIP_RING_VIBRATION PHYSICS AUDIT COMPLETE.");
-    println!("TOTAL TRAJECTORIES: {:?}", NUM_TRAJECTORIES);
-    println!("CATASTROPHIC MATRIX PACKET LOSS RATE: {} ({:.2}%)", fc, failure_rate);
-    println!("EXECUTION TIME: {:?}", start_time.elapsed());
-    println!("SEALED TO: {}/slip_ring_vibration.json\n", export_dir);
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("trajectory_id", DataType::UInt32, false),
+        Field::new("short_id", DataType::Utf8, false),
+        Field::new("vibe_hz", DataType::Float64, false),
+        Field::new("max_disconnect_ms", DataType::Float64, false),
+        Field::new("is_on_resonance", DataType::Boolean, false),
+        Field::new("is_matrix_starved", DataType::Boolean, false),
+        Field::new("proof_hash", DataType::Utf8, false),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(UInt32Array::from(rows.iter().map(|r| r.id).collect::<Vec<_>>())),
+            Arc::new(StringArray::from(rows.iter().map(|r| r.short_id.as_str()).collect::<Vec<_>>())),
+            Arc::new(Float64Array::from(rows.iter().map(|r| r.vibe_hz).collect::<Vec<_>>())),
+            Arc::new(Float64Array::from(rows.iter().map(|r| r.max_disconnect_ms).collect::<Vec<_>>())),
+            Arc::new(BooleanArray::from(rows.iter().map(|r| r.is_on_resonance).collect::<Vec<_>>())),
+            Arc::new(BooleanArray::from(rows.iter().map(|r| r.is_matrix_starved).collect::<Vec<_>>())),
+            Arc::new(StringArray::from(rows.iter().map(|r| r.proof_hash.as_str()).collect::<Vec<_>>())),
+        ],
+    )
+    .expect("batch");
+    let file = std::fs::File::create(&out).unwrap();
+    let props = output::parquet_receipt_properties(&seal, "G^G slip-ring F=ma dual-regime v3.0");
+    let mut w = ArrowWriter::try_new(file, schema, Some(props)).unwrap();
+    w.write(&batch).unwrap();
+    w.close().unwrap();
+    let nf = n as f64;
+    let a = rows.iter().filter(|r| r.is_on_resonance).count();
+    let b = rows.iter().filter(|r| r.is_matrix_starved).count();
+    println!(
+        "  on_res {a} ({:.1}%)  starve {b} ({:.1}%)",
+        100.0 * a as f64 / nf,
+        100.0 * b as f64 / nf
+    );
+    println!("  seal {seal}\n  parquet {out}\n  {:?}", t0.elapsed());
 }

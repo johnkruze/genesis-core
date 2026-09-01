@@ -1,114 +1,199 @@
-//! 1000Hz GENESIS CORE MODULE: BATTERY_THERMAL_RUNAWAY
-//! TARGET: Generic Commercial/Industrial Autonomous Systems
-//! CLASS: Bipedal Humanoid
-//! SUBSYSTEM: End-to-End Neural Control & High-Draw Battery Systems
-//! VULNERABILITY: E2E networks learn kinematics, not thermodynamics. Sustained high-torque holding patterns draw massive localized current from the Li-ion battery pack, inducing fatal thermal mass saturation and runaway discharge limits.
+//! Li-ion cell Joule heating with optional BMS current clamp and high-T self-heat.
+//! Clock: 1 Hz. Gates: current-limited (I_cmd > 60 A and clamp applied) vs
+//! thermal runaway (T ≥ 150 °C). 65 °C is not runaway — that is a BMS trip.
+//! Organ: LumpedThermalNode, joule_heating_watts, battery_dynamic_resistance_ohms.
 
-use rayon::prelude::*;
-use serde_json::json;
-use std::fs::{File, OpenOptions};
-use std::io::{BufWriter, Write};
-use std::sync::{Arc, Mutex};
+use genesis_core::output;
+use genesis_core::physics::thermal::{
+    battery_dynamic_resistance_ohms, joule_heating_watts, LumpedThermalNode,
+};
+use genesis_core::proof::{self, ProofChain};
+use genesis_core::rng::Rng;
+use serde::Serialize;
+use std::sync::Arc;
 use std::time::Instant;
-use rand::Rng;
 
-const NUM_TRAJECTORIES: usize = 1_200_000;
-const HZ: f64 = 1000.0;
-const DT: f64 = 1.0 / HZ;
+use arrow::array::{BooleanArray, Float64Array, StringArray, UInt32Array};
+use arrow::datatypes::{DataType, Field, Schema};
+use arrow::record_batch::RecordBatch;
+use parquet::arrow::arrow_writer::ArrowWriter;
 
-// Compact Battery Thermal Baseline
-const SAFE_DISCHARGE_CURRENT_AMPS: f64 = 40.0; // The continuous safe discharge limit
-const CRITICAL_CELL_TEMP_C: f64 = 65.0; // BMS forced shutdown or cell venting
+const DEFAULT_N: usize = 2500;
+const DT: f64 = 1.0;
+const HORIZON_S: f64 = 600.0;
+const I_LIMIT_A: f64 = 60.0;
+const T_FOLD_C: f64 = 80.0;
+const T_CHEM_C: f64 = 120.0;
+const T_RUNAWAY_C: f64 = 150.0;
+const CELL_AH: f64 = 5.0;
 
-fn main() {
-    let start_time = Instant::now();
-    let export_dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../../data/exports/sovereign");
-    std::fs::create_dir_all(export_dir).unwrap();
-    let file = OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .open(format!("{}/battery_thermal_runaway.json", export_dir))
-        .unwrap();
-    let mut writer = BufWriter::new(file);
+#[derive(Debug, Serialize)]
+struct Run {
+    id: u32,
+    short_id: String,
+    i_cmd_a: f64,
+    derate: f64,
+    k_runaway: f64,
+    peak_temp_c: f64,
+    is_current_limited: bool,
+    is_thermal_runaway: bool,
+    proof_hash: String,
+}
 
-    println!("=========================================================");
-    println!("G^G SOVEREIGN PHYSICS ENGINE: 1000Hz THERMODYNAMIC AUDIT");
-    println!("TARGET: GENERIC COMMERCIAL SYSTEMS");
-    println!("MODULE: BATTERY_THERMAL_RUNAWAY");
-    println!("EXECUTING 1,200,000 TRAJECTORIES...");
-    println!("=========================================================\n");
+fn run_one(id: u32, rng: &mut Rng) -> Run {
+    let short_id = output::short_id(rng);
+    let amb_c = rng.range(20.0, 45.0);
+    let i_cmd = rng.range(25.0, 95.0);
+    let r0 = rng.range(0.012, 0.028);
+    let derate = rng.range(0.0, 1.0);
+    let k_run = rng.range(0.020, 0.090);
 
-    let failed_count = Arc::new(Mutex::new(0usize));
+    let mut proof = ProofChain::new();
+    proof.seed(&id.to_le_bytes());
+    proof.feed_f64(amb_c);
+    proof.feed_f64(i_cmd);
+    proof.feed_f64(r0);
+    proof.feed_f64(derate);
+    proof.feed_f64(k_run);
 
-    let results: Vec<serde_json::Value> = (0..NUM_TRAJECTORIES).into_par_iter().map(|i| {
-        let mut rng = rand::thread_rng();
-        
-        let mut max_cell_temp_c = 25.0; // Room temp start
-        let mut bms_shutdown = false;
-        
-        // Simulating the robot tasked with holding a heavy box (15kg) statically in front of it while waiting for a human
-        let box_payload_kg = rng.gen_range(10.0..25.0); 
-        
-        let ambient_temp = rng.gen_range(20.0..30.0);
-        max_cell_temp_c = ambient_temp;
+    let mut node = LumpedThermalNode::new(amb_c, 300.0, 0.45);
+    let mut soc = 90.0;
+    let mut peak = amb_c;
+    let mut applied_clamp = false;
+    let mut runaway = false;
+    let mut elapsed = 0.0;
 
-        // Neural net is purely mapping Pixels -> Torque.
-        // To hold 15kg statically against a 40cm lever arm requires massive continuous torque.
-        // Motor Current is proportional to Torque.
-        
-        let torque_required_nm = box_payload_kg * 9.81 * 0.4;
-        let continuous_current_draw_amps: f64 = torque_required_nm * 0.8; // Motor specific Kt assumption
-        
-        // Thermodynamics change slowly. Stepping at 10Hz to model 180 seconds across 1.2M trajectories.
-        let thermal_dt = 1.0 / 10.0;
-        for _tick in 0..(180 * 10) as usize { 
-            
-            // Joules heating the pack (I^2 * R)
-            let battery_internal_resistance_ohms = 0.05;
-            let heat_power_watts = continuous_current_draw_amps.powi(2) * battery_internal_resistance_ohms;
-            
-            // Thermal mass of the battery segment assumes heating faster than passive cooling
-            let thermal_mass = 1200.0; // J/degC
-            let temp_increase_per_tick = heat_power_watts / thermal_mass * thermal_dt;
-            
-            let cooling_watts = (max_cell_temp_c - ambient_temp) * 0.5; // Passive case convection
-            let temp_decrease_per_tick = cooling_watts / thermal_mass * thermal_dt;
-            
-            max_cell_temp_c += temp_increase_per_tick - temp_decrease_per_tick;
-
-            if max_cell_temp_c > CRITICAL_CELL_TEMP_C || continuous_current_draw_amps > SAFE_DISCHARGE_CURRENT_AMPS * 1.5 {
-                bms_shutdown = true; // Dropping the load or catching fire
-                break;
-            }
+    while elapsed < HORIZON_S {
+        let mut i = i_cmd;
+        if i > I_LIMIT_A {
+            i = I_LIMIT_A + (i_cmd - I_LIMIT_A) * (1.0 - derate);
+            applied_clamp = derate > 0.05;
+        }
+        if node.temperature_c > T_FOLD_C {
+            i *= 0.15 + 0.85 * (1.0 - derate);
         }
 
-        if bms_shutdown {
-            let mut fc = failed_count.lock().unwrap();
-            *fc += 1;
+        let r_int = battery_dynamic_resistance_ohms(r0, soc);
+        let mut q = joule_heating_watts(i, r_int);
+        if node.temperature_c > T_CHEM_C {
+            q += 300.0 * k_run * (node.temperature_c - T_CHEM_C);
         }
 
-        json!({
-            "trajectory_id": i,
-            "static_payload_kg": f64::trunc(box_payload_kg * 100.0) / 100.0,
-            "continuous_current_A": f64::trunc(continuous_current_draw_amps * 100.0) / 100.0,
-            "max_cell_temp_C": f64::trunc(max_cell_temp_c * 100.0) / 100.0,
-            "survived": !bms_shutdown,
-            "failure_mode": if !bms_shutdown { "NOMINAL" } else { "E2E_UNMODELED_BMS_THERMAL_SHUTDOWN" },
-            "cryptographic_seal": format!("sha256:humanoid_battery_thermal_{}", i)
-        })
-    }).collect();
-
-    for res in results {
-        writeln!(writer, "{}", res.to_string()).unwrap();
+        let t = node.step(q, amb_c, DT);
+        soc = (soc - (i * DT / 3600.0) / CELL_AH * 100.0).max(5.0);
+        elapsed += DT;
+        if t > peak {
+            peak = t;
+        }
+        if t >= T_RUNAWAY_C {
+            runaway = true;
+            break;
+        }
+        if elapsed as u64 % 60 == 0 {
+            proof.feed_f64(t);
+        }
     }
 
-    let fc = *failed_count.lock().unwrap();
-    let failure_rate = (fc as f64 / NUM_TRAJECTORIES as f64) * 100.0;
-    
-    println!("BATTERY_THERMAL_RUNAWAY PHYSICS AUDIT COMPLETE.");
-    println!("TOTAL TRAJECTORIES: {:?}", NUM_TRAJECTORIES);
-    println!("CATASTROPHIC BMS SHUTDOWN RATE: {} ({:.2}%)", fc, failure_rate);
-    println!("EXECUTION TIME: {:?}", start_time.elapsed());
-    println!("SEALED TO: {}/battery_thermal_runaway.json\n", export_dir);
+    proof.feed_f64(peak);
+    proof.feed_str(if runaway {
+        "RUNAWAY"
+    } else if applied_clamp {
+        "CLAMPED"
+    } else {
+        "JOULE_OK"
+    });
+
+    Run {
+        id,
+        short_id,
+        i_cmd_a: (i_cmd * 10.0).round() / 10.0,
+        derate: (derate * 1000.0).round() / 1000.0,
+        k_runaway: (k_run * 1000.0).round() / 1000.0,
+        peak_temp_c: (peak * 10.0).round() / 10.0,
+        is_current_limited: applied_clamp,
+        is_thermal_runaway: runaway,
+        proof_hash: proof.seal(),
+    }
+}
+
+fn main() {
+    let args: Vec<String> = std::env::args().collect();
+    let n: usize = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(DEFAULT_N);
+    let out = args
+        .iter()
+        .position(|a| a == "--parquet")
+        .and_then(|i| args.get(i + 1))
+        .cloned()
+        .unwrap_or_else(|| {
+            format!(
+                "{}/../../data/exports/sovereign/battery_thermal_runaway.parquet",
+                env!("CARGO_MANIFEST_DIR")
+            )
+        });
+
+    println!("====================================================================");
+    println!("  G^G: LI-ION JOULE + SELF-HEAT  (clamp vs T≥{T_RUNAWAY_C} °C)");
+    println!("  n={n}  dt={DT}s  I_lim {I_LIMIT_A} A  fold {T_FOLD_C} °C  chem {T_CHEM_C} °C");
+    println!("====================================================================\n");
+
+    let t0 = Instant::now();
+    let mut rng = Rng::new(0xBA77_0001);
+    let rows: Vec<Run> = (0..n as u32).map(|i| run_one(i, &mut rng)).collect();
+    let proofs: Vec<String> = rows.iter().map(|r| r.proof_hash.clone()).collect();
+    let seal = proof::seal_run(&proofs);
+
+    if let Some(p) = std::path::Path::new(&out).parent() {
+        std::fs::create_dir_all(p).ok();
+    }
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("trajectory_id", DataType::UInt32, false),
+        Field::new("short_id", DataType::Utf8, false),
+        Field::new("i_cmd_a", DataType::Float64, false),
+        Field::new("derate", DataType::Float64, false),
+        Field::new("k_runaway", DataType::Float64, false),
+        Field::new("peak_temp_c", DataType::Float64, false),
+        Field::new("is_current_limited", DataType::Boolean, false),
+        Field::new("is_thermal_runaway", DataType::Boolean, false),
+        Field::new("proof_hash", DataType::Utf8, false),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(UInt32Array::from(rows.iter().map(|r| r.id).collect::<Vec<_>>())),
+            Arc::new(StringArray::from(rows.iter().map(|r| r.short_id.as_str()).collect::<Vec<_>>())),
+            Arc::new(Float64Array::from(rows.iter().map(|r| r.i_cmd_a).collect::<Vec<_>>())),
+            Arc::new(Float64Array::from(rows.iter().map(|r| r.derate).collect::<Vec<_>>())),
+            Arc::new(Float64Array::from(rows.iter().map(|r| r.k_runaway).collect::<Vec<_>>())),
+            Arc::new(Float64Array::from(rows.iter().map(|r| r.peak_temp_c).collect::<Vec<_>>())),
+            Arc::new(BooleanArray::from(rows.iter().map(|r| r.is_current_limited).collect::<Vec<_>>())),
+            Arc::new(BooleanArray::from(rows.iter().map(|r| r.is_thermal_runaway).collect::<Vec<_>>())),
+            Arc::new(StringArray::from(rows.iter().map(|r| r.proof_hash.as_str()).collect::<Vec<_>>())),
+        ],
+    )
+    .expect("batch");
+    let file = std::fs::File::create(&out).unwrap();
+    let props = output::parquet_receipt_properties(
+        &seal,
+        "G^G Li-ion Joule + self-heat dual-regime v3.0",
+    );
+    let mut w = ArrowWriter::try_new(file, schema, Some(props)).unwrap();
+    w.write(&batch).unwrap();
+    w.close().unwrap();
+
+    let n_f = n as f64;
+    let clamp = rows.iter().filter(|r| r.is_current_limited).count();
+    let run = rows.iter().filter(|r| r.is_thermal_runaway).count();
+    let held = rows
+        .iter()
+        .filter(|r| r.is_current_limited && !r.is_thermal_runaway)
+        .count();
+    println!(
+        "  current_limited {clamp} ({:.1}%)  runaway {run} ({:.1}%)  clamped-held {held} ({:.1}%)",
+        100.0 * clamp as f64 / n_f,
+        100.0 * run as f64 / n_f,
+        100.0 * held as f64 / n_f
+    );
+    println!("  seal {seal}");
+    println!("  parquet {out}");
+    println!("  {:?}", t0.elapsed());
 }

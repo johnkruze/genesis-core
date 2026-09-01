@@ -1,125 +1,140 @@
-//! 1000Hz GENESIS CORE MODULE: PNEUMATIC_LINE_RESONANCE
-//! TARGET: Generic Commercial/Industrial Autonomous Systems
-//! CLASS: Generic Autonomous Platform
-//! SUBSYSTEM: Drive-by-Wire Pneumatic Brake Actuation
-//! VULNERABILITY: Class 8 trucks rely on compressed air to engage the foundation brakes. The highway autonomy stack sends a digital braking signal, which triggers a solenoid to release 120 PSI of air down 60 feet of plastic tubing. When ABS pulses at 5-10Hz, it induces a standing acoustic pressure wave (water hammer) inside the air lines. If the commanded pulse frequency matches the pipe's natural acoustic resonance, the air flow chokes, effectively severing braking force to the rear axles.
+//! Class-8 air line. Organ-pipe f=c/(2L), Joukowsky ΔP=ρ c Δv. Mix coincident ABS vs not.
+//! Clock: constitutive. Gates: coincident |Δf|<0.8 Hz vs delivered P < 60 psi.
 
-use rayon::prelude::*;
-use serde_json::json;
-use std::fs::{File, OpenOptions};
-use std::io::{BufWriter, Write};
-use std::sync::{Arc, Mutex};
+use genesis_core::output;
+use genesis_core::physics::hydraulics::{
+    acoustic_fluid_wave_speed_m_s, pneumatic_line_resonance_freq_hz, AIR_BULK_MODULUS_PA,
+};
+use genesis_core::physics::resonance::vibration_transmissibility;
+use genesis_core::proof::{self, ProofChain};
+use genesis_core::rng::Rng;
+use serde::Serialize;
+use std::sync::Arc;
 use std::time::Instant;
-use rand::Rng;
 
-const NUM_TRAJECTORIES: usize = 1_200_000;
-const HZ: f64 = 1000.0;
-const DT: f64 = 1.0 / HZ;
+use arrow::array::{BooleanArray, Float64Array, StringArray, UInt32Array};
+use arrow::datatypes::{DataType, Field, Schema};
+use arrow::record_batch::RecordBatch;
+use parquet::arrow::arrow_writer::ArrowWriter;
 
-// Class-8 Pneumatic Brake Baseline
-const SPEED_OF_SOUND_AIR_MS: f64 = 343.0; // Speed of sound dictates pressure wave propagation
-const CRITICAL_BRAKE_PRESSURE_PSI: f64 = 60.0; // Needs at least 60 PSI to maintain safe stopping deceleration
-const SYSTEM_AIR_PRESSURE_PSI: f64 = 120.0;
+const DEFAULT_N: usize = 2500;
+const P_SYS_PA: f64 = 8.27e5; // 120 psi
+const P_MIN_PA: f64 = 4.14e5; // 60 psi
+
+#[derive(Debug, Serialize)]
+struct Run {
+    id: u32,
+    short_id: String,
+    line_length_m: f64,
+    min_delivered_psi: f64,
+    is_coincident: bool,
+    is_pneumatic_choked: bool,
+    proof_hash: String,
+}
+
+fn run_one(id: u32, rng: &mut Rng) -> Run {
+    let short_id = output::short_id(rng);
+    let l = rng.range(14.0, 26.0);
+    let coincident_mix = rng.chance(0.38);
+
+    let mut proof = ProofChain::new();
+    proof.seed(&id.to_le_bytes());
+    proof.feed_f64(l);
+
+    let c = acoustic_fluid_wave_speed_m_s(AIR_BULK_MODULUS_PA, 1.2);
+    let f0 = pneumatic_line_resonance_freq_hz(c, l, false);
+    let abs_hz = if coincident_mix {
+        f0 * rng.range(0.96, 1.04)
+    } else {
+        rng.range(4.0, 14.0)
+    };
+    let df = (f0 - abs_hz).abs();
+    let coincident = df < 0.80;
+    // Joukowsky in air is kPa — it does not choke 120 psi. Organ-pipe TR does.
+    let tr = vibration_transmissibility(abs_hz, f0, 0.10);
+    let p_del = P_SYS_PA / tr.max(1.0);
+    let choke = p_del < P_MIN_PA;
+
+    proof.feed_f64(p_del);
+    proof.feed_str(if choke {
+        "CHOKED"
+    } else if coincident {
+        "COINCIDENT"
+    } else {
+        "LIVE"
+    });
+
+    Run {
+        id,
+        short_id,
+        line_length_m: (l * 10.0).round() / 10.0,
+        min_delivered_psi: (p_del / 6895.0 * 10.0).round() / 10.0,
+        is_coincident: coincident,
+        is_pneumatic_choked: choke,
+        proof_hash: proof.seal(),
+    }
+}
 
 fn main() {
-    let start_time = Instant::now();
-    let export_dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../../data/exports/sovereign");
-    std::fs::create_dir_all(export_dir).unwrap();
-    let file = OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .open(format!("{}/pneumatic_line_resonance.json", export_dir))
-        .unwrap();
-    let mut writer = BufWriter::new(file);
-
-    println!("=========================================================");
-    println!("G^G SOVEREIGN PHYSICS ENGINE: 1000Hz FLUID DYNAMICS AUDIT");
-    println!("TARGET: GENERIC COMMERCIAL SYSTEMS");
-    println!("MODULE: PNEUMATIC_LINE_RESONANCE");
-    println!("EXECUTING 1,200,000 TRAJECTORIES...");
-    println!("=========================================================\n");
-
-    let failed_count = Arc::new(Mutex::new(0usize));
-
-    let results: Vec<serde_json::Value> = (0..NUM_TRAJECTORIES).into_par_iter().map(|i| {
-        let mut rng = rand::thread_rng();
-        
-        let mut min_delivered_pressure_psi = SYSTEM_AIR_PRESSURE_PSI;
-        let mut pneumatic_choke_failure = false;
-        
-        // Trailer air line length ranges from 15 meters to 25 meters
-        let pneumatic_line_length_m = rng.gen_range(15.0..25.0); 
-        
-        // Acoustic resonance frequency of a pipe open at both ends (solenoid to brake chamber)
-        let natural_acoustic_frequency_hz = SPEED_OF_SOUND_AIR_MS / (2.0 * pneumatic_line_length_m);
-        
-        // The digital ABS controller pulses the brakes to prevent jackknifing on wet roads
-        let abs_command_hz = rng.gen_range(5.0..12.0); 
-
-        // If the AI commands an ABS frequency that happens to match the natural harmonic of the 53ft trailer's air lines...
-        let harmonic_match_delta = (natural_acoustic_frequency_hz - abs_command_hz).abs();
-        
-        for tick in 0..(2.0 * HZ) as usize { // 2 seconds of emergency braking
-            let time = tick as f64 * DT;
-            
-            // The solenoid sends a square wave pressure pulse
-            let commanded_pulse = (time * abs_command_hz * std::f64::consts::PI * 2.0).sin();
-            
-            // The reflected pressure wave coming back from the brake chamber
-            // If they are in phase, they constructively interfere (pressure spikes).
-            // If they are out of phase, they destructively interfere (pressure flatlines).
-            
-            // At resonance, the standing wave creates "nodes" where the dynamic pressure is effectively zero.
-            let standing_wave_choke_factor = if harmonic_match_delta < 1.0 {
-                // Perfect harmonic match creates a massive choke
-                rng.gen_range(0.1..0.3)
-            } else {
-                rng.gen_range(0.7..1.0) // Nominal flow
-            };
-
-            let delivered_pressure_psi = SYSTEM_AIR_PRESSURE_PSI * standing_wave_choke_factor;
-            
-            if commanded_pulse > 0.0 { // During the "ON" phase of the ABS pulse
-                if delivered_pressure_psi < min_delivered_pressure_psi {
-                    min_delivered_pressure_psi = delivered_pressure_psi;
-                }
-
-                // If the standing wave prevents the air from reaching the required 60 PSI, the 80,000lb truck 
-                // loses its trailer brakes and jackknifes or rear-ends the target.
-                if delivered_pressure_psi < CRITICAL_BRAKE_PRESSURE_PSI {
-                    pneumatic_choke_failure = true;
-                    break;
-                }
-            }
-        }
-
-        if pneumatic_choke_failure {
-            let mut fc = failed_count.lock().unwrap();
-            *fc += 1;
-        }
-
-        json!({
-            "trajectory_id": i,
-            "trailer_line_length_m": f64::trunc(pneumatic_line_length_m * 10.0) / 10.0,
-            "matched_abs_frequency_Hz": f64::trunc(abs_command_hz * 10.0) / 10.0,
-            "min_delivered_pressure_PSI": f64::trunc(min_delivered_pressure_psi * 10.0) / 10.0,
-            "survived": !pneumatic_choke_failure,
-            "failure_mode": if !pneumatic_choke_failure { "NOMINAL" } else { "PNEUMATIC_STANDING_WAVE_ABS_CHOKE" },
-            "cryptographic_seal": format!("sha256:pneumatic_resonance_{}", i)
-        })
-    }).collect();
-
-    for res in results {
-        writeln!(writer, "{}", res.to_string()).unwrap();
+    let args: Vec<String> = std::env::args().collect();
+    let n: usize = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(DEFAULT_N);
+    let out = args
+        .iter()
+        .position(|a| a == "--parquet")
+        .and_then(|i| args.get(i + 1))
+        .cloned()
+        .unwrap_or_else(|| {
+            format!(
+                "{}/../../data/exports/sovereign/pneumatic_line_resonance.parquet",
+                env!("CARGO_MANIFEST_DIR")
+            )
+        });
+    println!("====================================================================");
+    println!("  G^G: AIR LINE  (organ-pipe + Joukowsky)");
+    println!("  n={n}");
+    println!("====================================================================\n");
+    let t0 = Instant::now();
+    let mut rng = Rng::new(0xA11E_00B3);
+    let rows: Vec<Run> = (0..n as u32).map(|i| run_one(i, &mut rng)).collect();
+    let proofs: Vec<String> = rows.iter().map(|r| r.proof_hash.clone()).collect();
+    let seal = proof::seal_run(&proofs);
+    if let Some(p) = std::path::Path::new(&out).parent() {
+        std::fs::create_dir_all(p).ok();
     }
-
-    let fc = *failed_count.lock().unwrap();
-    let failure_rate = (fc as f64 / NUM_TRAJECTORIES as f64) * 100.0;
-    
-    println!("PNEUMATIC_LINE_RESONANCE PHYSICS AUDIT COMPLETE.");
-    println!("TOTAL TRAJECTORIES: {:?}", NUM_TRAJECTORIES);
-    println!("CATASTROPHIC BRAKE CHOKE RATE: {} ({:.2}%)", fc, failure_rate);
-    println!("EXECUTION TIME: {:?}", start_time.elapsed());
-    println!("SEALED TO: {}/pneumatic_line_resonance.json\n", export_dir);
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("trajectory_id", DataType::UInt32, false),
+        Field::new("short_id", DataType::Utf8, false),
+        Field::new("line_length_m", DataType::Float64, false),
+        Field::new("min_delivered_psi", DataType::Float64, false),
+        Field::new("is_coincident", DataType::Boolean, false),
+        Field::new("is_pneumatic_choked", DataType::Boolean, false),
+        Field::new("proof_hash", DataType::Utf8, false),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(UInt32Array::from(rows.iter().map(|r| r.id).collect::<Vec<_>>())),
+            Arc::new(StringArray::from(rows.iter().map(|r| r.short_id.as_str()).collect::<Vec<_>>())),
+            Arc::new(Float64Array::from(rows.iter().map(|r| r.line_length_m).collect::<Vec<_>>())),
+            Arc::new(Float64Array::from(rows.iter().map(|r| r.min_delivered_psi).collect::<Vec<_>>())),
+            Arc::new(BooleanArray::from(rows.iter().map(|r| r.is_coincident).collect::<Vec<_>>())),
+            Arc::new(BooleanArray::from(rows.iter().map(|r| r.is_pneumatic_choked).collect::<Vec<_>>())),
+            Arc::new(StringArray::from(rows.iter().map(|r| r.proof_hash.as_str()).collect::<Vec<_>>())),
+        ],
+    )
+    .expect("batch");
+    let file = std::fs::File::create(&out).unwrap();
+    let props = output::parquet_receipt_properties(&seal, "G^G air-line Joukowsky dual-regime v3.0");
+    let mut w = ArrowWriter::try_new(file, schema, Some(props)).unwrap();
+    w.write(&batch).unwrap();
+    w.close().unwrap();
+    let nf = n as f64;
+    let a = rows.iter().filter(|r| r.is_coincident).count();
+    let b = rows.iter().filter(|r| r.is_pneumatic_choked).count();
+    println!(
+        "  coincident {a} ({:.1}%)  choke {b} ({:.1}%)",
+        100.0 * a as f64 / nf,
+        100.0 * b as f64 / nf
+    );
+    println!("  seal {seal}\n  parquet {out}\n  {:?}", t0.elapsed());
 }

@@ -1,162 +1,187 @@
-//! 1000Hz GENESIS CORE MODULE: HYPERSONIC_PLASMA_BLACKOUT
-//! TARGET: Generic Commercial/Industrial Autonomous Systems
-//! CLASS: Autonomous Flight Systems / Drones
-//! SUBSYSTEM: Terminal Guidance AI (INS/GPS Coupling)
-//! VULNERABILITY: During a terminal dive onto a moving naval carrier contour, the HGV reaches Mach 5+. The intense atmospheric friction creates a layer of superheated ionized gas (plasma sheath) around the radome. This plasma absorbs and reflects the 1.5 GHz GPS signals, causing a complete sensor blackout for the final 12 seconds of flight. The AI's Extended Kalman Filter (EKF), deprived of absolute positional updates, watches its Inertial Navigation System (INS) covariance balloon. The safety constraints within the AI's guidance loop "panic" when positional uncertainty exceeds 50 meters, causing it to zero out its targeting lead and lock the control fins in a neutral glide. The HGV becomes a blind dart, missing the continuously-moving carrier by over 100 meters.
+//! Plasma sheath vs GPS L1. f_p ≈ 8.98√n_e. Blackout when f_p > 1.575 GHz.
+//! During blackout the filter does **not** see true velocity. Cov grows as σ_v² t².
+//! Clock: 20 Hz. Mix Mach 2.5–6.5 so some never blackout.
+//! Gates: is_blackout vs is_target_missed (>39 m). Organ: aero plasma cutoff. Not LBM.
 
-use rayon::prelude::*;
-use serde_json::json;
-use std::fs::{File, OpenOptions};
-use std::io::{BufWriter, Write};
-use std::sync::{Arc, Mutex};
+use genesis_core::output;
+use genesis_core::physics::aero::{
+    gps_l1_blackout, plasma_frequency_hz, sheath_electron_density_m3, tas_from_mach, GPS_L1_HZ,
+};
+use genesis_core::proof::{self, ProofChain};
+use genesis_core::rng::Rng;
+use serde::Serialize;
+use std::sync::Arc;
 use std::time::Instant;
-use rand::Rng;
 
-const NUM_TRAJECTORIES: usize = 1_200_000;
-const HZ: f64 = 1000.0;
-const DT: f64 = 1.0 / HZ;
+use arrow::array::{BooleanArray, Float64Array, StringArray, UInt32Array};
+use arrow::datatypes::{DataType, Field, Schema};
+use arrow::record_batch::RecordBatch;
+use parquet::arrow::arrow_writer::ArrowWriter;
 
-// Hypersonic Glide Baseline
-const CARRIER_DECK_WIDTH_M: f64 = 78.0; // carrier class width. Miss distance > 39m is a total miss
+const DEFAULT_N: usize = 2500;
+const DT: f64 = 0.05;
+const DECK_HALF_M: f64 = 39.0;
+#[derive(Debug, Serialize)]
+struct Run {
+    id: u32,
+    short_id: String,
+    mach: f64,
+    max_plasma_freq_ghz: f64,
+    miss_distance_m: f64,
+    is_blackout: bool,
+    is_target_missed: bool,
+    proof_hash: String,
+}
 
-fn main() {
-    let start_time = Instant::now();
-    let export_dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../../data/exports/sovereign");
-    std::fs::create_dir_all(export_dir).unwrap();
-    let file = OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .open(format!("{}/hypersonic_plasma_blackout.json", export_dir))
-        .unwrap();
-    let mut writer = BufWriter::new(file);
+fn run_one(id: u32, rng: &mut Rng) -> Run {
+    let short_id = output::short_id(rng);
+    let mach = rng.range(2.5, 6.5);
+    let z0 = rng.range(12_000.0, 32_000.0);
+    let dive = rng.range(30.0, 55.0).to_radians();
 
-    println!("=========================================================");
-    println!("G^G SOVEREIGN PHYSICS ENGINE: 1000Hz THERMODYNAMIC/RF AUDIT");
-    println!("TARGET: GENERIC COMMERCIAL SYSTEMS");
-    println!("MODULE: HYPERSONIC_PLASMA_BLACKOUT");
-    println!("EXECUTING 1,200,000 TRAJECTORIES...");
-    println!("=========================================================\n");
+    let mut proof = ProofChain::new();
+    proof.seed(&id.to_le_bytes());
+    proof.feed_f64(mach);
+    proof.feed_f64(z0);
+    proof.feed_f64(dive);
 
-    let failed_count = Arc::new(Mutex::new(0usize));
+    let v = tas_from_mach(mach);
+    let vz = -v * dive.sin();
+    let vx = v * dive.cos();
+    let mut z = z0;
+    let mut x = 0.0;
+    let t_impact = z0 / vz.abs();
+    let mut tgt = t_impact * vx; // intercept geometry
+    let v_tgt = rng.range(8.0, 16.0);
+    let mut x_est = tgt;
+    let mut t_black = 0.0;
+    let mut saw_blackout = false;
+    let mut fin_lock = false;
+    let mut peak_fp: f64 = 0.0;
+    let mut miss: f64 = 0.0;
 
-    let results: Vec<serde_json::Value> = (0..NUM_TRAJECTORIES).into_par_iter().map(|i| {
-        let mut rng = rand::thread_rng();
-        
-        let mut target_missed = false;
-        let mut final_miss_distance_m = 0.0;
-        
-        // Terminal Dive Geometry
-        let mut hgv_altitude_m = 25_000.0; // 25km high
-        let mut mako_velocity_ms = 1715.0; // Mach 5
-        let dive_angle_rad = (45.0_f64) * std::f64::consts::PI / 180.0; // 45 degree dive
-        
-        let vertical_velocity = -mako_velocity_ms * dive_angle_rad.sin();
-        let horizontal_velocity = mako_velocity_ms * dive_angle_rad.cos();
-        
-        // The moving target (Aircraft Carrier)
-        let carrier_velocity_ms = rng.gen_range(10.0..15.0); // 20-30 knots evasive maneuvers
-        let distance_to_impact_s = hgv_altitude_m / vertical_velocity.abs();
-        
-        // Let's model the horizontal axis. 
-        // Initial distance matches impact time perfectly.
-        let mut hgv_x_m = 0.0;
-        let mut carrier_x_m = distance_to_impact_s * horizontal_velocity; // Carrier is 30km away
-        
-        // EKF State
-        // The AI is continuously calculating the intercept point
-        let mut ekf_estimated_carrier_x_m = carrier_x_m;
-        let mut ekf_positional_covariance_m2 = 1.0; // Very confident with GPS
-        
-        let mut gps_active = true;
-        let plasma_blackout_altitude_m = rng.gen_range(15_000.0..18_000.0); // Atmosphere thickens enough to generate severe plasma
-        
-        for tick in 0..(40.0 * HZ) as usize { // Up to 40 seconds of terminal dive
-            
-            // Physics Update
-            hgv_altitude_m += vertical_velocity * DT;
-            carrier_x_m += carrier_velocity_ms * DT; // Carrier keeps moving
-            
-            // AI Plasma Physics
-            if hgv_altitude_m < plasma_blackout_altitude_m && hgv_altitude_m > 0.0 {
-                gps_active = false; // The 1.5 GHz GPS signal cannot penetrate the ionized plasma sheath
+    let steps = ((t_impact / DT).ceil() as usize + 4).min(2000);
+    for k in 0..steps {
+        z += vz * DT;
+        tgt += v_tgt * DT;
+        let n_e = sheath_electron_density_m3(mach, z.max(0.0));
+        let fp = plasma_frequency_hz(n_e);
+        peak_fp = peak_fp.max(fp);
+        let black = z > 0.0 && gps_l1_blackout(n_e);
+        if black {
+            saw_blackout = true;
+            t_black += DT;
+            if t_black > 1.5 {
+                fin_lock = true; // safety fallback stays latched
             }
-            
-            // EKF Update Loop
-            if gps_active {
-                // Perfect updates
-                ekf_estimated_carrier_x_m = carrier_x_m;
-                ekf_positional_covariance_m2 = 1.0;
-            } else {
-                // INS Dead Reckoning
-                // The AI projects the carrier's movement based on last known velocity
-                ekf_estimated_carrier_x_m += carrier_velocity_ms * DT; 
-                
-                // Without absolute truth, IMU drift and target maneuvering uncertainty compounds the covariance quadratically
-                ekf_positional_covariance_m2 += (rng.gen_range(5.0..15.0) as f64) * DT;
-            }
-            
-            // AI Control Law: Proportional Navigation (Pranav) to hit the moving target
-            let mut hgv_horizontal_maneuver_velocity = horizontal_velocity;
-            
-            // FATAL FLAW: Covariance Panic
-            // If the statistical uncertainty of the target's position exceeds 50 meters,
-            // the AI's internal safety constraints ("Avoid collateral damage from blind strikes") 
-            // trigger a fallback state. It zeroes out the terminal maneuvering fins and flies a dumb ballistic trajectory.
-            
-            if ekf_positional_covariance_m2 > 50.0 {
-                // HGV locks fins neutral
-                // No more course corrections. It just flies straight.
-                hgv_horizontal_maneuver_velocity = horizontal_velocity; // No adjustment for carrier evasion
-            } else {
-                // Normal AI interception - perfectly leads the target
-                // We assume perfect guidance when covariance is low
-                let time_to_impact = hgv_altitude_m / vertical_velocity.abs();
-                if time_to_impact > 0.1 {
-                    let required_velocity = (ekf_estimated_carrier_x_m - hgv_x_m) / time_to_impact;
-                    hgv_horizontal_maneuver_velocity = required_velocity;
-                }
-            }
-            
-            hgv_x_m += hgv_horizontal_maneuver_velocity * DT;
-            
-            if hgv_altitude_m <= 0.0 {
-                // Impact!
-                final_miss_distance_m = (hgv_x_m - carrier_x_m).abs();
-                
-                if final_miss_distance_m > (CARRIER_DECK_WIDTH_M / 2.0) {
-                    target_missed = true;
-                }
-                break;
-            }
+        } else if !fin_lock {
+            x_est = tgt;
+            t_black = 0.0;
         }
-
-        if target_missed {
-            let mut fc = failed_count.lock().unwrap();
-            *fc += 1;
+        let tti = (z / vz.abs()).max(0.05);
+        let vx_cmd = if fin_lock {
+            vx
+        } else {
+            (x_est - x) / tti
+        };
+        x += vx_cmd * DT;
+        if z <= 0.0 {
+            miss = (x - tgt).abs();
+            break;
         }
-
-        json!({
-            "trajectory_id": i,
-            "blackout_altitude_m": f64::trunc(plasma_blackout_altitude_m * 10.0) / 10.0,
-            "final_ekf_covariance": f64::trunc(ekf_positional_covariance_m2 * 10.0) / 10.0,
-            "miss_distance_m": f64::trunc(final_miss_distance_m * 10.0) / 10.0,
-            "survived": !target_missed,
-            "failure_mode": if !target_missed { "NOMINAL" } else { "PLASMA_BLACKOUT_COVARIANCE_PANIC" },
-            "cryptographic_seal": format!("sha256:hgv_plasma_blackout_{}", i)
-        })
-    }).collect();
-
-    for res in results {
-        writeln!(writer, "{}", res.to_string()).unwrap();
+        if k % 10 == 0 {
+            proof.feed_f64(fp);
+        }
     }
 
-    let fc = *failed_count.lock().unwrap();
-    let failure_rate = (fc as f64 / NUM_TRAJECTORIES as f64) * 100.0;
-    
-    println!("HYPERSONIC_PLASMA_BLACKOUT PHYSICS AUDIT COMPLETE.");
-    println!("TOTAL TRAJECTORIES: {:?}", NUM_TRAJECTORIES);
-    println!("CATASTROPHIC TARGET MISS RATE: {} ({:.2}%)", fc, failure_rate);
-    println!("EXECUTION TIME: {:?}", start_time.elapsed());
-    println!("SEALED TO: {}/hypersonic_plasma_blackout.json\n", export_dir);
+    let missed = miss > DECK_HALF_M;
+    proof.feed_f64(miss);
+    proof.feed_str(if missed {
+        "MISS"
+    } else if saw_blackout {
+        "BLACKOUT_HIT"
+    } else {
+        "GPS_HIT"
+    });
+
+    Run {
+        id,
+        short_id,
+        mach: (mach * 100.0).round() / 100.0,
+        max_plasma_freq_ghz: (peak_fp / 1e9 * 100.0).round() / 100.0,
+        miss_distance_m: (miss * 10.0).round() / 10.0,
+        is_blackout: saw_blackout,
+        is_target_missed: missed,
+        proof_hash: proof.seal(),
+    }
+}
+
+fn main() {
+    let args: Vec<String> = std::env::args().collect();
+    let n: usize = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(DEFAULT_N);
+    let out = args
+        .iter()
+        .position(|a| a == "--parquet")
+        .and_then(|i| args.get(i + 1))
+        .cloned()
+        .unwrap_or_else(|| {
+            format!(
+                "{}/../../data/exports/sovereign/hypersonic_plasma_blackout.parquet",
+                env!("CARGO_MANIFEST_DIR")
+            )
+        });
+
+    println!("====================================================================");
+    println!("  G^G: PLASMA vs L1  (f_p=8.98√n_e, 20 Hz)");
+    println!("  n={n}  L1={:.3} GHz  miss >{DECK_HALF_M} m", GPS_L1_HZ / 1e9);
+    println!("====================================================================\n");
+
+    let t0 = Instant::now();
+    let mut rng = Rng::new(0x87A5_0019);
+    let rows: Vec<Run> = (0..n as u32).map(|i| run_one(i, &mut rng)).collect();
+    let proofs: Vec<String> = rows.iter().map(|r| r.proof_hash.clone()).collect();
+    let seal = proof::seal_run(&proofs);
+    if let Some(p) = std::path::Path::new(&out).parent() {
+        std::fs::create_dir_all(p).ok();
+    }
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("trajectory_id", DataType::UInt32, false),
+        Field::new("short_id", DataType::Utf8, false),
+        Field::new("mach", DataType::Float64, false),
+        Field::new("max_plasma_freq_ghz", DataType::Float64, false),
+        Field::new("miss_distance_m", DataType::Float64, false),
+        Field::new("is_blackout", DataType::Boolean, false),
+        Field::new("is_target_missed", DataType::Boolean, false),
+        Field::new("proof_hash", DataType::Utf8, false),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(UInt32Array::from(rows.iter().map(|r| r.id).collect::<Vec<_>>())),
+            Arc::new(StringArray::from(rows.iter().map(|r| r.short_id.as_str()).collect::<Vec<_>>())),
+            Arc::new(Float64Array::from(rows.iter().map(|r| r.mach).collect::<Vec<_>>())),
+            Arc::new(Float64Array::from(rows.iter().map(|r| r.max_plasma_freq_ghz).collect::<Vec<_>>())),
+            Arc::new(Float64Array::from(rows.iter().map(|r| r.miss_distance_m).collect::<Vec<_>>())),
+            Arc::new(BooleanArray::from(rows.iter().map(|r| r.is_blackout).collect::<Vec<_>>())),
+            Arc::new(BooleanArray::from(rows.iter().map(|r| r.is_target_missed).collect::<Vec<_>>())),
+            Arc::new(StringArray::from(rows.iter().map(|r| r.proof_hash.as_str()).collect::<Vec<_>>())),
+        ],
+    )
+    .expect("batch");
+    let file = std::fs::File::create(&out).unwrap();
+    let props = output::parquet_receipt_properties(&seal, "G^G plasma L1 dual-regime v3.0");
+    let mut w = ArrowWriter::try_new(file, schema, Some(props)).unwrap();
+    w.write(&batch).unwrap();
+    w.close().unwrap();
+    let n_f = n as f64;
+    let b = rows.iter().filter(|r| r.is_blackout).count();
+    let m = rows.iter().filter(|r| r.is_target_missed).count();
+    println!(
+        "  blackout {b} ({:.1}%)  miss {m} ({:.1}%)",
+        100.0 * b as f64 / n_f,
+        100.0 * m as f64 / n_f
+    );
+    println!("  seal {seal}");
+    println!("  parquet {out}");
+    println!("  {:?}", t0.elapsed());
 }

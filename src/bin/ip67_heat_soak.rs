@@ -1,118 +1,168 @@
-//! 1000Hz GENESIS CORE MODULE: IP67_HEAT_SOAK
-//! TARGET: Generic Commercial/Industrial Autonomous Systems
-//! CLASS: Quadrupedal Robotics
-//! SUBSYSTEM: Industrial RL Navigation Policy
-//! VULNERABILITY: IP67-rated offshore quadrupeds are completely sealed against water and dust ingress. However, this means there is zero convective airflow to cool the internal compute matrix. When operating in direct sunlight on a steel offshore rig, the internal chassis creates a profound thermal runaway loop. The RL policy expects continuous 50Hz inferences, but thermal throttling structurally cuts the cognitive rate, inducing phase-lag in the walking gait.
+//! Sealed IP67 enclosure. Solar G·A·α plus compute, lumped RC to ambient.
+//! Clock: 1 Hz thermal, 10 s exact exponential chunks, 4 h soak.
+//! Gates: throttle T > 70 °C (compute × 0.5) vs shutdown T > 85 °C.
+//! Envelope mixes night/shade (G=0) with desert midday so a survive class exists.
 
-use rayon::prelude::*;
-use serde_json::json;
-use std::fs::{File, OpenOptions};
-use std::io::{BufWriter, Write};
-use std::sync::{Arc, Mutex};
+use genesis_core::output;
+use genesis_core::physics::thermal::LumpedThermalNode;
+use genesis_core::proof::{self, ProofChain};
+use genesis_core::rng::Rng;
+use serde::Serialize;
+use std::sync::Arc;
 use std::time::Instant;
-use rand::Rng;
 
-const NUM_TRAJECTORIES: usize = 1_200_000;
-const HZ: f64 = 1000.0;
-const DT: f64 = 1.0 / HZ;
+use arrow::array::{BooleanArray, Float64Array, StringArray, UInt32Array};
+use arrow::datatypes::{DataType, Field, Schema};
+use arrow::record_batch::RecordBatch;
+use parquet::arrow::arrow_writer::ArrowWriter;
 
-// Sealed Enclosure Thermal Baseline
-const IP67_THERMAL_MASS_J_C: f64 = 8500.0; // The chassis can absorb a lot of heat, but has nowhere to dump it
-const CRITICAL_COMPUTE_TEMP_C: f64 = 98.0; // Edge AI throttling threshold
-const RL_PHASE_LAG_FATAL_MS: f64 = 120.0; // If inference delays past 120ms, the quadruped trips itself
+const DEFAULT_N: usize = 2500;
+const CHUNK: f64 = 10.0;
+const HORIZON_S: f64 = 4.0 * 3600.0;
+const T_THROTTLE: f64 = 70.0;
+const T_SHUT: f64 = 85.0;
+const AREA_M2: f64 = 0.05;
+const ALPHA: f64 = 0.85;
 
-fn main() {
-    let start_time = Instant::now();
-    let export_dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../../data/exports/sovereign");
-    std::fs::create_dir_all(export_dir).unwrap();
-    let file = OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .open(format!("{}/ip67_heat_soak.json", export_dir))
-        .unwrap();
-    let mut writer = BufWriter::new(file);
+#[derive(Debug, Serialize)]
+struct Run {
+    id: u32,
+    short_id: String,
+    solar_flux_w_m2: f64,
+    compute_w: f64,
+    peak_temp_c: f64,
+    is_thermal_throttled: bool,
+    is_overtemp_shutdown: bool,
+    proof_hash: String,
+}
 
-    println!("=========================================================");
-    println!("G^G SOVEREIGN PHYSICS ENGINE: 1000Hz THERMODYNAMIC AUDIT");
-    println!("TARGET: GENERIC COMMERCIAL SYSTEMS");
-    println!("MODULE: IP67_HEAT_SOAK");
-    println!("EXECUTING 1,200,000 TRAJECTORIES...");
-    println!("=========================================================\n");
+fn run_one(id: u32, rng: &mut Rng) -> Run {
+    let short_id = output::short_id(rng);
+    let amb = rng.range(18.0, 50.0);
+    let solar = rng.range(0.0, 1150.0); // night through desert
+    let compute = rng.range(12.0, 95.0);
 
-    let failed_count = Arc::new(Mutex::new(0usize));
+    let mut proof = ProofChain::new();
+    proof.seed(&id.to_le_bytes());
+    proof.feed_f64(amb);
+    proof.feed_f64(solar);
+    proof.feed_f64(compute);
 
-    let results: Vec<serde_json::Value> = (0..NUM_TRAJECTORIES).into_par_iter().map(|i| {
-        let mut rng = rand::thread_rng();
-        
-        let mut max_rl_inference_latency_ms = 20.0; // Nominal 50Hz
-        let mut thermal_trip_failure = false;
-        
-        // Simulating the quadruped performing a 3-hour inspection route on an offshore oil rig
-        let ambient_temp_c = rng.gen_range(30.0..50.0); // Persian Gulf or North Sea summer
-        let solar_irradiance_w = rng.gen_range(200.0..800.0); // Direct sun hitting the black/grey chassis
-        
-        let mut internal_chassis_temp_c = ambient_temp_c;
-        
-        let compute_heat_w = 400.0; // CPU/GPU/LiDAR heat generation
-        let actuator_conducted_heat_w = rng.gen_range(150.0..350.0); // Heat migrating from the legs into the body
-        
-        for tick in 0..(3600 * 3) as usize { // Stepping at 1Hz for 3 hours to simulate heat soak
-            
-            // Total heat entering the IP67 box
-            let total_heat_in_w = compute_heat_w + actuator_conducted_heat_w + (solar_irradiance_w * 0.5);
-            
-            // Heat leaving the box (only via passive radiation/conduction to the ambient air)
-            let heat_out_w = (internal_chassis_temp_c - ambient_temp_c) * 15.0; // Passive cooling coefficient
-            
-            let net_heat_w = total_heat_in_w - heat_out_w;
-            
-            // 1Hz step DT = 1.0s
-            internal_chassis_temp_c += (net_heat_w / IP67_THERMAL_MASS_J_C) * 1.0; 
+    let q_solar = solar * AREA_M2 * ALPHA;
+    let mut node = LumpedThermalNode::new(amb, 2250.0, 0.55);
+    let mut throttled = false;
+    let mut shutdown = false;
+    let mut peak = amb;
+    let mut elapsed = 0.0;
 
-            if internal_chassis_temp_c > CRITICAL_COMPUTE_TEMP_C {
-                // The AI matrix aggressively downclocks to save the silicon
-                let over_temp = internal_chassis_temp_c - CRITICAL_COMPUTE_TEMP_C;
-                
-                // Inference latency balloons quadratically as clock speeds are halved, then quartered
-                max_rl_inference_latency_ms = 20.0 + (over_temp.powi(2) * 5.0);
-            }
-
-            // Once the latency exceeds 120ms, the physical legs have moved on physically, but the RL policy 
-            // is calculating torques based on where the legs were 120ms ago. It rips itself apart or falls.
-            if max_rl_inference_latency_ms > RL_PHASE_LAG_FATAL_MS {
-                thermal_trip_failure = true;
-                break;
-            }
+    while elapsed < HORIZON_S {
+        let p = if throttled { compute * 0.50 } else { compute };
+        let t = node.step(p + q_solar, amb, CHUNK);
+        elapsed += CHUNK;
+        if t > peak {
+            peak = t;
         }
-
-        if thermal_trip_failure {
-            let mut fc = failed_count.lock().unwrap();
-            *fc += 1;
+        if t >= T_THROTTLE {
+            throttled = true;
         }
-
-        json!({
-            "trajectory_id": i,
-            "ambient_temp_C": f64::trunc(ambient_temp_c * 10.0) / 10.0,
-            "solar_irradiance_W": f64::trunc(solar_irradiance_w * 10.0) / 10.0,
-            "max_internal_temp_C": f64::trunc(internal_chassis_temp_c * 10.0) / 10.0,
-            "max_inference_latency_ms": f64::trunc(max_rl_inference_latency_ms * 10.0) / 10.0,
-            "survived": !thermal_trip_failure,
-            "failure_mode": if !thermal_trip_failure { "NOMINAL" } else { "IP67_THERMAL_THROTTLE_KINEMATIC_FALL" },
-            "cryptographic_seal": format!("sha256:ip67_heat_soak_{}", i)
-        })
-    }).collect();
-
-    for res in results {
-        writeln!(writer, "{}", res.to_string()).unwrap();
+        if t >= T_SHUT {
+            shutdown = true;
+            break;
+        }
+        if (elapsed as u64) % 600 == 0 {
+            proof.feed_f64(t);
+        }
     }
 
-    let fc = *failed_count.lock().unwrap();
-    let failure_rate = (fc as f64 / NUM_TRAJECTORIES as f64) * 100.0;
-    
-    println!("IP67_HEAT_SOAK PHYSICS AUDIT COMPLETE.");
-    println!("TOTAL TRAJECTORIES: {:?}", NUM_TRAJECTORIES);
-    println!("CATASTROPHIC LATENCY COLLAPSE RATE: {} ({:.2}%)", fc, failure_rate);
-    println!("EXECUTION TIME: {:?}", start_time.elapsed());
-    println!("SEALED TO: {}/ip67_heat_soak.json\n", export_dir);
+    proof.feed_f64(peak);
+    proof.feed_str(if shutdown {
+        "SHUTDOWN"
+    } else if throttled {
+        "THROTTLED"
+    } else {
+        "NOMINAL"
+    });
+
+    Run {
+        id,
+        short_id,
+        solar_flux_w_m2: (solar * 10.0).round() / 10.0,
+        compute_w: (compute * 10.0).round() / 10.0,
+        peak_temp_c: (peak * 10.0).round() / 10.0,
+        is_thermal_throttled: throttled,
+        is_overtemp_shutdown: shutdown,
+        proof_hash: proof.seal(),
+    }
+}
+
+fn main() {
+    let args: Vec<String> = std::env::args().collect();
+    let n: usize = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(DEFAULT_N);
+    let out = args
+        .iter()
+        .position(|a| a == "--parquet")
+        .and_then(|i| args.get(i + 1))
+        .cloned()
+        .unwrap_or_else(|| {
+            format!(
+                "{}/../../data/exports/sovereign/ip67_heat_soak.parquet",
+                env!("CARGO_MANIFEST_DIR")
+            )
+        });
+
+    println!("====================================================================");
+    println!("  G^G: IP67 HEAT SOAK  (G·A·α + compute, 1 Hz / 10 s chunks)");
+    println!("  n={n}  horizon {HORIZON_S}s  throttle {T_THROTTLE} °C  shut {T_SHUT} °C");
+    println!("====================================================================\n");
+
+    let t0 = Instant::now();
+    let mut rng = Rng::new(0x1967_0003);
+    let rows: Vec<Run> = (0..n as u32).map(|i| run_one(i, &mut rng)).collect();
+    let proofs: Vec<String> = rows.iter().map(|r| r.proof_hash.clone()).collect();
+    let seal = proof::seal_run(&proofs);
+
+    if let Some(p) = std::path::Path::new(&out).parent() {
+        std::fs::create_dir_all(p).ok();
+    }
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("trajectory_id", DataType::UInt32, false),
+        Field::new("short_id", DataType::Utf8, false),
+        Field::new("solar_flux_w_m2", DataType::Float64, false),
+        Field::new("compute_w", DataType::Float64, false),
+        Field::new("peak_temp_c", DataType::Float64, false),
+        Field::new("is_thermal_throttled", DataType::Boolean, false),
+        Field::new("is_overtemp_shutdown", DataType::Boolean, false),
+        Field::new("proof_hash", DataType::Utf8, false),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(UInt32Array::from(rows.iter().map(|r| r.id).collect::<Vec<_>>())),
+            Arc::new(StringArray::from(rows.iter().map(|r| r.short_id.as_str()).collect::<Vec<_>>())),
+            Arc::new(Float64Array::from(rows.iter().map(|r| r.solar_flux_w_m2).collect::<Vec<_>>())),
+            Arc::new(Float64Array::from(rows.iter().map(|r| r.compute_w).collect::<Vec<_>>())),
+            Arc::new(Float64Array::from(rows.iter().map(|r| r.peak_temp_c).collect::<Vec<_>>())),
+            Arc::new(BooleanArray::from(rows.iter().map(|r| r.is_thermal_throttled).collect::<Vec<_>>())),
+            Arc::new(BooleanArray::from(rows.iter().map(|r| r.is_overtemp_shutdown).collect::<Vec<_>>())),
+            Arc::new(StringArray::from(rows.iter().map(|r| r.proof_hash.as_str()).collect::<Vec<_>>())),
+        ],
+    )
+    .expect("batch");
+    let file = std::fs::File::create(&out).unwrap();
+    let props = output::parquet_receipt_properties(&seal, "G^G IP67 GAα soak dual-regime v3.0");
+    let mut w = ArrowWriter::try_new(file, schema, Some(props)).unwrap();
+    w.write(&batch).unwrap();
+    w.close().unwrap();
+
+    let n_f = n as f64;
+    let th = rows.iter().filter(|r| r.is_thermal_throttled).count();
+    let sh = rows.iter().filter(|r| r.is_overtemp_shutdown).count();
+    println!(
+        "  throttled {th} ({:.1}%)  shutdown {sh} ({:.1}%)",
+        100.0 * th as f64 / n_f,
+        100.0 * sh as f64 / n_f
+    );
+    println!("  seal {seal}");
+    println!("  parquet {out}");
+    println!("  {:?}", t0.elapsed());
 }

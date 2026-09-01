@@ -1,134 +1,153 @@
-//! 1000Hz GENESIS CORE MODULE: TRAILER_WHIP_RESONANCE
-//! TARGET: Generic Commercial/Industrial Autonomous Systems
-//! CLASS: Generic Autonomous Platform
-//! SUBSYSTEM: Idealized Dynamics Prior
-//! VULNERABILITY: Synthetic physics ignore the harmonic aerodynamic yaw oscillations of a 53ft empty sail under high crosswinds, leading to trailer whip and rollover.
+//! Empty 53-ft box. q A C_D yaw about the kingpin. Dryden gust, not rng/ms.
+//! Clock: 50 Hz, 12 s. Gates: yaw ≥ 0.12 rad whip vs ≥ 0.28 rad jackknife.
+//! Organ: DynamicOscillator, dryden_gust_step.
 
-use rayon::prelude::*;
-use serde_json::json;
-use std::fs::{File, OpenOptions};
-use std::io::{BufWriter, Write};
-use std::sync::{Arc, Mutex};
+use genesis_core::output;
+use genesis_core::physics::resonance::{dryden_gust_step, DynamicOscillator};
+use genesis_core::proof::{self, ProofChain};
+use genesis_core::rng::Rng;
+use serde::Serialize;
+use std::sync::Arc;
 use std::time::Instant;
-use rand::Rng;
 
-const NUM_TRAJECTORIES: usize = 1_200_000;
-const HZ: f64 = 1000.0;
-const DT: f64 = 1.0 / HZ;
+use arrow::array::{BooleanArray, Float64Array, StringArray, UInt32Array};
+use arrow::datatypes::{DataType, Field, Schema};
+use arrow::record_batch::RecordBatch;
+use parquet::arrow::arrow_writer::ArrowWriter;
 
-// Class 8 Empty Trailer Baseline
-const TRAILER_LATERAL_AREA_SQM: f64 = 43.0; // 53ft x ~9ft wall
-const TRAILER_EMPTY_MASS_KG: f64 = 6000.0; // Empty
-const CRITICAL_YAW_ANGLE_RADIANS: f64 = 0.35; // ~20 degrees yaw relative to cab means jackknife / rollover
+const DEFAULT_N: usize = 2500;
+const DT: f64 = 0.02;
+const HORIZON_S: f64 = 12.0;
+const AREA: f64 = 43.0;
+const MASS: f64 = 6_000.0;
+const LEN: f64 = 16.0;
+const CD: f64 = 1.1;
+const RHO: f64 = 1.225;
+
+#[derive(Debug, Serialize)]
+struct Run {
+    id: u32,
+    short_id: String,
+    mean_wind_ms: f64,
+    max_yaw_rad: f64,
+    is_yaw_whip: bool,
+    is_jackknife: bool,
+    proof_hash: String,
+}
+
+fn run_one(id: u32, rng: &mut Rng) -> Run {
+    let short_id = output::short_id(rng);
+    let mean = rng.range(4.0, 16.0);
+    let sigma = rng.range(1.5, 5.0);
+    let tau = rng.range(1.5, 4.0);
+
+    let mut proof = ProofChain::new();
+    proof.seed(&id.to_le_bytes());
+    proof.feed_f64(mean);
+    proof.feed_f64(sigma);
+
+    let i_yaw = MASS * LEN * LEN / 12.0;
+    let k_king = 4.0e4; // tractor exists
+    let fn_hz = (k_king / i_yaw).sqrt() / (2.0 * std::f64::consts::PI);
+    let mut osc = DynamicOscillator::new(fn_hz.max(0.15), 0.18);
+    let mut gust = 0.0;
+    let mut peak: f64 = 0.0;
+    let arm = 8.0;
+    let steps = (HORIZON_S / DT) as usize;
+    for k in 0..steps {
+        let white = rng.gaussian(0.0, 1.0);
+        gust = dryden_gust_step(gust, white, tau, sigma, DT);
+        let v = mean + gust;
+        let f = 0.5 * RHO * v * v.abs() * CD * AREA;
+        let alpha = (f * arm) / i_yaw; // yaw accel forcing
+        let (y, _) = osc.step(alpha, DT);
+        peak = peak.max(y.abs());
+        if k % 20 == 0 {
+            proof.feed_f64(y);
+        }
+    }
+    let whip = peak >= 0.12;
+    let knife = peak >= 0.28;
+    proof.feed_f64(peak);
+    proof.feed_str(if knife {
+        "JACKKNIFE"
+    } else if whip {
+        "WHIP"
+    } else {
+        "HELD"
+    });
+
+    Run {
+        id,
+        short_id,
+        mean_wind_ms: (mean * 10.0).round() / 10.0,
+        max_yaw_rad: (peak * 1000.0).round() / 1000.0,
+        is_yaw_whip: whip,
+        is_jackknife: knife,
+        proof_hash: proof.seal(),
+    }
+}
 
 fn main() {
-    let start_time = Instant::now();
-    let export_dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../../data/exports/sovereign");
-    std::fs::create_dir_all(export_dir).unwrap();
-    let file = OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .open(format!("{}/trailer_whip_resonance.json", export_dir))
-        .unwrap();
-    let mut writer = BufWriter::new(file);
-
-    println!("=========================================================");
-    println!("G^G SOVEREIGN PHYSICS ENGINE: 1000Hz AEROMECHANICAL AUDIT");
-    println!("TARGET: GENERIC COMMERCIAL SYSTEMS");
-    println!("MODULE: TRAILER_WHIP_RESONANCE");
-    println!("EXECUTING 1,200,000 TRAJECTORIES...");
-    println!("=========================================================\n");
-
-    let failed_count = Arc::new(Mutex::new(0usize));
-
-    let results: Vec<serde_json::Value> = (0..NUM_TRAJECTORIES).into_par_iter().map(|i| {
-        let mut rng = rand::thread_rng();
-        
-        let mut trailer_yaw = 0.0;
-        let mut trailer_yaw_velocity = 0.0;
-        let mut max_yaw_experienced = 0.0;
-        let mut catastrophic_rollover = false;
-        
-        // Simulating highway driving across an elevated viaduct (e.g. crossing a major river bridge)
-        // High, unpredictable lateral wind gusts
-        // Waabi World assumes single-body physics or heavily damped articulation
-        
-        // Base uniform crosswind 15-30mph (~6 to 13 m/s)
-        let base_crosswind_ms = rng.gen_range(6.0..13.0);
-        
-        // The kingpin acts as a torsional spring.
-        let torsional_stiffness = 50000.0; 
-        let torsional_damping = 8000.0;
-
-        for tick in 0..(10.0 * HZ) as usize {
-            let time = tick as f64 * DT;
-
-            // Introduce vortex shedding / gust buffeting frequency (0.5Hz to 2Hz)
-            let gust_variance = rng.gen_range(-5.0..15.0);
-            let instantaneous_crosswind = base_crosswind_ms + gust_variance + (time * 1.5).sin() * 8.0;
-
-            // Aerodynamic lateral force F = 0.5 * rho * v^2 * Cd * Area
-            // Sign preserves wind direction
-            let air_density = 1.225;
-            let drag_coeff = 1.1; // Flat slab side
-            let lateral_wind_force = 0.5 * air_density * instantaneous_crosswind.powi(2) * instantaneous_crosswind.signum() * drag_coeff * TRAILER_LATERAL_AREA_SQM;
-
-            // Torque around the kingpin (Assume center of pressure is 8 meters back)
-            let aero_torque = lateral_wind_force * 8.0;
-
-            // The AI steers the cab straight. It ignores the trailer.
-            // Physical Hooke/Damper logic for the trailer yaw:
-            let restoring_torque = -torsional_stiffness * trailer_yaw;
-            let damping_torque = -torsional_damping * trailer_yaw_velocity;
-            
-            let total_torque = aero_torque + restoring_torque + damping_torque;
-            let rotational_inertia = TRAILER_EMPTY_MASS_KG * 60.0; // Approximate Izz
-
-            let yaw_acceleration = total_torque / rotational_inertia;
-
-            trailer_yaw_velocity += yaw_acceleration * DT;
-            trailer_yaw += trailer_yaw_velocity * DT;
-
-            if trailer_yaw.abs() > max_yaw_experienced {
-                max_yaw_experienced = trailer_yaw.abs();
-            }
-
-            // Coupled oscillation (Whip): If the AI makes minor steering corrections in phase 
-            // with the wind buffering, it pumps energy into the pendulum. 
-            // Generative sim removes this 1000Hz noise.
-            if trailer_yaw.abs() > CRITICAL_YAW_ANGLE_RADIANS {
-                catastrophic_rollover = true;
-                break;
-            }
-        }
-
-        if catastrophic_rollover {
-            let mut fc = failed_count.lock().unwrap();
-            *fc += 1;
-        }
-
-        json!({
-            "trajectory_id": i,
-            "base_crosswind_ms": f64::trunc(base_crosswind_ms * 100.0) / 100.0,
-            "max_yaw_deflection_rad": f64::trunc(max_yaw_experienced * 1000.0) / 1000.0,
-            "critical_rollover_limit_rad": CRITICAL_YAW_ANGLE_RADIANS,
-            "survived": !catastrophic_rollover,
-            "failure_mode": if !catastrophic_rollover { "NOMINAL" } else { "WAABI_WORLD_UNMODELED_WHIP_RESONANCE" },
-            "cryptographic_seal": format!("sha256:waabi_trailer_whip_{}", i)
-        })
-    }).collect();
-
-    for res in results {
-        writeln!(writer, "{}", res.to_string()).unwrap();
+    let args: Vec<String> = std::env::args().collect();
+    let n: usize = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(DEFAULT_N);
+    let out = args
+        .iter()
+        .position(|a| a == "--parquet")
+        .and_then(|i| args.get(i + 1))
+        .cloned()
+        .unwrap_or_else(|| {
+            format!(
+                "{}/../../data/exports/sovereign/trailer_whip_resonance.parquet",
+                env!("CARGO_MANIFEST_DIR")
+            )
+        });
+    println!("====================================================================");
+    println!("  G^G: TRAILER WHIP  (Dryden gust, kingpin SDOF, 50 Hz)");
+    println!("  n={n}");
+    println!("====================================================================\n");
+    let t0 = Instant::now();
+    let mut rng = Rng::new(0x789A_11EF);
+    let rows: Vec<Run> = (0..n as u32).map(|i| run_one(i, &mut rng)).collect();
+    let proofs: Vec<String> = rows.iter().map(|r| r.proof_hash.clone()).collect();
+    let seal = proof::seal_run(&proofs);
+    if let Some(p) = std::path::Path::new(&out).parent() {
+        std::fs::create_dir_all(p).ok();
     }
-
-    let fc = *failed_count.lock().unwrap();
-    let failure_rate = (fc as f64 / NUM_TRAJECTORIES as f64) * 100.0;
-    
-    println!("TRAILER_WHIP_RESONANCE PHYSICS AUDIT COMPLETE.");
-    println!("TOTAL TRAJECTORIES: {:?}", NUM_TRAJECTORIES);
-    println!("CATASTROPHIC ROLLOVER RATE: {} ({:.2}%)", fc, failure_rate);
-    println!("EXECUTION TIME: {:?}", start_time.elapsed());
-    println!("SEALED TO: {}/trailer_whip_resonance.json\n", export_dir);
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("trajectory_id", DataType::UInt32, false),
+        Field::new("short_id", DataType::Utf8, false),
+        Field::new("mean_wind_ms", DataType::Float64, false),
+        Field::new("max_yaw_rad", DataType::Float64, false),
+        Field::new("is_yaw_whip", DataType::Boolean, false),
+        Field::new("is_jackknife", DataType::Boolean, false),
+        Field::new("proof_hash", DataType::Utf8, false),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(UInt32Array::from(rows.iter().map(|r| r.id).collect::<Vec<_>>())),
+            Arc::new(StringArray::from(rows.iter().map(|r| r.short_id.as_str()).collect::<Vec<_>>())),
+            Arc::new(Float64Array::from(rows.iter().map(|r| r.mean_wind_ms).collect::<Vec<_>>())),
+            Arc::new(Float64Array::from(rows.iter().map(|r| r.max_yaw_rad).collect::<Vec<_>>())),
+            Arc::new(BooleanArray::from(rows.iter().map(|r| r.is_yaw_whip).collect::<Vec<_>>())),
+            Arc::new(BooleanArray::from(rows.iter().map(|r| r.is_jackknife).collect::<Vec<_>>())),
+            Arc::new(StringArray::from(rows.iter().map(|r| r.proof_hash.as_str()).collect::<Vec<_>>())),
+        ],
+    )
+    .expect("batch");
+    let file = std::fs::File::create(&out).unwrap();
+    let props = output::parquet_receipt_properties(&seal, "G^G trailer Dryden dual-regime v3.0");
+    let mut w = ArrowWriter::try_new(file, schema, Some(props)).unwrap();
+    w.write(&batch).unwrap();
+    w.close().unwrap();
+    let nf = n as f64;
+    let a = rows.iter().filter(|r| r.is_yaw_whip).count();
+    let b = rows.iter().filter(|r| r.is_jackknife).count();
+    println!(
+        "  whip {a} ({:.1}%)  jackknife {b} ({:.1}%)",
+        100.0 * a as f64 / nf,
+        100.0 * b as f64 / nf
+    );
+    println!("  seal {seal}\n  parquet {out}\n  {:?}", t0.elapsed());
 }
